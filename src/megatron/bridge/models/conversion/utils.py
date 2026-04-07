@@ -44,7 +44,8 @@ def weights_verification_table(bridge, megatron_model) -> Table:
     table.add_column("Matches Original", justify="center")
 
     # Check each weight against the original HF-model
-    for name, param in bridge.export_hf_weights(megatron_model, show_progress=True):
+    for item in bridge.export_hf_weights(megatron_model, show_progress=True):
+        name, param = item.param_name, item.weight
         original_param = bridge.hf_pretrained.state[name]
         table.add_row(
             name,

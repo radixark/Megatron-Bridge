@@ -586,8 +586,8 @@ class AutoBridge(Generic[MegatronModelT]):
             dist.barrier()
 
         adapter_state: dict[str, torch.Tensor] = {}
-        for name, tensor in self.export_adapter_weights(model, cpu=True, show_progress=show_progress):
-            adapter_state[f"base_model.model.{name}"] = tensor.clone().float()
+        for item in self.export_adapter_weights(model, cpu=True, show_progress=show_progress):
+            adapter_state[f"base_model.model.{item.param_name}"] = item.weight.clone().float()
 
         if not adapter_state:
             raise RuntimeError(
