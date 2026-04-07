@@ -836,8 +836,8 @@ class MegatronPeftBridge:
                     linear_out_stacked = linear_out_by_base[base_name]
                     if cpu:
                         linear_out_stacked = linear_out_stacked.cpu()
-                    yield HFWeightTuple(linear_in_hf_names[index], linear_in_stacked)
-                    yield HFWeightTuple(linear_out_hf_names[index], linear_out_stacked)
+                    yield HFWeightTuple(linear_in_hf_names[index], linear_in_stacked, None)
+                    yield HFWeightTuple(linear_out_hf_names[index], linear_out_stacked, None)
 
                 continue
 
@@ -885,12 +885,12 @@ class MegatronPeftBridge:
                             current_linear_out_tensor = per_base_linear_out.get(base_name)
                             assert current_linear_out_tensor is not None, "unknown projection name"
 
-                            yield HFWeightTuple(linear_in_hf_names[index], current_linear_in_tensor)
-                            yield HFWeightTuple(linear_out_hf_names[index], current_linear_out_tensor)
+                            yield HFWeightTuple(linear_in_hf_names[index], current_linear_in_tensor, None)
+                            yield HFWeightTuple(linear_out_hf_names[index], current_linear_out_tensor, None)
                         continue
 
-                yield HFWeightTuple(linear_in_hf_names[0], current_linear_in_tensor)
-                yield HFWeightTuple(linear_out_hf_names[0], current_linear_out_tensor)
+                yield HFWeightTuple(linear_in_hf_names[0], current_linear_in_tensor, None)
+                yield HFWeightTuple(linear_out_hf_names[0], current_linear_out_tensor, None)
 
     def _get_fused_adapter_linear_out_slices(
         self,
