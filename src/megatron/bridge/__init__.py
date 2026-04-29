@@ -13,6 +13,9 @@
 # limitations under the License.
 """Megatron Bridge - A component of the Megatron ecosystem."""
 
+# Marker for verify the version is radixark/Megatron-Bridge.git@kimi-k25 fork.
+KIMI_K25 = True
+
 from megatron.bridge.models.conversion.auto_bridge import AutoBridge
 from megatron.bridge.package_info import (
     __contact_emails__,
