@@ -64,6 +64,10 @@ from megatron.bridge.models.glm import (
     GLM45ModelProvider355B,
     GLMMoEModelProvider,
 )
+from megatron.bridge.models.kimi_vl import (
+    KimiK25VLBridge,
+    KimiK25VLModel,
+)
 from megatron.bridge.models.gpt_oss import (
     GPTOSSBridge,
     GPTOSSProvider,
