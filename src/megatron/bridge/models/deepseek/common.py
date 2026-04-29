@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from megatron.bridge.models.conversion.param_mapping import AutoMapping, GatedMLPMapping, RowParallelMapping
+from megatron.bridge.models.conversion.param_mapping import AutoMapping, GatedMLPMapping
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 
 
@@ -101,10 +101,7 @@ def get_common_mapping_list() -> list:
         "decoder.layers.*.mlp.linear_fc2.weight": "model.layers.*.mlp.down_proj.weight",
         # MoE
         "decoder.layers.*.mlp.router.weight": "model.layers.*.mlp.gate.weight",
-        # NOTE: experts.linear_fc2.weight* is moved out of this dict (and added below as
-        # explicit RowParallelMapping) so it does not go through AutoMapping. With EP>1
-        # and PP=1, AutoMapping's parallelism-type broadcast is a no-op and non-owning EP
-        # ranks see megatron_module=None, which breaks _detect_parallelism_type.
+        "decoder.layers.*.mlp.experts.linear_fc2.weight*": "model.layers.*.mlp.experts.*.down_proj.weight",
         "decoder.layers.*.mlp.shared_experts.linear_fc2.weight": "model.layers.*.mlp.shared_experts.down_proj.weight",
         # LM Head
         "decoder.final_layernorm.weight": "model.norm.weight",
@@ -142,10 +139,6 @@ def get_common_mapping_list() -> list:
                 megatron_param="decoder.layers.*.mlp.shared_experts.linear_fc1.weight",
                 gate="model.layers.*.mlp.shared_experts.gate_proj.weight",
                 up="model.layers.*.mlp.shared_experts.up_proj.weight",
-            ),
-            RowParallelMapping(
-                megatron_param="decoder.layers.*.mlp.experts.linear_fc2.weight*",
-                hf_param="model.layers.*.mlp.experts.*.down_proj.weight",
             ),
         ]
     )
