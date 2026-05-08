@@ -28,9 +28,6 @@ from hydra._internal.config_loader_impl import ConfigLoaderImpl
 from hydra.core.override_parser.overrides_parser import OverridesParser
 from omegaconf import DictConfig, OmegaConf
 
-# Re-export so existing callers (e.g. transformer_config.py) keep working.
-from megatron.bridge.utils.activation_map import callable_to_str, str_to_callable  # noqa: F401
-
 
 logger = logging.getLogger(__name__)
 
@@ -38,9 +35,6 @@ DataclassInstance = TypeVar("DataclassInstance")
 
 # Sentinel object to distinguish between "exclude this field" and "field is legitimately None"
 _EXCLUDE_FIELD = object()
-
-# Fields whose callables should be serialized as strings (not excluded)
-_SERIALIZABLE_CALLABLE_FIELDS: frozenset[str] = frozenset({"activation_func"})
 
 
 def create_omegaconf_dict_config(config_container: Any) -> Tuple[DictConfig, Dict[str, Any]]:
@@ -266,15 +260,8 @@ def _dataclass_to_omegaconf_dict(val_to_convert: Any, path: str = "") -> Any:
         logger.debug(f"Converting torch.dtype at {current_path}: {val_to_convert}")
         return str(val_to_convert)
 
-    # Handle callables — serialize known activation functions as strings,
-    # exclude everything else.
+    # Handle callables - exclude them completely
     if _is_omegaconf_problematic(val_to_convert):
-        field_name = current_path.rsplit(".", 1)[-1] if "." in current_path else current_path
-        if field_name in _SERIALIZABLE_CALLABLE_FIELDS:
-            str_name = callable_to_str(val_to_convert)
-            if str_name is not None:
-                logger.debug(f"Serializing callable at {current_path} as string: {str_name}")
-                return str_name
         logger.debug(f"Excluding callable at {current_path}: {type(val_to_convert)} - {val_to_convert}")
         return _EXCLUDE_FIELD
 
@@ -369,12 +356,8 @@ def _track_excluded_fields(obj: Any, path: str = "") -> Dict[str, Any]:
             field_value = getattr(obj, field_name)
 
             if _is_omegaconf_problematic(field_value):
-                # Skip fields that are serialized as strings (not excluded)
-                if field_name in _SERIALIZABLE_CALLABLE_FIELDS and callable_to_str(field_value) is not None:
-                    logger.debug(f"Skipping serializable callable (not excluded): {field_path}")
-                else:
-                    excluded_fields[field_path] = field_value
-                    logger.debug(f"Tracking excluded callable: {field_path}")
+                excluded_fields[field_path] = field_value
+                logger.debug(f"Tracking excluded callable: {field_path}")
             elif dataclasses.is_dataclass(field_value):
                 nested_excluded = _track_excluded_fields(field_value, field_path)
                 excluded_fields.update(nested_excluded)
@@ -497,20 +480,11 @@ def _apply_overrides(config_obj: DataclassInstance, overrides_dict: Dict[str, An
 
                 # If the original was a torch.dtype and value is a string, convert back
                 if isinstance(current_attr, torch.dtype) and isinstance(value, str):
-                    from megatron.bridge.utils.activation_map import str_to_dtype
-
                     try:
-                        final_value = str_to_dtype(value)
-                    except ValueError:
+                        final_value = getattr(torch, value.split(".")[-1])
+                    except AttributeError:
                         logger.warning(f"Could not convert string '{value}' back to torch.dtype")
                         final_value = value
-
-                # Restore serialized callable fields (e.g. "relu" → F.relu)
-                if key in _SERIALIZABLE_CALLABLE_FIELDS and isinstance(final_value, str):
-                    try:
-                        final_value = str_to_callable(final_value)
-                    except ValueError:
-                        logger.warning(f"Could not restore callable for {key}='{final_value}'; keeping string")
 
                 setattr(config_obj, key, final_value)
                 logger.debug(f"Set {type(config_obj).__name__}.{key} = {final_value}")

@@ -39,8 +39,6 @@ class DiffusionDataModuleConfig(DatasetProvider):  # noqa: D101
     use_train_split_for_val: bool = False
 
     def build_datasets(self, context: DatasetBuildContext):
-        if context.pg_collection is not None:
-            self.dataset.pg_collection = context.pg_collection
         return (
             iter(self.dataset.train_dataloader()),
             iter(self.dataset.val_dataloader()),
@@ -84,7 +82,6 @@ class DiffusionDataModule(EnergonMultiModalDataModule):
         packing_buffer_size: int = None,
         task_encoder: DefaultTaskEncoder = None,
         use_train_split_for_val: bool = False,
-        pg_collection=None,
     ) -> None:
         """
         Initialize the SimpleMultiModalDataModule.
@@ -110,7 +107,6 @@ class DiffusionDataModule(EnergonMultiModalDataModule):
             packing_buffer_size=packing_buffer_size,
             pin_memory=pin_memory,
             task_encoder=task_encoder,
-            pg_collection=pg_collection,
         )
         self.use_train_split_for_val = use_train_split_for_val
 

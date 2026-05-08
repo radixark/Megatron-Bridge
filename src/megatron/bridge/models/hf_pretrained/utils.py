@@ -24,7 +24,6 @@ SAFE_REPOS: list[str] = [
     "google",
     "llava-hf",
     "meta-llama",
-    "MiniMaxAI",
     "mistralai",
     "moonshotai",
     "nvidia",

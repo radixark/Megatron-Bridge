@@ -60,7 +60,6 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 VALID_EVENTS: frozenset[str] = frozenset(
     {
-        "on_data_init_start",
         "on_train_start",
         "on_train_step_start",
         "on_train_step_end",
@@ -73,7 +72,6 @@ VALID_EVENTS: frozenset[str] = frozenset(
         "on_test_step_start",
         "on_test_step_end",
         "on_test_end",
-        "on_checkpoint_save",
     }
 )
 
@@ -99,7 +97,6 @@ class CallbackContext:
     Field Availability by Event:
         All events: state, model, user_state
         Training events: optimizer, scheduler
-        on_data_init_start: optimizer, scheduler
         on_train_step_end: loss_dict, grad_norm, skipped_iter
         on_eval_end, on_test_end: total_loss_dict
     """
@@ -141,15 +138,6 @@ class Callback:
         pretrain(config, forward_step_func, callbacks=[MyCallback()])
         ```
     """
-
-    def on_data_init_start(self, context: CallbackContext) -> None:
-        """Called after model/optimizer/checkpoint are ready, before dataset files are opened.
-
-        This is the correct place to run JIT warmup with mock data and to log
-        MLPerf init_stop/run_start markers, ensuring no real dataset I/O occurs
-        before run_start is recorded.
-        """
-        pass
 
     def on_train_start(self, context: CallbackContext) -> None:
         """Called after model.train(), before training loop begins."""
@@ -197,10 +185,6 @@ class Callback:
 
     def on_test_end(self, context: CallbackContext) -> None:
         """Called after test completes, before model.train()."""
-        pass
-
-    def on_checkpoint_save(self, context: CallbackContext) -> None:
-        """Called after checkpoint was saved"""
         pass
 
 
@@ -275,7 +259,6 @@ class CallbackManager:
 
         Args:
             event_name: Event to register for. Valid events:
-                - "on_data_init_start"
                 - "on_train_start"
                 - "on_train_step_start"
                 - "on_train_step_end"
@@ -288,7 +271,6 @@ class CallbackManager:
                 - "on_test_step_start"
                 - "on_test_step_end"
                 - "on_test_end"
-                - "on_checkpoint_save"
             fn: Callback function with signature (CallbackContext) -> None.
 
         Raises:

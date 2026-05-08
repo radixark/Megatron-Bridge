@@ -110,9 +110,10 @@ class ModuleMatcher:
                 if name == pattern or wildcard_match(pattern, full_name):
                     return (pattern, full_name)
         elif len(self.target_modules or []) > 0:
-            assert len(self.exclude_modules) == 0, "exclude_modules should be empty when using target_modules"
+            #assert len(self.exclude_modules) == 0, "exclude_modules should be empty when using target_modules"
+
             for pattern in self.target_modules:
-                if name == pattern or wildcard_match(pattern, full_name):
+                if name == pattern or wildcard_match(pattern, full_name) and not any(wildcard_match(pattern, full_name) for pattern in self.exclude_modules):
                     return (pattern, full_name)
         else:
             linear_types = [ColumnParallelLinear, RowParallelLinear, nn.Linear]

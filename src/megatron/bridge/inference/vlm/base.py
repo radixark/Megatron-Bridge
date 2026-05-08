@@ -25,7 +25,6 @@ from PIL.Image import Image
 from transformers import AutoProcessor
 
 from megatron.bridge import AutoBridge
-from megatron.bridge.models.hf_pretrained.utils import is_safe_repo
 from megatron.bridge.models.qwen_vl import Qwen3VLModelProvider, Qwen25VLModelProvider
 from megatron.bridge.training.utils.checkpoint_utils import get_hf_model_id_from_checkpoint
 from megatron.bridge.utils.common_utils import print_rank_0
@@ -47,8 +46,7 @@ def setup_model_and_tokenizer(
     """Set up model and tokenizer from a Megatron checkpoint.
 
     Args:
-        megatron_model_path: Path to the Megatron checkpoint. HuggingFace model id for
-            tokenizer/processor is read from checkpoint metadata.
+        megatron_model_path: Path to the Megatron checkpoint.
         tp: Tensor model parallel size.
         pp: Pipeline model parallel size.
         params_dtype: Data type for model parameters.
@@ -61,16 +59,12 @@ def setup_model_and_tokenizer(
     # Load from Megatron checkpoint
     print_rank_0(f"Loading Megatron model from: {megatron_model_path}")
 
-    hf_pretrained_id = get_hf_model_id_from_checkpoint(megatron_model_path)
-    if not hf_pretrained_id:
-        raise ValueError("Could not determine HuggingFace model id from checkpoint metadata for tokenizer/processor.")
+    # Get HF model path from checkpoint metadata
+    hf_model_path = get_hf_model_id_from_checkpoint(megatron_model_path)
 
     # We still need HF config for tokenizer, but we'll load the model from Megatron checkpoint
     # Create bridge from HF config only (no weights)
-    bridge = AutoBridge.from_hf_pretrained(
-        hf_pretrained_id,
-        trust_remote_code=is_safe_repo(trust_remote_code=False, hf_path=hf_pretrained_id),
-    )
+    bridge = AutoBridge.from_hf_pretrained(hf_model_path)
 
     # Initialize model parallel before loading
     model_provider = bridge.to_megatron_provider(load_weights=False)
@@ -102,8 +96,7 @@ def setup_model_and_tokenizer(
 
     # Initialize tokenizer and processor
     processor = AutoProcessor.from_pretrained(
-        hf_pretrained_id,
-        trust_remote_code=is_safe_repo(trust_remote_code=False, hf_path=hf_pretrained_id),
+        hf_model_path,
     )
     if processor.tokenizer.pad_token is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
@@ -148,9 +141,15 @@ def setup_inference_wrapper(
     mcore_model = mcore_model.to(params_dtype)
     mcore_model.eval()
 
+    # if isinstance(config, vlm.Qwen2VLConfig):
     if isinstance(config, Qwen25VLModelProvider) or isinstance(config, Qwen3VLModelProvider):
         wrapper_cls = QwenVLInferenceWrapper
-        _expose_decoder_from_language_model(mcore_model)
+        if isinstance(config, Qwen25VLModelProvider):
+            _ = config.hidden_size
+            # Expose decoder for MCore Infernce Engine compatibility (used by get_mamba_inference_state_config_from_model)
+            _expose_decoder_from_language_model(mcore_model)
+        else:
+            _ = config.language_transformer_config.hidden_size
     else:
         raise ValueError(f"Unknown model config: {config}")
 
@@ -205,9 +204,7 @@ def generate(
             tokenizer=tokenizer,
             image_processor=image_processor,
         )
-    mcore_engine = VLMEngine(
-        text_generation_controller=text_generation_controller, random_seed=random_seed, legacy=True
-    )
+    mcore_engine = VLMEngine(text_generation_controller=text_generation_controller, random_seed=random_seed)
 
     if sampling_params is None:
         sampling_params = SamplingParams(num_tokens_to_generate=50)

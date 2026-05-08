@@ -26,7 +26,6 @@ import yaml
 from megatron.core.msc_utils import MultiStorageClientFeature
 from omegaconf import OmegaConf
 
-from megatron.bridge.models.common import Serializable
 from megatron.bridge.utils.instantiate_utils import InstantiationMode, instantiate
 from megatron.bridge.utils.yaml_utils import safe_yaml_representers
 
@@ -263,7 +262,6 @@ class _ConfigContainerBase:
 
         Handles:
         - ConfigContainer instances (using to_dict)
-        - Serializable instances (using as_dict)
         - Classes which implement a to_cfg_dict method
         - Regular dataclasses (converting each non-private field)
         - Lists and tuples (converting each element)
@@ -278,8 +276,6 @@ class _ConfigContainerBase:
         """
         if isinstance(value, _ConfigContainerBase):
             return value.to_dict()
-        elif isinstance(value, Serializable):
-            return value.as_dict()
         elif hasattr(value, "to_cfg_dict"):
             # Allow non-Container classes to implement own custom method
             return value.to_cfg_dict()

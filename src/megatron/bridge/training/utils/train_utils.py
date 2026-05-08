@@ -347,9 +347,7 @@ def training_log(
     global_state: GlobalState,
     history_wct: list,
     model: list[MegatronModule],
-    pg_collection: Optional[Any] = None,
     log_max_attention_logit: Optional[float] = None,
-    loaded_iteration: int = 0,
 ) -> bool:
     """Log training stats (losses, learning rate, timings, etc.).
 
@@ -372,8 +370,6 @@ def training_log(
         global_state: The global training state.
         history_wct (list): list of elapsed time per each iteration.
         model (list[MegatronModule]): megatron model state.
-        pg_collection (Optional[Any]): ProcessGroupCollection to use for logging reductions.
-            If None, falls back to extracting from model wrappers.
         log_max_attention_logit (Optional[float]): Maximum attention logit if available, None otherwise.
     Returns:
         bool: The updated report_memory_flag.
@@ -384,13 +380,10 @@ def training_log(
     writer = global_state.tensorboard_logger
     wandb_writer = global_state.wandb_logger
     mlflow_logger = global_state.mlflow_logger
-    comet_logger = global_state.comet_logger
     energy_monitor = global_state.energy_monitor
     logger_config = config.logger
     train_config = config.train
-    pg_collection = pg_collection or get_pg_collection(model)
-
-    loggers_exist = writer is not None or wandb_writer is not None or mlflow_logger is not None
+    pg_collection = get_pg_collection(model)
 
     # Advanced, skipped, and Nan iterations.
     advanced_iters_key = "advanced iterations"
@@ -469,8 +462,6 @@ def training_log(
             timers.write_to_wandb(timers_to_log, wandb_writer, iteration, normalizer=total_iterations, reset=True)
         if hasattr(timers, "write_to_mlflow"):
             timers.write_to_mlflow(timers_to_log, mlflow_logger, iteration, normalizer=total_iterations, reset=True)
-        if hasattr(timers, "write_to_comet"):
-            timers.write_to_comet(timers_to_log, comet_logger, iteration, normalizer=total_iterations, reset=True)
 
     if config.profiling:
         if config.profiling.record_memory_history and get_rank_safe() in config.profiling.profile_ranks:
@@ -486,7 +477,7 @@ def training_log(
                 dump(snapshot, f)
                 print_rank_0(f"Saved memory snapshot to {filename}")
 
-    if loggers_exist and iteration % logger_config.tensorboard_log_interval == 0:
+    if writer and (iteration % logger_config.tensorboard_log_interval == 0):
         if logger_config.log_throughput_to_tensorboard:
             throughput_report = report_throughput(
                 iteration=iteration,
@@ -495,27 +486,21 @@ def training_log(
                 history_wct=history_wct,
                 window_size=logger_config.throughput_window_size,
             )
-            if writer:
-                for metric, value in throughput_report.items():
-                    writer.add_scalar(metric, value, iteration)
+            for metric, value in throughput_report.items():
+                writer.add_scalar(metric, value, iteration)
             if wandb_writer:
                 wandb_writer.log(throughput_report, iteration)
             if mlflow_logger:
                 mlflow_logger.log_metrics(_sanitize_mlflow_metrics(throughput_report), step=iteration)
-            if comet_logger:
-                comet_logger.log_metrics(throughput_report, step=iteration)
         if logger_config.log_memory_to_tensorboard:
             memory_report = report_memory(memory_keys=logger_config.memory_keys)
             memory_report = {f"memory/{mem_stat}": val for (mem_stat, val) in memory_report.items()}
-            if writer:
-                for metric, value in memory_report.items():
-                    writer.add_scalar(metric, value, iteration)
+            for metric, value in memory_report.items():
+                writer.add_scalar(metric, value, iteration)
             if wandb_writer:
                 wandb_writer.log(memory_report, iteration)
             if mlflow_logger:
                 mlflow_logger.log_metrics(_sanitize_mlflow_metrics(memory_report), step=iteration)
-            if comet_logger:
-                comet_logger.log_metrics(memory_report, step=iteration)
         if logger_config.log_runtime_to_tensorboard:
             runtime_report = report_runtime(
                 train_state=train_state,
@@ -524,54 +509,34 @@ def training_log(
                 train_iters=train_config.train_iters,
                 time_unit=logger_config.runtime_time_unit,
             )
-            if writer:
-                for metric, value in runtime_report.items():
-                    writer.add_scalar(metric, value, iteration)
+            for metric, value in runtime_report.items():
+                writer.add_scalar(metric, value, iteration)
             if wandb_writer:
                 wandb_writer.log(runtime_report, iteration)
             if mlflow_logger:
                 mlflow_logger.log_metrics(_sanitize_mlflow_metrics(runtime_report), step=iteration)
-            if comet_logger:
-                comet_logger.log_metrics(runtime_report, step=iteration)
-
-        # l2 grad norm
         if logger_config.log_l2_norm_grad_to_tensorboard:
             l2_report = report_l2_norm_grad(model)
-            if writer:
-                for metric, value in l2_report.items():
-                    writer.add_scalar(metric, value, iteration)
+            for metric, value in l2_report.items():
+                writer.add_scalar(metric, value, iteration)
             if wandb_writer:
                 wandb_writer.log(l2_report, iteration)
             if mlflow_logger:
                 mlflow_logger.log_metrics(_sanitize_mlflow_metrics(l2_report), step=iteration)
-            if comet_logger:
-                comet_logger.log_metrics(l2_report, step=iteration)
         if wandb_writer:
             wandb_writer.log({"samples vs steps": train_state.consumed_train_samples}, iteration)
         if mlflow_logger:
             mlflow_logger.log_metrics({"samples vs steps": train_state.consumed_train_samples}, step=iteration)
-
-        # learning rate
-        if learning_rate is not None:
-            if writer:
-                writer.add_scalar("learning-rate", learning_rate, iteration)
-                writer.add_scalar("learning-rate vs samples", learning_rate, train_state.consumed_train_samples)
-            if wandb_writer:
-                wandb_writer.log({"learning-rate": learning_rate}, iteration)
-            if mlflow_logger:
-                mlflow_logger.log_metrics({"learning-rate": learning_rate}, step=iteration)
-            if comet_logger:
-                comet_logger.log_metrics({"learning-rate": learning_rate}, step=iteration)
-
-        # decoupled lr
+        writer.add_scalar("learning-rate", learning_rate, iteration)
+        writer.add_scalar("learning-rate vs samples", learning_rate, train_state.consumed_train_samples)
+        if wandb_writer and learning_rate is not None:
+            wandb_writer.log({"learning-rate": learning_rate}, iteration)
+        if mlflow_logger and learning_rate is not None:
+            mlflow_logger.log_metrics({"learning-rate": learning_rate}, step=iteration)
         if config.optimizer.decoupled_lr is not None:
-            if writer:
-                writer.add_scalar("decoupled-learning-rate", decoupled_learning_rate, iteration)
-
-        # skipped samples
+            writer.add_scalar("decoupled-learning-rate", decoupled_learning_rate, iteration)
         if global_state.train_state.skipped_train_samples > 0:
-            if writer:
-                writer.add_scalar("skipped-train-samples", global_state.train_state.skipped_train_samples, iteration)
+            writer.add_scalar("skipped-train-samples", global_state.train_state.skipped_train_samples, iteration)
             if wandb_writer:
                 wandb_writer.log({"skipped-train-samples": global_state.train_state.skipped_train_samples}, iteration)
             if mlflow_logger:
@@ -579,137 +544,89 @@ def training_log(
                     {"skipped-train-samples": global_state.train_state.skipped_train_samples},
                     step=iteration,
                 )
-            if comet_logger:
-                comet_logger.log_metrics(
-                    {"skipped-train-samples": global_state.train_state.skipped_train_samples},
-                    step=iteration,
-                )
-
-        # batch size
-        if writer:
-            writer.add_scalar("batch-size", batch_size, iteration)
-            writer.add_scalar("batch-size vs samples", batch_size, global_state.train_state.consumed_train_samples)
+        writer.add_scalar("batch-size", batch_size, iteration)
+        writer.add_scalar("batch-size vs samples", batch_size, global_state.train_state.consumed_train_samples)
         if wandb_writer:
             wandb_writer.log({"batch-size": batch_size}, iteration)
         if mlflow_logger:
             mlflow_logger.log_metrics({"batch-size": batch_size}, step=iteration)
-        if comet_logger:
-            comet_logger.log_metrics({"batch-size": batch_size}, step=iteration)
-
-        # loss dict
         for key in loss_dict:
-            if writer:
-                writer.add_scalar(key, loss_dict[key], iteration)
-                writer.add_scalar(key + " vs samples", loss_dict[key], global_state.train_state.consumed_train_samples)
+            writer.add_scalar(key, loss_dict[key], iteration)
+            writer.add_scalar(key + " vs samples", loss_dict[key], global_state.train_state.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({key: loss_dict[key]}, iteration)
         if mlflow_logger:
             loss_metrics = {key: float(val) for key, val in loss_dict.items()}
             mlflow_logger.log_metrics(loss_metrics, step=iteration)
-        if comet_logger:
-            comet_logger.log_metrics({key: float(val) for key, val in loss_dict.items()}, step=iteration)
-
-        # loss scale
         if logger_config.log_loss_scale_to_tensorboard:
-            if writer:
-                writer.add_scalar("loss-scale", loss_scale, iteration)
-                writer.add_scalar("loss-scale vs samples", loss_scale, global_state.train_state.consumed_train_samples)
+            writer.add_scalar("loss-scale", loss_scale, iteration)
+            writer.add_scalar("loss-scale vs samples", loss_scale, global_state.train_state.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({"loss-scale": loss_scale}, iteration)
             if mlflow_logger:
                 mlflow_logger.log_metrics({"loss-scale": loss_scale}, step=iteration)
-            if comet_logger:
-                comet_logger.log_metrics({"loss-scale": loss_scale}, step=iteration)
-
-        # world size
         if logger_config.log_world_size_to_tensorboard:
-            if writer:
-                writer.add_scalar("world-size", get_world_size_safe(), iteration)
-                writer.add_scalar(
-                    "world-size vs samples", get_world_size_safe(), global_state.train_state.consumed_train_samples
-                )
+            writer.add_scalar("world-size", get_world_size_safe(), iteration)
+            writer.add_scalar(
+                "world-size vs samples", get_world_size_safe(), global_state.train_state.consumed_train_samples
+            )
             if wandb_writer:
                 wandb_writer.log({"world-size": get_world_size_safe()}, iteration)
             if mlflow_logger:
                 mlflow_logger.log_metrics({"world-size": get_world_size_safe()}, step=iteration)
-            if comet_logger:
-                comet_logger.log_metrics({"world-size": get_world_size_safe()}, step=iteration)
-
-        # grad norm
         if grad_norm is not None:
-            if writer:
-                writer.add_scalar("grad-norm", grad_norm, iteration)
-                writer.add_scalar("grad-norm vs samples", grad_norm, global_state.train_state.consumed_train_samples)
+            writer.add_scalar("grad-norm", grad_norm, iteration)
+            writer.add_scalar("grad-norm vs samples", grad_norm, global_state.train_state.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({"grad-norm": grad_norm}, iteration)
             if mlflow_logger:
                 mlflow_logger.log_metrics({"grad-norm": grad_norm}, step=iteration)
-            if comet_logger:
-                comet_logger.log_metrics({"grad-norm": grad_norm}, step=iteration)
-
-        # num zeros in grad
         if num_zeros_in_grad is not None:
-            if writer:
-                writer.add_scalar("num-zeros", num_zeros_in_grad, iteration)
-                writer.add_scalar(
-                    "num-zeros vs samples", num_zeros_in_grad, global_state.train_state.consumed_train_samples
-                )
+            writer.add_scalar("num-zeros", num_zeros_in_grad, iteration)
+            writer.add_scalar(
+                "num-zeros vs samples", num_zeros_in_grad, global_state.train_state.consumed_train_samples
+            )
             if wandb_writer:
                 wandb_writer.log({"num-zeros": num_zeros_in_grad}, iteration)
             if mlflow_logger:
                 mlflow_logger.log_metrics({"num-zeros": num_zeros_in_grad}, step=iteration)
-            if comet_logger:
-                comet_logger.log_metrics({"num-zeros": num_zeros_in_grad}, step=iteration)
-
-        # params norm
         if params_norm is not None:
-            if writer:
-                writer.add_scalar("params-norm", params_norm, iteration)
-                writer.add_scalar(
-                    "params-norm vs samples", params_norm, global_state.train_state.consumed_train_samples
-                )
+            writer.add_scalar("params-norm", params_norm, iteration)
+            writer.add_scalar("params-norm vs samples", params_norm, global_state.train_state.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({"params-norm": params_norm}, iteration)
             if mlflow_logger:
                 mlflow_logger.log_metrics({"params-norm": params_norm}, step=iteration)
-            if comet_logger:
-                comet_logger.log_metrics({"params-norm": params_norm}, step=iteration)
-
-        # max attention logit
         if log_max_attention_logit is not None:
-            if writer:
-                writer.add_scalar("max-attention-logit", log_max_attention_logit, iteration)
-                writer.add_scalar(
-                    "max-attention-logit vs samples",
-                    log_max_attention_logit,
-                    global_state.train_state.consumed_train_samples,
-                )
+            writer.add_scalar("max-attention-logit", log_max_attention_logit, iteration)
+            writer.add_scalar(
+                "max-attention-logit vs samples",
+                log_max_attention_logit,
+                global_state.train_state.consumed_train_samples,
+            )
             if wandb_writer:
                 wandb_writer.log({"max-attention-logit": log_max_attention_logit}, iteration)
             if mlflow_logger:
                 mlflow_logger.log_metrics({"max-attention-logit": log_max_attention_logit}, step=iteration)
-            if comet_logger:
-                comet_logger.log_metrics({"max-attention-logit": log_max_attention_logit}, step=iteration)
 
-    num_moe_experts = getattr(config.model, "num_moe_experts", None)
-    if num_moe_experts is not None:
+    if config.model.num_moe_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
 
-        moe_router_load_balancing_type = getattr(config.model, "moe_router_load_balancing_type", "")
+        moe_router_load_balancing_type = config.model.moe_router_load_balancing_type
         if "aux_loss" in moe_router_load_balancing_type:
             track_names.append("load_balancing_loss")
         if "seq_aux_loss" in moe_router_load_balancing_type:
             track_names.append("seq_load_balancing_loss")
         if "global_aux_loss" in moe_router_load_balancing_type:
             track_names.append("global_load_balancing_loss")
-        if getattr(config.model, "moe_z_loss_coeff", None) is not None:
+        if config.model.moe_z_loss_coeff is not None:
             track_names.append("z_loss")
 
-        if getattr(config.model, "is_hybrid_model", False):
-            layers = getattr(config.model, "hybrid_layer_pattern", "").count("E")
+        if config.model.is_hybrid_model:
+            layers = config.model.hybrid_layer_pattern.count("E")
         else:
-            layers = getattr(config.model, "num_layers", None)
+            layers = config.model.num_layers
 
         track_moe_metrics(
             loss_scale=moe_loss_scale,
@@ -717,15 +634,15 @@ def training_log(
             writer=writer,
             wandb_writer=wandb_writer,
             total_loss_dict=total_loss_dict,
-            per_layer_logging=getattr(config.model, "moe_per_layer_logging", False),
+            per_layer_logging=config.model.moe_per_layer_logging,
             force_initialize=True,
             track_names=track_names,
             num_layers=layers,
-            moe_layer_freq=getattr(config.model, "moe_layer_freq", None),
-            mtp_num_layers=getattr(config.model, "mtp_num_layers", None),
+            moe_layer_freq=config.model.moe_layer_freq,
+            mtp_num_layers=config.model.mtp_num_layers,
             pg_collection=pg_collection,
         )
-    if getattr(config.model, "mtp_num_layers", None) is not None:
+    if config.model.mtp_num_layers is not None:
         mtp_loss_scale = 1 / get_num_microbatches()
         MTPLossLoggingHelper.track_mtp_metrics(mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict)
 
@@ -734,39 +651,30 @@ def training_log(
         elapsed_time_per_iteration = elapsed_time / total_iterations
 
         # Calculate GPU utilization
-        num_flops = None
-        if hasattr(config.model, "kv_channels") and hasattr(config.model, "num_attention_heads"):
-            num_flops = num_floating_point_operations(config, batch_size)
-            per_gpu_tf = num_flops / elapsed_time_per_iteration / get_world_size_safe() / 1e12
-            print_rank_0(
-                f"Step Time : {elapsed_time_per_iteration:.2f}s GPU utilization: {per_gpu_tf:.1f}MODEL_TFLOP/s/GPU"
-            )
+        num_flops = num_floating_point_operations(config, batch_size)
+        per_gpu_tf = num_flops / elapsed_time_per_iteration / get_world_size_safe() / 1e12
+        print_rank_0(
+            f"Step Time : {elapsed_time_per_iteration:.2f}s GPU utilization: {per_gpu_tf:.1f}MODEL_TFLOP/s/GPU"
+        )
 
-        # throughput
-        if num_flops is not None and logger_config.log_throughput_to_tensorboard:
+        if logger_config.log_throughput_to_tensorboard:
             if writer:
                 writer.add_scalar("throughput/tflops/device", per_gpu_tf, iteration)
                 writer.add_scalar("throughput/tflops", per_gpu_tf * get_world_size_safe(), iteration)
-            if wandb_writer:
-                wandb_writer.log({"throughput/tflops/device": per_gpu_tf}, iteration)
-                wandb_writer.log({"throughput/tflops": per_gpu_tf * get_world_size_safe()}, iteration)
-            if mlflow_logger:
-                mlflow_logger.log_metrics(
-                    metrics={
-                        "throughput/tflops_per_device": per_gpu_tf,
-                        "throughput/tflops": per_gpu_tf * get_world_size_safe(),
-                    },
-                    step=iteration,
-                )
-            if comet_logger:
-                comet_logger.log_metrics(
-                    {
-                        "throughput/tflops/device": per_gpu_tf,
-                        "throughput/tflops": per_gpu_tf * get_world_size_safe(),
-                    },
-                    step=iteration,
-                )
-        # timers
+                if wandb_writer:
+                    wandb_writer.log({"throughput/tflops/device": per_gpu_tf}, iteration)
+                    wandb_writer.log({"throughput/tflops": per_gpu_tf * get_world_size_safe()}, iteration)
+                if mlflow_logger:
+                    mlflow_logger.log_metrics(
+                        _sanitize_mlflow_metrics(
+                            {
+                                "throughput/tflops/device": per_gpu_tf,
+                                "throughput/tflops": per_gpu_tf * get_world_size_safe(),
+                            }
+                        ),
+                        step=iteration,
+                    )
+
         if logger_config.log_timers_to_tensorboard:
             if writer:
                 writer.add_scalar("iteration-time", elapsed_time_per_iteration, iteration)
@@ -774,9 +682,6 @@ def training_log(
                 wandb_writer.log({"iteration-time": elapsed_time_per_iteration}, iteration)
             if mlflow_logger:
                 mlflow_logger.log_metrics({"iteration-time": elapsed_time_per_iteration}, step=iteration)
-            if comet_logger:
-                comet_logger.log_metrics({"iteration-time": elapsed_time_per_iteration}, step=iteration)
-
         log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
         log_string += " iteration {:8d}/{:8d} |".format(iteration, train_config.train_iters)
         log_string += " consumed samples: {:12d} |".format(global_state.train_state.consumed_train_samples)
@@ -784,7 +689,7 @@ def training_log(
             log_string += " skipped samples: {:12d} |".format(global_state.train_state.skipped_train_samples)
         log_string += " elapsed time per iteration (ms): {:.1f} |".format(elapsed_time_per_iteration * 1000.0)
 
-        if num_flops is not None and logger_config.log_throughput:
+        if logger_config.log_throughput:
             log_string += f" throughput per GPU (TFLOP/s/GPU): {per_gpu_tf:.1f} |"
 
         if energy_monitor is not None:
@@ -803,8 +708,6 @@ def training_log(
                     _sanitize_mlflow_metrics({"iter-energy/gpu": float(energy), "power/gpu": float(power)}),
                     step=iteration,
                 )
-            if comet_logger:
-                comet_logger.log_metrics({"iter-energy/gpu": float(energy), "power/gpu": float(power)}, step=iteration)
 
         # Decoupled_learning_rate should be not None only on first and last pipeline stage.
         log_string += f" learning rate: {learning_rate:.6E} |"
@@ -840,10 +743,7 @@ def training_log(
                 memory_string += f" | {metric}: {value}"
             if torch.distributed.get_rank(group=pg_collection.dp) == 0:
                 print("[Rank {}] {}".format(torch.distributed.get_rank(), memory_string), flush=True)
-            if iteration > (loaded_iteration + 1):
-                # Make sure the memory after the second iteration is reported
-                # to include optimizer state memory.
-                report_memory_flag = False
+            report_memory_flag = False
         timers.log(timers_to_log, normalizer=logger_config.log_interval)
 
     return report_memory_flag
@@ -933,7 +833,7 @@ def report_l2_norm_grad(model: list[MegatronModule]) -> dict:
 
     for model_chunk in model:
         for name, p in model_chunk.named_parameters():
-            if p.requires_grad and p.main_grad is not None:
+            if p.main_grad is not None and p.requires_grad:
                 if f"l2_norm/grad/{name}" not in optimizer_metrics:
                     param_grad_norm = torch.linalg.vector_norm(p.main_grad)
                     optimizer_metrics[f"l2_norm/grad/{name}"] = param_grad_norm
