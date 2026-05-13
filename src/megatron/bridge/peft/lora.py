@@ -27,6 +27,7 @@ from megatron.core.utils import unwrap_model
 from megatron.bridge.peft.base import PEFT
 from megatron.bridge.peft.lora_layers import (
     LinearAdapter,
+    LoRAGroupedExpertLinear,
     LoRALinear,
     LoRATopKRouter,
     TEFusedLoRALinear,
@@ -36,6 +37,8 @@ from megatron.bridge.peft.lora_layers import (
 from megatron.bridge.peft.module_matcher import ModuleMatcher
 from megatron.bridge.peft.utils import (
     GroupedExpertLinearAdapter,
+    HAVE_TE_COL_GRP_LINEAR,
+    HAVE_TE_ROW_GRP_LINEAR,
     ParallelLinearAdapter,
     SharedOuterGroupedExpertAdapter,
     align_expert_dim_for_tp,

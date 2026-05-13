@@ -62,6 +62,25 @@ class LoRALinear(AdapterWrapper):
         return linear_output + adapter_output, bias
 
 
+class LoRAGroupedExpertLinear(LoRALinear):
+    """LoRALinear for grouped-expert linears (TE*ParallelGroupedLinear).
+
+    The base module's forward takes ``(x, tokens_per_expert)``; the adapter
+    for shared-outer expert LoRA also needs ``tokens_per_expert`` to run its
+    per-expert GroupedLinear side. Plumb it through.
+    """
+
+    def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        linear_output, bias, layernorm_output = self.base_linear_forward(x, *args, **kwargs)
+        if not self._adapter_enabled:
+            return linear_output, bias
+        # TEGroupedMLP calls linear_fc1(x, tokens_per_expert) positionally.
+        m_splits = args[0] if args else kwargs.get("m_splits", kwargs.get("tokens_per_expert"))
+        adapter_output = self.adapter(layernorm_output.contiguous(), m_splits=m_splits)
+        adapter_output = adapter_output.reshape(linear_output.shape)
+        return linear_output + adapter_output, bias
+
+
 class LoRATopKRouter(AdapterWrapper):
     """Adapter wrapper that applies LoRA to router gating logits."""
 
