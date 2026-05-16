@@ -15,6 +15,7 @@
 # pylint: disable=C0115,C0116,C0301
 
 from dataclasses import dataclass
+from functools import partial
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -99,6 +100,16 @@ def mock_batch(  # noqa: D103
     return batch
 
 
+def _mock_collate_fn(**kwargs):
+    """Return a picklable collate function that calls mock_batch with fixed kwargs."""
+    return partial(_collate_ignore_samples, **kwargs)
+
+
+def _collate_ignore_samples(_samples, **kwargs):
+    """Collate function that ignores samples and delegates to mock_batch."""
+    return mock_batch(**kwargs)
+
+
 @dataclass(kw_only=True)
 class WanMockDataModuleConfig(DatasetProvider):  # noqa: D101
     path: str = ""
@@ -118,15 +129,17 @@ class WanMockDataModuleConfig(DatasetProvider):  # noqa: D101
     context_embeddings_dim: int = 4096
 
     def __post_init__(self):
+        import itertools
+
         mock_ds = _MockDataset(length=1024)
         kwargs = {}
         if self.num_workers > 0:
             kwargs["prefetch_factor"] = 8
-        self._train_dl = DataLoader(
+        dl = DataLoader(
             mock_ds,
             batch_size=self.micro_batch_size,
             num_workers=self.num_workers,
-            collate_fn=lambda samples: mock_batch(
+            collate_fn=_mock_collate_fn(
                 F_latents=self.F_latents,
                 H_latents=self.H_latents,
                 W_latents=self.W_latents,
@@ -141,7 +154,7 @@ class WanMockDataModuleConfig(DatasetProvider):  # noqa: D101
             pin_memory=True,
             **kwargs,
         )
-        self._train_dl = iter(self._train_dl)
+        self._train_dl = itertools.cycle(dl)
         self.sequence_length = self.seq_length
 
     def build_datasets(self, _context: DatasetBuildContext):

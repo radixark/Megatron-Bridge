@@ -21,9 +21,13 @@ import pytest
 import torch
 from megatron.core.msc_utils import MultiStorageClientFeature
 
+from megatron.bridge.utils.instantiate_utils import register_allowed_target_prefix
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+register_allowed_target_prefix("tests.")
 
 
 def pytest_configure(config):
@@ -127,7 +131,5 @@ def sample_train_state_data():
 
 
 def pytest_sessionfinish(session, exitstatus):
-    """Force immediate exit to bypass PyTorch/CUDA C++ destructor crashes during teardown."""
-    import os
-
-    os._exit(int(exitstatus))
+    if exitstatus == 5:
+        session.exitstatus = 0
