@@ -54,7 +54,8 @@ class NemotronHModelProvider(MambaModelProvider):
     moe_token_dispatcher_type: str = "alltoall"
     moe_permute_fusion: bool = True
     moe_shared_expert_overlap: bool = True
-    moe_latent_size: int | None = None
+
+    # Num layers i
 
 
 @dataclass
