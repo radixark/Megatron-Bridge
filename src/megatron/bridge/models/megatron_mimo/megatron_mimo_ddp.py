@@ -10,7 +10,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Dict, Optional
 
-from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
+try:
+    from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
+except ImportError:
+    # Backport for older Megatron-LM (e.g. radixark/miles:dev) that lacks
+    # megatron.core.models.mimo.config.role. Vendored copy lives in bridge.
+    from megatron.bridge._compat.mimo_role import MIMO_LANGUAGE_MODULE_KEY
 
 
 if TYPE_CHECKING:

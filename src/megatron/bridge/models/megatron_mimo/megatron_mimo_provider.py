@@ -21,7 +21,12 @@ import torch.distributed as dist
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.models.mimo import MimoModel
 from megatron.core.models.mimo.config.base_configs import MimoModelConfig
-from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
+try:
+    from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
+except ImportError:
+    # Backport for older Megatron-LM (e.g. radixark/miles:dev) that lacks
+    # megatron.core.models.mimo.config.role. Vendored copy lives in bridge.
+    from megatron.bridge._compat.mimo_role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
