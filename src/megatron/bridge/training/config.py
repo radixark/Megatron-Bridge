@@ -34,15 +34,68 @@ from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import MLATransformerConfig as MCoreMLATransformerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig as MCoreTransformerConfig
-from megatron.training.config import CheckpointConfig as MTrainCheckpointConfig
-from megatron.training.config import DistributedInitConfig as MTrainDistributedInitConfig
-from megatron.training.config import LoggerConfig as MTrainLoggerConfig
-from megatron.training.config import ProfilingConfig as MTrainProfilingConfig
-from megatron.training.config import RerunStateMachineConfig as MTrainRerunStateMachineConfig
-from megatron.training.config import RNGConfig, ValidationConfig
-from megatron.training.config import SchedulerConfig as MTrainSchedulerConfig
-from megatron.training.config import StragglerDetectionConfig as MTrainStragglerDetectionConfig
-from megatron.training.config import TrainingConfig as MTrainTrainingConfig
+try:
+    # Newer Megatron-LM (≥ commit 8b00c3ce, 2026-03-30): config dataclasses are
+    # consolidated into the megatron.training.config package.
+    from megatron.training.config import CheckpointConfig as MTrainCheckpointConfig
+    from megatron.training.config import DistributedInitConfig as MTrainDistributedInitConfig
+    from megatron.training.config import LoggerConfig as MTrainLoggerConfig
+    from megatron.training.config import ProfilingConfig as MTrainProfilingConfig
+    from megatron.training.config import RerunStateMachineConfig as MTrainRerunStateMachineConfig
+    from megatron.training.config import RNGConfig, ValidationConfig
+    from megatron.training.config import SchedulerConfig as MTrainSchedulerConfig
+    from megatron.training.config import StragglerDetectionConfig as MTrainStragglerDetectionConfig
+    from megatron.training.config import TrainingConfig as MTrainTrainingConfig
+except ImportError:
+    # Older Megatron-LM (e.g. radixark/miles:dev image): dataclasses are scattered
+    # across individual modules. DistributedInitConfig was added in commit 8b00c3ce
+    # and has no counterpart, so we backport an inline stub mirroring the upstream
+    # definition (kept in sync with newer Megatron-LM).
+    from megatron.training.training_config import (
+        CheckpointConfig as MTrainCheckpointConfig,
+        LoggerConfig as MTrainLoggerConfig,
+        SchedulerConfig as MTrainSchedulerConfig,
+        TrainingConfig as MTrainTrainingConfig,
+        ValidationConfig,
+    )
+    from megatron.training.common_config import (
+        ProfilingConfig as MTrainProfilingConfig,
+        RNGConfig,
+    )
+    from megatron.training.resilience_config import (
+        RerunStateMachineConfig as MTrainRerunStateMachineConfig,
+        StragglerDetectionConfig as MTrainStragglerDetectionConfig,
+    )
+
+    @dataclass(kw_only=True)
+    class MTrainDistributedInitConfig:
+        """Backport of upstream megatron.training.config.DistributedInitConfig
+        for older Megatron-LM that doesn't ship a megatron.training.config package."""
+
+        distributed_backend: Literal["nccl", "gloo"] = "nccl"
+        distributed_timeout_minutes: int = 10
+        align_grad_reduce: bool = True
+        local_rank: int = field(default_factory=lambda: int(os.getenv("LOCAL_RANK", "0")))
+        lazy_mpu_init: bool = False
+        use_megatron_fsdp: bool = False
+        use_torch_fsdp2: bool = False
+        nccl_communicator_config_path: Optional[str] = None
+        use_tp_pp_dp_mapping: bool = False
+        use_gloo_process_groups: bool = field(
+            default=True,
+            metadata={"argparse_meta": {"arg_names": ["--disable-gloo-process-groups"]}},
+        )
+        use_sharp: bool = False
+        sharp_enabled_group: Optional[Literal["dp", "dp_replica"]] = None
+        high_priority_stream_groups: Optional[list[str]] = field(default_factory=list)
+        distributed_timeout_seconds_after_init: Optional[int] = None
+        flight_recorder_dump_path: Optional[str] = None
+        flight_recorder_trace_buffer_size: int = 2000
+        flight_recorder_dump_on_timeout: bool = True
+        flight_recorder_include_stack_trace: bool = False
+        flight_recorder_include_only_active: bool = True
+        flight_recorder_extra_dump_on_exec: bool = True
+        disable_jit_fuser: bool = False
 
 from megatron.bridge.data.datasets.packed_sequence import PackedSequenceSpecs
 from megatron.bridge.models import GPTModelProvider, T5ModelProvider
