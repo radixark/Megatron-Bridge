@@ -29,7 +29,17 @@ from megatron.core.models.mamba.mamba_layer_specs import (
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.post_training.modelopt.mamba.model_specs import get_mamba_stack_modelopt_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols, parse_hybrid_pattern
+from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+
+try:
+    from megatron.core.ssm.mamba_hybrid_layer_allocation import parse_hybrid_pattern
+except ImportError:
+    # radixark/miles `miles-main` Megatron-LM fork lacks `parse_hybrid_pattern`
+    # (upstream NVIDIA added it in MTP commit 300d1b655, which miles-main
+    # branched off before). It's only used inside method paths Mamba/hybrid
+    # models take; non-Mamba consumers (gpt-oss, Qwen, Kimi) never call it.
+    # Degrade to None so the module loads everywhere.
+    parse_hybrid_pattern = None
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.enums import AttnBackend
 
