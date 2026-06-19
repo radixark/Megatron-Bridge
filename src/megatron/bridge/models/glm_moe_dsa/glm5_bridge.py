@@ -53,6 +53,19 @@ def _build_glm5_dsa_block_spec(config, *args, **kwargs):
     _orig = _eav.get_experimental_attention_variant_module_spec
 
     def _patched(config, backend=None):
+        # GLM-5.2 DSA cross-layer index sharing: when index_topk_freq>1, build our own
+        # CrossLayerDSAttention spec (megatron-core's DSA -- native or shimmed -- is per-layer
+        # only and cannot share top-k across layers). GLM-5.1 (no freq) falls through below.
+        if getattr(config, "experimental_attention_variant", None) == "dsa" and (
+            (getattr(config, "dsa_index_topk_freq", 1) or 1) > 1
+        ):
+            if backend is None:
+                backend = _eav._get_backend_spec_provider(config=config)
+            from megatron.bridge.models.glm_moe_dsa.cross_layer_dsa import (
+                get_glm5_crosslayer_dsa_spec,
+            )
+
+            return get_glm5_crosslayer_dsa_spec(config, backend)
         # Prefer megatron-core's native handling (works as-is on newer megatron-core).
         try:
             return _orig(config, backend)
@@ -187,6 +200,11 @@ class GLM5Bridge(MegatronModelBridge):
         provider.dsa_indexer_topk = hf_config.index_topk
         provider.dsa_indexer_loss_coeff = 0.001
         provider.dsa_indexer_use_sparse_loss = True
+        # GLM-5.2 DSA cross-layer index sharing. Absent in GLM-5.1 (-> freq=1 -> every layer
+        # computes its own top-k = plain DSA). When >1, CrossLayerDSAttention builds the indexer
+        # only on computing layers and skip layers reuse the most recent computing layer's top-k.
+        provider.dsa_index_topk_freq = getattr(hf_config, "index_topk_freq", 1) or 1
+        provider.dsa_index_skip_topk_offset = getattr(hf_config, "index_skip_topk_offset", 0) or 0
 
         return provider
 
