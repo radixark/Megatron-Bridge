@@ -31,6 +31,51 @@ from megatron.bridge.models.mla_provider import MLAModelProvider
 logger = logging.getLogger(__name__)
 
 
+def _build_glm5_dsa_block_spec(config, *args, **kwargs):
+    """``transformer_layer_spec`` for GLM-5 / GLM-5.1 DSA (feature-detected, self-disabling).
+
+    Older megatron-core (e.g. 0.16.0rc0): its experimental-attention dispatcher
+    (``get_experimental_attention_variant_module_spec``) only natively wires
+    ``"gated_delta_net"`` and raises ``ValueError`` for ``"dsa"``, and its DSA builder
+    (``get_dsa_module_spec_for_backend``) omits the ``metainfo`` the variant
+    layer-builder reads. Newer megatron-core handles ``"dsa"`` natively (the dispatcher
+    gained a ``== "dsa"`` branch and the DSA builder sets ``metainfo`` itself).
+
+    So this wraps the dispatcher to PREFER megatron-core's own handling, and only when it
+    raises for ``"dsa"`` (old megatron-core) back-fills via the shipped DSA builder + sets
+    ``metainfo["fuse_input_layernorm"]=False`` (MLA-based DSA keeps a separate, non-fused
+    input layernorm, like the DeepSeek-V4 ``dsv4`` spec; ``gated_delta_net`` uses ``True``).
+    => On newer megatron-core this is a transparent no-op; once the runtime's megatron-core
+    handles ``"dsa"``, this whole helper can be deleted. No megatron-core source change.
+    """
+    from megatron.core.models.gpt import experimental_attention_variant_module_specs as _eav
+
+    _orig = _eav.get_experimental_attention_variant_module_spec
+
+    def _patched(config, backend=None):
+        # Prefer megatron-core's native handling (works as-is on newer megatron-core).
+        try:
+            return _orig(config, backend)
+        except ValueError:
+            # Old megatron-core: dispatcher doesn't know "dsa". Don't mask genuine errors
+            # for other variants -- only back-fill the dsa case.
+            if getattr(config, "experimental_attention_variant", None) != "dsa":
+                raise
+            if backend is None:
+                backend = _eav._get_backend_spec_provider(config=config)
+            spec = _eav.get_dsa_module_spec_for_backend(config=config, backend=backend)
+            if spec.metainfo is None:
+                spec.metainfo = {}
+            spec.metainfo.setdefault("fuse_input_layernorm", False)
+            return spec
+
+    _eav.get_experimental_attention_variant_module_spec = _patched
+    try:
+        return _eav.get_transformer_block_with_experimental_attention_variant_spec(config, *args, **kwargs)
+    finally:
+        _eav.get_experimental_attention_variant_module_spec = _orig
+
+
 @MegatronModelBridge.register_bridge(
     source=GlmMoeDsaForCausalLM, target=GPTModel, provider=MLAModelProvider, model_type="glm_moe_dsa"
 )
@@ -57,13 +102,14 @@ class GLM5Bridge(MegatronModelBridge):
         provider = super().provider_bridge(hf_pretrained)
         hf_config = hf_pretrained.config
 
-        # Use experimental-attention spec for DSA
+        # Use experimental-attention spec for DSA. megatron-core's dispatcher raises for
+        # "dsa", so route it through _build_glm5_dsa_block_spec (which makes the DSA
+        # variant buildable + supplies the metainfo). This makes the GLM-5/5.1 bridge
+        # self-contained for both LoRA and full-FT builds (no caller-side monkey-patch).
         try:
-            from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
-                get_transformer_block_with_experimental_attention_variant_spec,
-            )
+            import megatron.core.models.gpt.experimental_attention_variant_module_specs  # noqa: F401
 
-            provider.transformer_layer_spec = get_transformer_block_with_experimental_attention_variant_spec
+            provider.transformer_layer_spec = _build_glm5_dsa_block_spec
         except (ImportError, ModuleNotFoundError):
             logger.warning("DSA spec not available; falling back to standard GPT decoder block spec.")
 
