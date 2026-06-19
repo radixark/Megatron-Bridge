@@ -145,12 +145,40 @@ class GLM5Bridge(MegatronModelBridge):
         )
         provider.moe_shared_expert_intermediate_size = hf_config.moe_intermediate_size * hf_config.n_shared_experts
 
-        # GLM5-specific: rotary_base is nested in rope_parameters
-        provider.rotary_base = hf_config.rope_parameters["rope_theta"]
+        # GLM5-specific: rope_theta is nested in rope_parameters (transformers 5.x) or flat
+        # (older / GLM-5.2 = 8e6). Handle both shapes robustly.
+        _rope_params = getattr(hf_config, "rope_parameters", None)
+        provider.rotary_base = (
+            (_rope_params.get("rope_theta") if isinstance(_rope_params, dict) else None)
+            or getattr(hf_config, "rope_theta", None)
+            or 10000
+        )
         # GLM5 uses default rope (no YaRN scaling)
         provider.rotary_scaling_factor = 1.0
         provider.mscale = 1.0
         provider.mscale_all_dim = 1.0
+
+        # GLM-5.2 / transformers>=5.12 mis-parses qk_rope_head_dim as head_dim (192) rather than
+        # the config.json value (64); the base config-mapping then sizes MLA's decoupled-rope key
+        # by 192, giving linear_kv_down_proj = kv_lora_rank + 192 = 704. The checkpoint is ground
+        # truth: kv_a_proj_with_mqa = kv_lora_rank + qk_rope_head_dim = 576 = 512 + 64, and MLA
+        # applies rotary over qk_pos_emb_head_dim. Read the rope dim straight from config.json so
+        # the dims match the weights for both GLM-5.1 (64) and GLM-5.2 (64). No-op when correct.
+        import json as _json
+        import os as _os
+
+        _cfg_dir = getattr(hf_config, "_name_or_path", "") or ""
+        _cfg_json = _os.path.join(_cfg_dir, "config.json")
+        if _os.path.isfile(_cfg_json):
+            _rope = _json.load(open(_cfg_json)).get("qk_rope_head_dim")
+            if _rope and _rope != provider.qk_pos_emb_head_dim:
+                logger.info(
+                    "GLM5 bridge: overriding qk_pos_emb_head_dim %s -> %s from config.json "
+                    "(transformers mis-parse of qk_rope_head_dim)",
+                    provider.qk_pos_emb_head_dim,
+                    _rope,
+                )
+                provider.qk_pos_emb_head_dim = _rope
 
         # DSA indexer params
         provider.experimental_attention_variant = "dsa"
