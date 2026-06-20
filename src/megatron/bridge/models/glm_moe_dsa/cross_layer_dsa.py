@@ -90,8 +90,9 @@ def assert_pp_stage_starts_on_computing_layer(config, vp_stage=None) -> None:
 # we fall back to a thread-local dict keyed by layer_number. The fallback is correct for
 # sequentially-executed micro-batches WITHOUT full activation recompute (each micro-batch's
 # forward writes the anchor before the in-stage skip layer reads it, and the next micro-batch
-# overwrites before its own skip reads). For full-recompute + bshd, prefer thd or extend the
-# carrier. (Skip layers always have their source anchor in the same PP stage; see the assert.)
+# overwrites before its own skip reads). bshd + activation recompute is UNSAFE and is rejected
+# at forward time (see the recompute guard in CrossLayerDSAttention.forward) -- use thd there.
+# (Skip layers always have their source anchor in the same PP stage; see the runtime assert.)
 _HOLDER_ATTR = "_dsa_index_share_topk_holder"
 _TLS = threading.local()
 
@@ -136,6 +137,10 @@ class CrossLayerDSAttention(DSAttention):
         # layers) and HF export / LoRA target-matching naturally omit them here.
         if self._skip_topk and hasattr(self, "indexer"):
             del self.indexer
+        # The bshd holder fallback (thread-local) is NOT recompute-safe (see ``forward``); the
+        # thd carrier on ``packed_seq_params`` is. Remember whether activation recompute is on so
+        # the forward can reject the unsafe bshd + recompute + cross-layer combination loudly.
+        self._recompute_active = self._index_share and (getattr(config, "recompute_granularity", None) is not None)
 
     def forward(
         self,
@@ -161,6 +166,20 @@ class CrossLayerDSAttention(DSAttention):
                 attn_mask_type,
                 attention_bias,
                 packed_seq_params,
+            )
+
+        # bshd (``packed_seq_params is None``) uses the thread-local holder fallback, which is
+        # NOT recompute-safe: under activation recompute a skip layer's recompute can read a stale
+        # anchor top-k (the thread-local dict is not closure-captured per microbatch the way
+        # ``packed_seq_params`` is). Fail loudly instead of silently producing wrong gradients.
+        if packed_seq_params is None and self._recompute_active:
+            raise AssertionError(
+                "DSA cross-layer index-share is not recompute-safe in the bshd layout: "
+                "packed_seq_params is None, so the per-microbatch top-k holder falls back to a "
+                "thread-local dict that activation recompute can read stale. Use --qkv-format thd "
+                "(the holder rides on packed_seq_params and is recompute-safe), or disable "
+                f"activation recompute (recompute_granularity="
+                f"{getattr(self.config, 'recompute_granularity', None)})."
             )
 
         holder = _holder(packed_seq_params)
