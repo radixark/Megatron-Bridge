@@ -48,6 +48,18 @@ def _build_glm5_dsa_block_spec(config, *args, **kwargs):
     => On newer megatron-core this is a transparent no-op; once the runtime's megatron-core
     handles ``"dsa"``, this whole helper can be deleted. No megatron-core source change.
     """
+    # GLM-5.2 cross-layer: fail early at build time if this (virtual) pipeline stage would start
+    # on a skip layer -- the per-microbatch top-k holder does not cross PP boundaries. No-op for
+    # GLM-5.1 (index_topk_freq=1) and when the layout can't be determined (runtime guard backs it).
+    if getattr(config, "experimental_attention_variant", None) == "dsa" and (
+        (getattr(config, "dsa_index_topk_freq", 1) or 1) > 1
+    ):
+        from megatron.bridge.models.glm_moe_dsa.cross_layer_dsa import (
+            assert_pp_stage_starts_on_computing_layer,
+        )
+
+        assert_pp_stage_starts_on_computing_layer(config, vp_stage=kwargs.get("vp_stage"))
+
     from megatron.core.models.gpt import experimental_attention_variant_module_specs as _eav
 
     _orig = _eav.get_experimental_attention_variant_module_spec

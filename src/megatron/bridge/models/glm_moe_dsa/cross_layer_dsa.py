@@ -48,6 +48,42 @@ def source_compute_layer(layer_number: int, skip_topk_offset: int, topk_freq: in
     return layer
 
 
+def assert_pp_stage_starts_on_computing_layer(config, vp_stage=None) -> None:
+    """Build-time guard: a (virtual) pipeline stage must not START on a skip layer.
+
+    The per-microbatch top-k holder does NOT cross pipeline boundaries, so a skip layer's source
+    computing layer must live in the same PP stage. If a stage's first layer is a skip layer, its
+    source is on a previous stage -> cross-PP top-k sharing (unsupported). Mirrors slime's
+    ``get_glm5_spec`` build-time check so a bad PP layout fails at model construction with a clear
+    message, instead of only at the first forward (the runtime guard in ``CrossLayerDSAttention``).
+
+    No-op unless cross-layer sharing is active (``dsa_index_topk_freq > 1``). If the layer layout
+    cannot be determined (e.g. parallel state not yet initialised), this silently returns and
+    leaves the runtime guard as the backstop.
+    """
+    freq = getattr(config, "dsa_index_topk_freq", 1) or 1
+    if freq <= 1:
+        return
+    offset = getattr(config, "dsa_index_skip_topk_offset", 0) or 0
+    try:
+        from megatron.core.transformer.transformer_block import get_transformer_layer_offset
+
+        layer_offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
+    except Exception:  # noqa: BLE001 - layout not determinable; runtime guard still applies
+        return
+    first_layer_number = layer_offset + 1  # Megatron layer_number is 1-indexed
+    if is_skip_topk_layer(first_layer_number, offset, freq):
+        src = source_compute_layer(first_layer_number, offset, freq)
+        raise AssertionError(
+            "DSA cross-layer index-share: this pipeline stage starts at global "
+            f"layer_number={first_layer_number}, which is a SKIP layer whose source computing "
+            f"layer={src} is on a previous pipeline stage. The per-microbatch top-k holder does "
+            "not cross PP boundaries -- choose a pipeline layout where every (virtual) stage "
+            f"begins on a computing layer (dsa_index_topk_freq={freq}, "
+            f"dsa_index_skip_topk_offset={offset})."
+        )
+
+
 # Per-microbatch top-k holder. Preferred carrier is the ``packed_seq_params`` object (thd:
 # fresh per microbatch + closure-captured by activation-checkpoint custom_forward => recompute
 # safe under PP 1F1B), matching slime. With ``--qkv-format bshd`` packed_seq_params is None, so
