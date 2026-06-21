@@ -14,6 +14,8 @@
 
 import logging
 
+import torch
+
 from megatron.core.models.gpt.gpt_model import GPTModel
 from transformers import GlmMoeDsaForCausalLM
 
@@ -29,6 +31,51 @@ from megatron.bridge.models.mla_provider import MLAModelProvider
 
 
 logger = logging.getLogger(__name__)
+
+
+class _IndexerRopeHalfSwapMapping(AutoMapping):
+    """HF<->Megatron mapping for the DSA-indexer ``wq_b``/``wk`` with a rope-half swap.
+
+    megatron-core's ``DSAIndexer`` applies RoPE to the **last** ``qk_pos_emb_head_dim`` of every
+    index head (``split([D-rope, rope])``), but the HF/DeepSeek checkpoint stores the rope dims in
+    the **first** half. Without compensation the indexer rotates the wrong dimensions (confirmed:
+    HF<->bridge index-score correlation ~0.48 vs slime ~0.70). So swap the two halves of each
+    index head's ``dsa_indexer_head_dim`` at load (self-inverse on export). Mirrors
+    THUDM/slime#2093 ``slime_plugins/mbridge/deepseek_v32.py``:
+    ``wq_b = cat([wq_b[:, rope:], wq_b[:, :rope]])`` ; ``wk = cat([wk[rope:], wk[:rope]])``.
+    """
+
+    @staticmethod
+    def _swap(w: torch.Tensor, head_dim: int, rope_dim: int) -> torch.Tensor:
+        # swap [first rope | rest] -> [rest | first rope] along each head's head_dim.
+        # wq_b [n_heads*head_dim, in] / wk [head_dim, in] (2-D); k_norm weight/bias [head_dim] (1-D).
+        if w.dim() == 1:
+            w2 = w.reshape(-1, head_dim)
+            w2 = torch.cat([w2[:, rope_dim:], w2[:, :rope_dim]], dim=1)
+            return w2.reshape(w.shape)
+        w3 = w.reshape(-1, head_dim, w.shape[-1])
+        w3 = torch.cat([w3[:, rope_dim:], w3[:, :rope_dim]], dim=1)
+        return w3.reshape(w.shape)
+
+    @staticmethod
+    def _dims(megatron_module) -> tuple[int, int]:
+        cfg = getattr(megatron_module, "config", None)
+        return (
+            getattr(cfg, "dsa_indexer_head_dim", 128) or 128,
+            getattr(cfg, "qk_pos_emb_head_dim", 64) or 64,
+        )
+
+    def hf_to_megatron(self, hf_weights, megatron_module):
+        hd, rd = self._dims(megatron_module)
+        return super().hf_to_megatron(self._swap(hf_weights, hd, rd), megatron_module)
+
+    def megatron_to_hf(self, megatron_weights, megatron_module):
+        out = super().megatron_to_hf(megatron_weights, megatron_module)
+        key = str(self.hf_param)
+        if key in out and out[key] is not None:
+            hd, rd = self._dims(megatron_module)
+            out[key] = self._swap(out[key], hd, rd)
+        return out
 
 
 def _build_glm5_dsa_block_spec(config, *args, **kwargs):
@@ -246,11 +293,7 @@ class GLM5Bridge(MegatronModelBridge):
             "decoder.layers.*.self_attention.kv_layernorm.weight": "model.layers.*.self_attn.kv_a_layernorm.weight",
             # For non-MLA attention (fallback)
             "decoder.layers.*.self_attention.linear_q_proj.weight": "model.layers.*.self_attn.q_proj.weight",
-            # DSA indexer
-            "decoder.layers.*.self_attention.core_attention.indexer.linear_wq_b.weight": "model.layers.*.self_attn.indexer.wq_b.weight",
-            "decoder.layers.*.self_attention.core_attention.indexer.linear_wk.weight": "model.layers.*.self_attn.indexer.wk.weight",
-            "decoder.layers.*.self_attention.core_attention.indexer.k_norm.weight": "model.layers.*.self_attn.indexer.k_norm.weight",
-            "decoder.layers.*.self_attention.core_attention.indexer.k_norm.bias": "model.layers.*.self_attn.indexer.k_norm.bias",
+            # DSA indexer (wq_b / wk / k_norm are mapped below with the rope-half swap)
             "decoder.layers.*.self_attention.core_attention.indexer.linear_weights_proj.weight": "model.layers.*.self_attn.indexer.weights_proj.weight",
             # Dense MLP
             "decoder.layers.*.mlp.linear_fc2.weight": "model.layers.*.mlp.down_proj.weight",
@@ -263,6 +306,31 @@ class GLM5Bridge(MegatronModelBridge):
         }
 
         mapping_list = [AutoMapping(megatron_param=k, hf_param=v) for k, v in param_mappings.items()]
+
+        # DSA indexer wq_b/wk: rope-half swap (megatron ropes the last half, HF stores rope first).
+        # Mirrors THUDM/slime#2093 slime_plugins/mbridge/deepseek_v32.py.
+        mapping_list.extend(
+            [
+                _IndexerRopeHalfSwapMapping(
+                    megatron_param="decoder.layers.*.self_attention.core_attention.indexer.linear_wq_b.weight",
+                    hf_param="model.layers.*.self_attn.indexer.wq_b.weight",
+                ),
+                _IndexerRopeHalfSwapMapping(
+                    megatron_param="decoder.layers.*.self_attention.core_attention.indexer.linear_wk.weight",
+                    hf_param="model.layers.*.self_attn.indexer.wk.weight",
+                ),
+                # k_norm is applied to the (swapped) key BEFORE rope -> its per-dim scale/bias must be
+                # swapped the same way (slime's mbridge swaps k_norm too).
+                _IndexerRopeHalfSwapMapping(
+                    megatron_param="decoder.layers.*.self_attention.core_attention.indexer.k_norm.weight",
+                    hf_param="model.layers.*.self_attn.indexer.k_norm.weight",
+                ),
+                _IndexerRopeHalfSwapMapping(
+                    megatron_param="decoder.layers.*.self_attention.core_attention.indexer.k_norm.bias",
+                    hf_param="model.layers.*.self_attn.indexer.k_norm.bias",
+                ),
+            ]
+        )
 
         # Attention (non-MLA fallback: combined QKV)
         mapping_list.extend(
