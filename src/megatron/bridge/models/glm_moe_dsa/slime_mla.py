@@ -58,6 +58,23 @@ class SlimeMLASelfAttention(MLASelfAttention):
     q/kv absorb + RoPE numerics matched to slime so the attention output bit-matches slime.
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # R3 indexer replay: register this attention's per-layer stream so the fused lighting_indexer
+        # top-k is recorded/replayed against the rollout's DSA selection (arxiv 2510.11370). The
+        # megatron-core DSAIndexer only self-registers in DeepSeek-V4 mode (dsv4_mode); for GLM
+        # (dsv4_mode=False) it does not, so -- exactly like slime's glm5.py -- we register here.
+        # Gated on the slime backend (the unfused path has no fused indexer top-k to replay) and a
+        # no-op unless --use-indexer-replay enabled the manager before the build (register_to_module
+        # returns early while disabled). Guarded so the package still imports without miles.
+        if getattr(self.config, "dsa_attention_backend", "megatron-bridge") == "slime":
+            try:
+                from miles.utils.replay_base import indexer_replay_manager
+
+                indexer_replay_manager.register_to_module(self, "indexer_replay", stream_idx=self.layer_number - 1)
+            except ImportError:
+                pass
+
     def forward(
         self,
         hidden_states,
@@ -412,6 +429,18 @@ class SlimeMLASelfAttention(MLASelfAttention):
         ends = ends.to(torch.int32)
 
         index_topk = core_attention.indexer.index_topk
+        # R3 indexer replay: select THIS layer's stream (registered on self in __init__, mirroring
+        # slime's glm5.py -- the megatron-core DSAIndexer only self-registers in DeepSeek-V4 mode,
+        # not for GLM, so we own the registration). register_to_module also installs a forward-pre-hook
+        # that does this, but the fused path computes the top-k in this helper rather than in the
+        # indexer module's own ``forward``, so we set_current explicitly instead of relying on hook
+        # ordering. No-op when --use-indexer-replay is off: ``self.indexer_replay`` is then unset
+        # (register_to_module returns early while the manager is disabled) -> ``_replay`` is None.
+        _replay = getattr(self, "indexer_replay", None)
+        if _replay is not None:
+            from miles.utils.replay_base import indexer_replay_manager
+
+            indexer_replay_manager.set_current(_replay)
         _, topk_indices = lighting_indexer(index_q, index_k, weights, starts, ends, index_topk)
         # lighting_indexer returns [S, topk]; SparseMLA wants indices [t, kv_group=1, topk].
         topk_indices = topk_indices.unsqueeze(1)

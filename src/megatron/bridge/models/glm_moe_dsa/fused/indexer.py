@@ -74,8 +74,18 @@ def lighting_indexer(
     logits = indexer_fwd_interface(index_q, index_k, weights_2d, cu_seqlen_ks, cu_seqlen_ke, clean_logits=True)
 
     if topk_indices is None:
-        # replay manager dropped in the vendored copy (miles-only debug feature); call topk directly.
-        topk_indices = _original_topk(logits, topk)
+        # R3 indexer replay (matched DSA top-k between rollout & training, arxiv 2510.11370): route
+        # the selection through miles' indexer_replay_manager when it is present + enabled, mirroring
+        # slime's indexer.py so the fused backend records/replays the indexer top-k instead of
+        # recomputing it. Guarded so the vendored kernel still imports + runs standalone (no miles),
+        # in which case it falls back to a plain top-k -- identical to the previous behaviour.
+        try:
+            from miles.utils.replay_base import indexer_replay_manager
+
+            topk_fn = indexer_replay_manager.get_topk_fn(_original_topk, return_probs=False)
+        except ImportError:
+            topk_fn = _original_topk
+        topk_indices = topk_fn(logits, topk)
 
     index_score = IndexerFunction.apply(index_q, index_k, weights_2d, cu_seqlen_ks, cu_seqlen_ke, logits, topk_indices)
     return index_score, topk_indices
