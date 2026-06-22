@@ -16,7 +16,7 @@
 
 Provides the ``slime`` sparse-attention backend: ``SparseMLA`` (sparse-MLA attention) and
 ``lighting_indexer`` (the DSA indexer), both with fwd+bwd TileLang kernels. Importing this
-package pulls in the optional ``tilelang`` + ``fast_hadamard_transform`` deps, so
+package pulls in the optional ``tilelang`` dependency, so
 ``cross_layer_dsa.py`` imports it lazily — only when ``config.dsa_attention_backend == "slime"``
 — keeping the default unfused (``megatron-bridge``) path dependency-free.
 """

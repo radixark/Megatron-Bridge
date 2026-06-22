@@ -17,7 +17,7 @@
 The default (``megatron-bridge``) backend stays byte-identical: :meth:`SlimeMLASelfAttention.forward`
 delegates to ``super().forward`` unless ``config.dsa_attention_backend == "slime"``. Only the slime
 branch runs the fused TileLang kernels (``SparseMLA`` + ``lighting_indexer``), which are imported
-lazily so the default path stays free of the optional ``tilelang`` / ``fast_hadamard_transform`` deps.
+lazily so the default path stays free of the optional ``tilelang`` dependency.
 
 Why subclass ``MLASelfAttention`` (and not just dispatch inside ``CrossLayerDSAttention``): slime's
 ``SparseMLA`` consumes the *absorbed-latent* q/kv (q ``[t, heads, kv_lora_rank + qk_pos_emb_head_dim]``,
@@ -132,10 +132,9 @@ class SlimeMLASelfAttention(MLASelfAttention):
         *,
         inference_params=None,
     ):
-        # Lazy import: only the slime branch pulls in tilelang / fast_hadamard_transform, so the
-        # package imports fine without them (the default backend stays dependency-free). Guard the
-        # import so a missing optional dep gives a clear, actionable error rather than a deep
-        # ImportError from the vendored kernels.
+        # Lazy import: only the slime branch pulls in tilelang, so the package imports fine without
+        # it (the default backend stays dependency-free). Guard the import so a missing optional dep
+        # gives a clear, actionable error rather than a deep ImportError from the vendored kernels.
         try:
             from megatron.bridge.models.glm_moe_dsa.fused import (
                 SparseMLA,
@@ -144,8 +143,8 @@ class SlimeMLASelfAttention(MLASelfAttention):
             )
         except ImportError as e:
             raise ImportError(
-                "dsa_attention_backend='slime' needs the optional fused-kernel dependencies "
-                "(tilelang + fast_hadamard_transform), which are not installed. Install them, or "
+                "dsa_attention_backend='slime' needs the optional fused-kernel dependency "
+                "tilelang, which is not installed. Install it, or "
                 "select the default backend (--dsa-attention-backend megatron-bridge)."
             ) from e
 
