@@ -48,6 +48,17 @@ class _IndexerRopeHalfSwapMapping(AutoMapping):
     def _swap(w: torch.Tensor, head_dim: int, rope_dim: int) -> torch.Tensor:
         # swap [first rope | rest] -> [rest | first rope] along each head's head_dim.
         # wq_b [n_heads*head_dim, in] / wk [head_dim, in] (2-D); k_norm weight/bias [head_dim] (1-D).
+        # Runtime guard: every indexer param folds dim-0 into head_dim-sized blocks. If it does not
+        # tile exactly, the HF layout is not the per-head [rope | rest] shape this swap assumes --
+        # refuse rather than silently mis-convert (e.g. a future GLM-5.x indexer layout change).
+        if w.shape[0] % head_dim != 0:
+            raise ValueError(
+                f"DSA-indexer rope-half swap: param leading dim {w.shape[0]} is not a multiple of "
+                f"dsa_indexer_head_dim={head_dim}. The HF indexer weight layout does not match what "
+                f"this bridge assumes (per-head blocks of dsa_indexer_head_dim with RoPE in the "
+                f"first qk_pos_emb_head_dim={rope_dim} dims). Refusing to silently mis-convert -- "
+                f"re-check the HF checkpoint's indexer layout and the index_head_dim / rope config."
+            )
         if w.dim() == 1:
             w2 = w.reshape(-1, head_dim)
             w2 = torch.cat([w2[:, rope_dim:], w2[:, :rope_dim]], dim=1)
@@ -58,11 +69,29 @@ class _IndexerRopeHalfSwapMapping(AutoMapping):
 
     @staticmethod
     def _dims(megatron_module) -> tuple[int, int]:
+        # Read the head/rope split from config. On the OWNING rank (and the entire import path)
+        # build_conversion_tasks back-fills megatron_module.config (model_bridge.py ~1596), so this
+        # resolves the real dims and the range guard below catches a genuinely changed indexer
+        # layout. On EXPORT under pipeline_model_parallel_size > 1, params this PP rank does not own
+        # get a broadcast-only "fill" task with megatron_module=None (model_bridge.py ~1626);
+        # ColumnParallelMapping.megatron_to_hf still returns the PP-broadcast full (un-swapped)
+        # tensor on that rank, so megatron_to_hf() must run the SAME swap to stay consistent across
+        # ranks. With no config to read there we fall back to the known GlmMoeDsa indexer split
+        # instead of crashing (this matches the pre-guard behavior); the owning rank still validates
+        # the real dims, so a future layout change is still caught there.
         cfg = getattr(megatron_module, "config", None)
-        return (
-            getattr(cfg, "dsa_indexer_head_dim", 128) or 128,
-            getattr(cfg, "qk_pos_emb_head_dim", 64) or 64,
-        )
+        head_dim = getattr(cfg, "dsa_indexer_head_dim", None)
+        rope_dim = getattr(cfg, "qk_pos_emb_head_dim", None)
+        if head_dim is None or rope_dim is None:
+            # GlmMoeDsa indexer split; only reached on the config-less PP-broadcast (non-owning) rank.
+            head_dim, rope_dim = 128, 64
+        if not 0 < rope_dim < head_dim:
+            raise ValueError(
+                f"DSA-indexer rope-half swap: expected 0 < qk_pos_emb_head_dim ({rope_dim}) < "
+                f"dsa_indexer_head_dim ({head_dim}). A degenerate split means the swap would be a "
+                "no-op or out-of-range -- the assumed indexer layout does not hold for this model."
+            )
+        return head_dim, rope_dim
 
     def hf_to_megatron(self, hf_weights, megatron_module):
         hd, rd = self._dims(megatron_module)
