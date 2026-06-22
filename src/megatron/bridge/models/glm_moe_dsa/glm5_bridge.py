@@ -15,7 +15,6 @@
 import logging
 
 import torch
-
 from megatron.core.models.gpt.gpt_model import GPTModel
 from transformers import GlmMoeDsaForCausalLM
 
@@ -127,7 +126,7 @@ def _build_glm5_dsa_block_spec(config, *args, **kwargs):
             return get_glm5_crosslayer_dsa_spec(config, backend)
         # Prefer megatron-core's native handling (works as-is on newer megatron-core).
         try:
-            return _orig(config, backend)
+            spec = _orig(config, backend)
         except ValueError:
             # Old megatron-core: dispatcher doesn't know "dsa". Don't mask genuine errors
             # for other variants -- only back-fill the dsa case.
@@ -139,7 +138,18 @@ def _build_glm5_dsa_block_spec(config, *args, **kwargs):
             if spec.metainfo is None:
                 spec.metainfo = {}
             spec.metainfo.setdefault("fuse_input_layernorm", False)
-            return spec
+        # GLM-5.1 (no cross-layer sharing): point the MLA self-attention at SlimeMLASelfAttention so
+        # the fused (slime) backend is dispatchable. Only meaningful when this is the DSA MLA spec.
+        # With the default "megatron-bridge" backend its forward delegates to the base class ->
+        # byte-identical. Guarded so we never re-wrap a non-DSA / non-MLA spec.
+        if (
+            getattr(config, "experimental_attention_variant", None) == "dsa"
+            and getattr(getattr(spec, "module", None), "__name__", "") == "MLASelfAttention"
+        ):
+            from megatron.bridge.models.glm_moe_dsa.slime_mla import SlimeMLASelfAttention
+
+            spec.module = SlimeMLASelfAttention
+        return spec
 
     _eav.get_experimental_attention_variant_module_spec = _patched
     try:
@@ -264,6 +274,11 @@ class GLM5Bridge(MegatronModelBridge):
         # only on computing layers and skip layers reuse the most recent computing layer's top-k.
         provider.dsa_index_topk_freq = getattr(hf_config, "index_topk_freq", 1) or 1
         provider.dsa_index_skip_topk_offset = getattr(hf_config, "index_skip_topk_offset", 0) or 0
+        # DSA sparse-attention kernel backend. Default "megatron-bridge" = the portable unfused
+        # megatron-core kernels (current behavior); "slime" = the fused TileLang kernels. Set by the
+        # miles --dsa-attention-backend arg; CrossLayerDSAttention reads it via getattr (same
+        # extra-attr pattern as dsa_index_topk_freq above, so no megatron-core config change).
+        provider.dsa_attention_backend = "megatron-bridge"
 
         return provider
 

@@ -154,18 +154,27 @@ class CrossLayerDSAttention(DSAttention):
         attention_bias=None,
         packed_seq_params=None,
     ):
-        # GLM-5.1 / no sharing -> identical to the base class.
+        backend = getattr(self.config, "dsa_attention_backend", "megatron-bridge")
+
+        # GLM-5.1 / no cross-layer sharing. With the default (unfused) backend this stays byte-for-
+        # byte the base class. With the ``slime`` backend we run the single-layer logic in-class so
+        # the sparse-attention kernel is dispatchable -- the base ``DSAttention.forward`` calls the
+        # unfused kernel directly and lives in megatron-core, so it cannot be intercepted there.
         if not self._index_share:
-            return super().forward(
-                query,
-                key,
-                value,
-                attention_mask,
-                x,
-                qr,
-                attn_mask_type,
-                attention_bias,
-                packed_seq_params,
+            if backend != "slime":
+                return super().forward(
+                    query,
+                    key,
+                    value,
+                    attention_mask,
+                    x,
+                    qr,
+                    attn_mask_type,
+                    attention_bias,
+                    packed_seq_params,
+                )
+            return self._compute_layer_forward(
+                query, key, value, attention_mask, x, qr, attn_mask_type, packed_seq_params, holder=None
             )
 
         # bshd (``packed_seq_params is None``) uses the thread-local holder fallback, which is
@@ -195,9 +204,36 @@ class CrossLayerDSAttention(DSAttention):
                     f"index_skip_topk_offset={self._skip_topk_offset}). Holder has {sorted(holder)}."
                 )
             topk_indices = holder[self._source_layer]
-            return unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
+            return self._sparse_attention(query, key, value, topk_indices)
 
         # ---- anchor layer: compute top-k (base-class logic) + publish to holder ----
+        return self._compute_layer_forward(
+            query, key, value, attention_mask, x, qr, attn_mask_type, packed_seq_params, holder=holder
+        )
+
+    def _sparse_attention(self, query, key, value, topk_indices):
+        """Dispatch the sparse-MLA attention kernel to the configured backend.
+
+        Both branches currently call the unfused megatron-core kernel; the ``slime`` fused TileLang
+        ``SparseMLA`` path is wired in a later step. Centralising the call here keeps the GLM-5.1 and
+        GLM-5.2 forwards on a single, backend-agnostic dispatch point.
+        """
+        if getattr(self.config, "dsa_attention_backend", "megatron-bridge") == "slime":
+            # TODO(fused backend, Step 4): call the TileLang SparseMLA kernel here. Until it is
+            # wired the slime backend uses the unfused kernel so the plumbing is regression-safe.
+            return unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
+        return unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
+
+    def _compute_layer_forward(
+        self, query, key, value, attention_mask, x, qr, attn_mask_type, packed_seq_params, holder
+    ):
+        """Compute this layer's indexer top-k and run sparse attention (anchor / plain-DSA path).
+
+        Mirrors the base ``DSAttention.forward`` but (a) routes the sparse-attention kernel through
+        :meth:`_sparse_attention` so the backend is dispatchable, and (b) optionally publishes the
+        top-k to ``holder`` for cross-layer sharing (``holder=None`` for GLM-5.1, which has no skip
+        layers, so it behaves exactly like the base class apart from the kernel dispatch).
+        """
         sq, b, np, hn = query.size()
         skv = key.size(0)
         x = x.detach()
@@ -236,15 +272,17 @@ class CrossLayerDSAttention(DSAttention):
                     layer_number=self.layer_number,
                     num_layers=self.config.num_layers,
                 )
-            holder[self.layer_number] = topk_indices
-            output = unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
+            if holder is not None:
+                holder[self.layer_number] = topk_indices
+            output = self._sparse_attention(query, key, value, topk_indices)
             output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
         else:
             _, topk_indices = self.indexer.forward_with_scores(
                 x, qr, mask=float_mask, packed_seq_params=packed_seq_params
             )
-            holder[self.layer_number] = topk_indices
-            output = unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
+            if holder is not None:
+                holder[self.layer_number] = topk_indices
+            output = self._sparse_attention(query, key, value, topk_indices)
 
         return output
 
@@ -270,6 +308,12 @@ def get_glm5_crosslayer_dsa_spec(config, backend=None):
         backend = _eav._get_backend_spec_provider(config=config)
     spec = _eav.get_dsa_module_spec_for_backend(config=config, backend=backend)
     spec.submodules.core_attention.module = CrossLayerDSAttention
+    # Point the MLA self-attention module at SlimeMLASelfAttention so the fused (slime) backend is
+    # dispatchable from the MLA level (where the absorbed-latent q/kv live). With the default
+    # "megatron-bridge" backend its forward delegates to MLASelfAttention.forward -> unchanged.
+    from megatron.bridge.models.glm_moe_dsa.slime_mla import SlimeMLASelfAttention
+
+    spec.module = SlimeMLASelfAttention
     if spec.metainfo is None:
         spec.metainfo = {}
     spec.metainfo.setdefault("fuse_input_layernorm", False)
