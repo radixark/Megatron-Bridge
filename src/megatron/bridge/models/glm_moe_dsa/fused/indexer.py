@@ -33,9 +33,19 @@ def pytorch_extract_topk_scores(logits, topk_indices, dim=-1):
 
 
 def _original_topk(logits, topk):
-    score, indices = torch.topk(logits, topk, dim=-1)
-    indices = indices.to(torch.int32)
-    return indices.masked_fill(score == -torch.inf, -1)
+    # Short sequence (seq_len_kv < index_topk): the indexer degenerates to dense. torch.topk cannot
+    # select more entries than exist ("selected index k out of range"), so cap k and pad the
+    # selection back out to the fixed `topk` width with -1 (invalid). This matches the
+    # rollout-captured indexer top-k shape that R3 replay asserts ([n_tokens, topk]) and that
+    # SparseMLA expects; -1 is the same sentinel masked_fill uses for out-of-window picks, which
+    # downstream ignores. The long-sequence path (k == topk) is unchanged.
+    k = min(topk, logits.shape[-1])
+    score, indices = torch.topk(logits, k, dim=-1)
+    indices = indices.to(torch.int32).masked_fill(score == -torch.inf, -1)
+    if k < topk:
+        pad = torch.full((*indices.shape[:-1], topk - k), -1, dtype=torch.int32, device=indices.device)
+        indices = torch.cat([indices, pad], dim=-1)
+    return indices
 
 
 class IndexerFunction(torch.autograd.Function):
