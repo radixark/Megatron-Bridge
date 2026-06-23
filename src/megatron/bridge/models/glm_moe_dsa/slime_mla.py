@@ -43,7 +43,10 @@ attention output -- bit-match slime. The indexer top-k still goes through the br
 
 import torch
 from megatron.core import parallel_state
-from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+from megatron.core.tensor_parallel.mappings import (
+    gather_from_sequence_parallel_region,
+    scatter_to_sequence_parallel_region,
+)
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 from megatron.core.utils import deprecate_inference_params
 
@@ -423,7 +426,19 @@ class SlimeMLASelfAttention(MLASelfAttention):
         # lighting_indexer's fwd kernel declares Weights as float32 (slime feeds fp32 here too).
         weights = weights.float().contiguous()
 
+        # cu_seqlens_q spans the FULL packed sequence, so generate_varlen_mask_params yields
+        # per-query starts/ends of length S_full. The fused lighting_indexer kernel derives its
+        # query count from index_q.shape[0] and requires starts/ends (CuSeqLenKS/KE) to have the
+        # SAME first dim. After _slime_index_qkw, index_q/index_k/weights are SP-gathered to the
+        # full-over-TP, CP-local token dim (S_full/CP per rank); the FULL-length starts/ends must
+        # be brought to the same token dim. Mirror slime's glm5.py exactly: scatter starts/ends
+        # over the CONTEXT-PARALLEL group (CP=1 -> no-op, so SP-only runs keep the full length to
+        # match the SP-gathered index_q; CP>1 -> each rank keeps its S_full/CP slice). Without this
+        # the kernel aborts with "CuSeqLenKS shape[0] expected <S> but got <S/TP>".
         starts, ends = generate_varlen_mask_params(packed_seq_params.cu_seqlens_q)
+        cp_group = parallel_state.get_context_parallel_group()
+        starts = scatter_to_sequence_parallel_region(starts, group=cp_group)
+        ends = scatter_to_sequence_parallel_region(ends, group=cp_group)
         starts = starts.to(torch.int32)
         ends = ends.to(torch.int32)
 
@@ -483,9 +498,24 @@ class SlimeMLASelfAttention(MLASelfAttention):
         cu_seqlens_q = packed_seq_params.cu_seqlens_q
         cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
 
+        # SP/CP token-dim contract (mirrors slime glm5.py get_absorb_query_key_value_tensors,
+        # indexer section). The indexer projections run on the SP-LOCAL hidden / q_compressed
+        # (S_full/TP tokens per rank). The fused lighting_indexer needs them reconciled to the
+        # full-over-TP, CP-local token dim:
+        #   * index_q: SP all-gather (over the TP group) -> S_full-over-TP (CP-local). The RoPE
+        #     below (_fuse_rope gathered=False) then does the CP repeat/slice, so index_q must
+        #     already be SP-full here for the cu_seqlens_q (FULL) RoPE to line up. (slime l.538-539)
+        #   * index_k: SP all-gather AND CP all-gather -> FULL S_full (keys are dense across CP;
+        #     RoPE gathered=True). (slime l.544-546)
+        #   * head_weights: SP all-gather -> matches index_q's token dim. (slime l.554-555)
+        # At CP=1 the CP gathers are no-ops; SP=1 makes the SP gathers no-ops. starts/ends are
+        # reconciled symmetrically in _slime_topk (CP-scatter of the FULL-length starts/ends).
+
         # index_q: wq_b on the (post-q_layernorm) compressed q.
         index_q, _ = indexer.linear_wq_b(q_compressed)
         index_q = index_q.view(*index_q.size()[:-1], index_n_heads, index_head_dim)
+        if config.sequence_parallel:
+            index_q = gather_from_sequence_parallel_region(index_q)
 
         # index_k: wk on hidden, k_norm in fp32 (slime uses eps=1e-6), back to bf16.
         index_k, _ = indexer.linear_wk(hidden_states)
@@ -497,6 +527,9 @@ class SlimeMLASelfAttention(MLASelfAttention):
             bias=indexer.k_norm.bias.float() if getattr(indexer.k_norm, "bias", None) is not None else None,
             eps=1e-6,
         ).to(torch.bfloat16)
+        if config.sequence_parallel:
+            index_k = gather_from_sequence_parallel_region(index_k)
+        index_k = gather_from_sequence_parallel_region(index_k, group=parallel_state.get_context_parallel_group())
         index_k = index_k.unsqueeze(1)  # [t, 1, index_head_dim]
 
         # head_weights: fp32 router-gating linear, scaled by n_heads**-.5 * head_dim**-.5.
@@ -508,6 +541,8 @@ class SlimeMLASelfAttention(MLASelfAttention):
         weights_proj = getattr(indexer.linear_weights_proj, "to_wrap", indexer.linear_weights_proj)
         head_weights = RouterGatingLinearFunction.apply(hidden_states, weights_proj.weight, None, torch.float32)
         head_weights = head_weights.squeeze(1) * ((index_n_heads**-0.5) * (index_head_dim**-0.5))
+        if config.sequence_parallel:
+            head_weights = gather_from_sequence_parallel_region(head_weights)
 
         # RoPE (interleaved branch -- indexer_rope_interleave=True for GLM-5.2): split [no_pe | pe],
         # apex-rope the pe half, re-cat. The wq_b/wk rope-half swap at load makes the bridge's
