@@ -22,7 +22,7 @@ import threading
 
 import torch
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.experimental_attention_variant.dsa import (
+from megatron.bridge.models.glm5.unfused import (
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
     DSAttention,
@@ -311,7 +311,7 @@ def get_glm5_crosslayer_dsa_spec(config, backend=None):
     # Point the MLA self-attention module at SlimeMLASelfAttention so the fused (slime) backend is
     # dispatchable from the MLA level (where the absorbed-latent q/kv live). With the default
     # "megatron-bridge" backend its forward delegates to MLASelfAttention.forward -> unchanged.
-    from megatron.bridge.models.glm_moe_dsa.slime_mla import SlimeMLASelfAttention
+    from megatron.bridge.models.glm5.fused.slime_mla import SlimeMLASelfAttention
 
     spec.module = SlimeMLASelfAttention
     if spec.metainfo is None:

@@ -50,7 +50,7 @@ from megatron.core.tensor_parallel.mappings import (
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 from megatron.core.utils import deprecate_inference_params
 
-from megatron.bridge.models.glm_moe_dsa.cross_layer_dsa import _holder
+from megatron.bridge.models.glm5.cross_layer_dsa_dispatch import _holder
 
 
 class SlimeMLASelfAttention(MLASelfAttention):
@@ -139,7 +139,7 @@ class SlimeMLASelfAttention(MLASelfAttention):
         # it (the default backend stays dependency-free). Guard the import so a missing optional dep
         # gives a clear, actionable error rather than a deep ImportError from the vendored kernels.
         try:
-            from megatron.bridge.models.glm_moe_dsa.fused import (
+            from megatron.bridge.models.glm5.fused import (
                 SparseMLA,
                 generate_varlen_mask_params,
                 lighting_indexer,

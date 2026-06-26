@@ -129,7 +129,7 @@ def _build_glm5_dsa_block_spec(config, *args, **kwargs):
     if getattr(config, "experimental_attention_variant", None) == "dsa" and (
         (getattr(config, "dsa_index_topk_freq", 1) or 1) > 1
     ):
-        from megatron.bridge.models.glm_moe_dsa.cross_layer_dsa import (
+        from megatron.bridge.models.glm5.cross_layer_dsa_dispatch import (
             assert_pp_stage_starts_on_computing_layer,
         )
 
@@ -148,7 +148,7 @@ def _build_glm5_dsa_block_spec(config, *args, **kwargs):
         ):
             if backend is None:
                 backend = _eav._get_backend_spec_provider(config=config)
-            from megatron.bridge.models.glm_moe_dsa.cross_layer_dsa import (
+            from megatron.bridge.models.glm5.cross_layer_dsa_dispatch import (
                 get_glm5_crosslayer_dsa_spec,
             )
 
@@ -175,7 +175,7 @@ def _build_glm5_dsa_block_spec(config, *args, **kwargs):
             getattr(config, "experimental_attention_variant", None) == "dsa"
             and getattr(getattr(spec, "module", None), "__name__", "") == "MLASelfAttention"
         ):
-            from megatron.bridge.models.glm_moe_dsa.slime_mla import SlimeMLASelfAttention
+            from megatron.bridge.models.glm5.fused.slime_mla import SlimeMLASelfAttention
 
             spec.module = SlimeMLASelfAttention
         return spec

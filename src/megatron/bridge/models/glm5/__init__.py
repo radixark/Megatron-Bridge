@@ -43,7 +43,7 @@ deliberate choice. GLM-5.2's cross-layer index sharing (``index_topk_freq`` /
 backends -- no extra CLI args.
 """
 
-from megatron.bridge.models.glm_moe_dsa.glm5_bridge import GLM5Bridge
+from megatron.bridge.models.glm5.glm5_bridge import GLM5Bridge
 
 
 __all__ = [

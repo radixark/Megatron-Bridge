@@ -59,7 +59,7 @@ from megatron.bridge.models.gemma_vl import (
 from megatron.bridge.models.glm import (
     GLM45Bridge,
 )
-from megatron.bridge.models.glm_moe_dsa import (
+from megatron.bridge.models.glm5 import (
     GLM5Bridge,
 )
 from megatron.bridge.models.glm_vl import (
