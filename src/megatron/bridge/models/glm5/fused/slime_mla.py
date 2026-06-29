@@ -342,10 +342,16 @@ class SlimeMLASelfAttention(MLASelfAttention):
         # so all-gather it to the full rank before the matmul. linear_out already matches the local
         # output shard of the base weight.
         if tp_size > 1 and not getattr(adapter, "input_is_parallel", False) and linear_in.shape[0] * tp_size == dim:
-            import torch.distributed as dist
+            # Differentiable all-gather so the LoRA-A (linear_in) gradient flows back. The gathered
+            # full linear_in is used in EVERY TP rank's local delta, so its adjoint is reduce-scatter
+            # (sum grads across TP ranks, then scatter each rank's shard). Plain torch.distributed
+            # all_gather has no autograd -> it silently detached linear_in and froze LoRA-A on the
+            # fused path; the autograd-aware variant restores the gradient.
+            from torch.distributed.nn.functional import all_gather as _diff_all_gather
 
-            gathered = [torch.empty_like(linear_in) for _ in range(tp_size)]
-            dist.all_gather(gathered, linear_in.contiguous(), group=parallel_state.get_tensor_model_parallel_group())
+            gathered = _diff_all_gather(
+                linear_in.contiguous(), group=parallel_state.get_tensor_model_parallel_group()
+            )
             linear_in = torch.cat(gathered, dim=0)
 
         delta = scale * (linear_out.to(weight.dtype) @ linear_in.to(weight.dtype))
