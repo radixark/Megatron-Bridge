@@ -237,11 +237,26 @@ class GPTOSSMLPDownProjMapping(AutoMapping):
 
     def hf_to_megatron(self, hf_weights: torch.Tensor, megatron_module: nn.Module) -> torch.Tensor:
         global_expert_number = extract_expert_number_from_param(self.megatron_param)
-        return super().hf_to_megatron(hf_weights[global_expert_number], megatron_module)
+        expert_weight = hf_weights[global_expert_number]
+        # HF stores down_proj as [intermediate(in), hidden(out)], but Megatron RowParallelLinear
+        # expects [hidden(out), intermediate(in)]. down_proj is square (intermediate == hidden) for
+        # some GPT-OSS sizes (e.g. 20B: 2880x2880), so shape-based auto-detection is ambiguous and
+        # would silently leave the weight transposed -> always transpose explicitly.
+        # (The 1-D down_proj_bias also routes through this mapping and must pass through untouched.)
+        if expert_weight.ndim == 2:
+            normalized_param = self._normalize_expert_param_name(self.megatron_param)
+            _, target_param = get_module_and_param_from_name(megatron_module, normalized_param)
+            expert_weight = _align_expert_weight_to_shape(
+                expert_weight, target_param.shape, "down_proj", transpose_hint=True
+            )
+        return super().hf_to_megatron(expert_weight, megatron_module)
 
     def megatron_to_hf(self, megatron_weights: torch.Tensor, megatron_module: nn.Module) -> Dict[str, torch.Tensor]:
         if megatron_weights is None:
             return super().megatron_to_hf(megatron_weights, megatron_module)
+        # Invert the load-time transpose so HF round-trips to [intermediate(in), hidden(out)].
+        if megatron_weights.ndim == 2:
+            megatron_weights = megatron_weights.transpose(0, 1)
         return super().megatron_to_hf(megatron_weights.contiguous(), megatron_module)
 
 

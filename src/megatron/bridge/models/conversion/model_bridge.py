@@ -1010,8 +1010,9 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
 
         _hf_import_cache: Dict[str, torch.Tensor] = {}
         for task in self._with_progress_tracking(hf_to_megatron_tasks, description):
-            # None means megatron module not on current rank, skip if this task is not going to happen
-            if task.megatron_module is None:
+            # None task: param had no HF mapping (e.g. Gemma 4 post_shared_expert_layernorm
+            # is megatron-side only, not in HF); skip.
+            if task is None or task.megatron_module is None:
                 continue
             # 1) Fetch source tensor(s) from HF state dict, with caching for grouped mappings
             hf_param_key = str(task.mapping.hf_param)
@@ -1236,12 +1237,17 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
         # Pre-compute expected expert counts for grouped export mappings
         _grouped_task_counts: Dict[str, int] = {}
         for task in megatron_to_hf_tasks:
+            if task is None:
+                # Megatron-side param had no HF mapping; skip.
+                continue
             if task is not None and getattr(task.mapping, "is_grouped_export", False):
                 gk = task.mapping.group_key
                 _grouped_task_counts[gk] = _grouped_task_counts.get(gk, 0) + 1
         _grouped_buffers: Dict[str, Dict[int, torch.Tensor]] = {}
 
         for task in self._with_progress_tracking(megatron_to_hf_tasks, "Converting to HuggingFace", show_progress):
+            if task is None:
+                continue
             if isinstance(task.param_weight, DTensor):
                 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
                     uneven_dtensor_to_full_tensor,

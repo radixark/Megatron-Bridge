@@ -47,12 +47,9 @@ def can_enable_gradient_accumulation_fusion() -> bool:
     Returns:
         bool: True if gradient accumulation fusion is available via either backend.
     """
-    try:
-        import transformer_engine.pytorch  # noqa: F401
-
-        return True
-    except ImportError:
-        pass
+    # MILES PATCH: TE has wgrad_accumulation only via TELinear; ColumnParallelLinear
+    # still requires APEX fused_weight_gradient_mlp_cuda. Skip the TE shortcut.
+    pass  # was: try: import transformer_engine.pytorch; return True
 
     try:
         import fused_weight_gradient_mlp_cuda  # noqa: F401

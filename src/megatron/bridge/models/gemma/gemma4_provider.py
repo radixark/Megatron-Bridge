@@ -39,7 +39,9 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.moe_utils import MoECudaGraphPartialCaptureSignal
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from torch import Tensor
@@ -53,7 +55,6 @@ from megatron.bridge.models.gemma.modules import extend_instance
 from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.bridge.utils.import_utils import safe_import_from
 
-
 if TYPE_CHECKING:
     from megatron.core.models.gpt import GPTModel as MCoreGPTModel
 
@@ -61,6 +62,7 @@ if TYPE_CHECKING:
 HAVE_TE = safe_import_from("megatron.core.extensions.transformer_engine", "TENorm")[1]
 TENorm, _ = safe_import_from("megatron.core.extensions.transformer_engine", "TENorm")
 TEDotProductAttention, _ = safe_import_from("megatron.core.extensions.transformer_engine", "TEDotProductAttention")
+te_checkpoint, _ = safe_import_from("megatron.core.extensions.transformer_engine", "te_checkpoint")
 
 
 @dataclass
@@ -78,8 +80,7 @@ class Gemma4ModelProvider(GPTModelProvider):
     rotary_base: tuple = (10_000, 1_000_000)  # (local/sliding, global/full)
     share_embeddings_and_output_weights: bool = True
 
-    # Norm — Gemma 4 uses STANDARD RMSNorm (x * w / rms(x)), NOT zero-centered gamma.
-    # This differs from Gemma 1/2/3 which use zero-centered gamma (x * (1+w) / rms(x)).
+    # Gemma-4 uses standard RMSNorm, not Gemma 1/2/3's zero-centered gamma
     normalization: str = "RMSNorm"
     layernorm_zero_centered_gamma: bool = False
     layernorm_epsilon: float = 1e-6
@@ -99,6 +100,9 @@ class Gemma4ModelProvider(GPTModelProvider):
     global_head_dim: int = 512
     num_global_key_value_heads: int = 2
     global_rotary_percent: float = 0.25
+
+    # K=V tying for global-attn layers (v_proj absent in HF ckpt); from config.attention_k_eq_v
+    attention_k_eq_v: bool = False
 
     # MLP / Activation
     gated_linear_unit: bool = True
@@ -188,25 +192,17 @@ class Gemma4ModelProvider(GPTModelProvider):
 
 
 class Gemma4TransformerLayer(TransformerLayer):
-    """Gemma 4 transformer layer with per-layer output scaling and extra post-norms.
-
-    Gemma 4 has architectural features not present in standard MCore:
-    - ``layer_scalar``: per-layer scaling applied to the full hidden state after residual add.
-    - ``post_ffn_layernorm``: norm applied to the combined dense+MoE output before residual add
-      (HF's ``post_feedforward_layernorm``).
-    - ``post_moe_layernorm``: norm applied to routed expert output before combining with dense
-      (HF's ``post_feedforward_layernorm_2``). Applied via a forward hook on the MoE layer.
-    """
+    """Gemma-4 transformer layer: per-layer output scaling (layer_scalar) + post-feedforward norms."""
 
     def __init__(self, config, submodules, layer_number=1, **kwargs):
         super().__init__(config=config, submodules=submodules, layer_number=layer_number, **kwargs)
         self.register_buffer("layer_scalar", torch.ones(1, dtype=config.params_dtype))
-        # HF pre_feedforward_layernorm (dense/shared-expert pre-norm) has no MCore
-        # counterpart — stored as an inert buffer so it round-trips through export.
-        self.register_buffer("pffl_weight", torch.ones(config.hidden_size, dtype=config.params_dtype))
 
-        # Post-feedforward layernorm: applied to combined dense+MoE output before residual add
-        # (HF: post_feedforward_layernorm)
+        # Gemma-4 has dual pre-norm; MCore's single pre_mlp_layernorm can't represent both
+        # (ratio-fusion into shared-expert weights destroys bf16). No-op it; Gemma4MoELayer
+        # applies both norms internally on the un-normed input.
+        self.pre_mlp_layernorm = torch.nn.Identity()
+
         NormImpl = TENorm if HAVE_TE else torch.nn.Identity
         self.post_ffn_layernorm = NormImpl(
             config=config,
@@ -214,21 +210,17 @@ class Gemma4TransformerLayer(TransformerLayer):
             eps=config.layernorm_epsilon,
         )
 
-    def _forward_post_mlp(self, mlp_output_with_bias, residual):
-        """Override to apply post_ffn_layernorm before residual add, then layer_scalar."""
+    def _forward_post_mlp(self, mlp_output_with_bias, residual, *, hc_ffn_post=None, hc_ffn_comb=None):
+        # post_ffn_layernorm(mlp_out), residual add, then * layer_scalar (HF parity); hc_* are unused DSV4 kwargs
         from megatron.core.utils import make_viewless_tensor
 
-        # Apply post_ffn_layernorm to the MLP output before residual add
         mlp_out = mlp_output_with_bias[0]
         mlp_bias = mlp_output_with_bias[1] if len(mlp_output_with_bias) > 1 else None
 
-        # Post-feedforward norm (HF: post_feedforward_layernorm)
         normed = self.post_ffn_layernorm(mlp_out)
         if isinstance(normed, tuple):
             normed = normed[0]
 
-        # Residual add then per-layer scaling:
-        # HF: hidden_states = (residual + post_ffn_norm(mlp_out)) * layer_scalar
         if mlp_bias is not None:
             normed = normed + mlp_bias
         hidden_states = (residual + normed) * self.layer_scalar
@@ -238,14 +230,7 @@ class Gemma4TransformerLayer(TransformerLayer):
 
 
 class Gemma4TopKRouter(TopKRouter):
-    """Gemma 4 MoE router with per-expert scaling.
-
-    Applies ``per_expert_scale`` to the routing probs after standard routing.
-    Also renormalizes top-k weights before scaling (matching HF behavior).
-
-    The router's input preprocessing (parameter-free RMSNorm + ``scale * scalar_root_size``)
-    is fused into the router weight at load time in the bridge.
-    """
+    """Gemma-4 MoE router: renormalize top-k weights and apply per_expert_scale (HF parity)."""
 
     def __init__(self, config, **kwargs):
         super().__init__(config=config, **kwargs)
@@ -253,41 +238,57 @@ class Gemma4TopKRouter(TopKRouter):
             "per_expert_scale",
             torch.ones(config.num_moe_experts, dtype=config.params_dtype),
         )
-        # HF router.scale (per-channel input scaling, fused into router weight on import)
-        # — stored as an inert buffer so it round-trips through export.
+        # HF router.scale, fused into the router weight on import; inert buffer for round-trip
         self.register_buffer(
             "scale",
             torch.ones(config.hidden_size, dtype=config.params_dtype),
         )
 
-    def routing(self, logits, padding_mask=None):
-        """Apply standard routing, then renormalize and scale by per_expert_scale."""
-        routing_probs, routing_map = super().routing(logits, padding_mask=padding_mask)
-        # routing_probs: [num_tokens, num_experts] sparse — non-zero at selected experts
-        # routing_map: [num_tokens, num_experts] boolean mask
-        #
-        # HF does: top_k_weights /= top_k_weights.sum(); top_k_weights *= per_expert_scale
-        # In MCore sparse format, renormalize selected probs and apply per_expert_scale
+    def routing(self, logits, padding_mask=None, **kwargs):
+        # **kwargs passes through whatever base router.forward threads in (e.g. input_ids on newer Megatron-LM);
+        # do NOT forward input_ids unconditionally — this Megatron-LM's base routing rejects it
+        routing_probs, routing_map = super().routing(logits, padding_mask=padding_mask, **kwargs)
         if routing_map is not None:
-            # Renormalize: divide each token's selected probs by their sum
+            # renormalize top-k weights, then per-expert scale (matches HF)
             prob_sums = routing_probs.sum(dim=-1, keepdim=True).clamp(min=1e-20)
-            routing_probs = routing_probs / prob_sums
-            # Apply per-expert scale element-wise (broadcasting over tokens)
-            routing_probs = routing_probs * self.per_expert_scale.unsqueeze(0)
+            routing_probs = routing_probs / prob_sums * self.per_expert_scale.unsqueeze(0)
         return routing_probs, routing_map
+
+    def gating(self, input):
+        """sglang-faithful router input preprocessing.
+
+        sglang Gemma4Router: x = RMSNorm_noweight(x); x = x * (scale * hidden^-0.5); proj(x).
+        We do the parameter-free RMSNorm + per-channel scale + root_size here on the
+        UN-NORMED residual, then apply the RAW proj weight (no w2 fusion). This avoids
+        the bf16 division-by-w2 in the old _fuse_router_weight (w2 has ~5% near-zero
+        channels → catastrophic router-logit error on tokens activating them).
+        """
+        x = input.float()
+        var = x.pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(var + self.config.layernorm_epsilon)
+        root_size = self.config.hidden_size**-0.5
+        x = x * (self.scale.float() * root_size)
+        return super().gating(x.type_as(input))
 
 
 class Gemma4MoELayer(MoELayer):
-    """Gemma 4 MoE layer with post-routed-expert and post-shared-expert normalization.
-
-    Applies ``post_feedforward_layernorm_2`` (pffl_ln2) to routed expert output and
-    ``post_feedforward_layernorm_1`` (pffl_ln1) to shared expert output before combining.
-    Standard MCore MoELayer simply sums routed + shared outputs without any intermediate norms.
-    """
+    """Gemma-4 MoE layer: applies HF's dual pre-norm (shared vs routed path) and dual post-norm internally."""
 
     def __init__(self, config, submodules, **kwargs):
         super().__init__(config=config, submodules=submodules, **kwargs)
         NormImpl = TENorm if HAVE_TE else torch.nn.Identity
+        # HF: pre_feedforward_layernorm — applied to shared-expert input
+        self.pre_shared_layernorm = NormImpl(
+            config=config,
+            hidden_size=config.hidden_size,
+            eps=config.layernorm_epsilon,
+        )
+        # HF: pre_feedforward_layernorm_2 — applied to router + routed-expert input
+        self.pre_moe_layernorm = NormImpl(
+            config=config,
+            hidden_size=config.hidden_size,
+            eps=config.layernorm_epsilon,
+        )
         # HF: post_feedforward_layernorm_2 — applied to routed expert output
         self.post_moe_layernorm = NormImpl(
             config=config,
@@ -300,6 +301,85 @@ class Gemma4MoELayer(MoELayer):
             hidden_size=config.hidden_size,
             eps=config.layernorm_epsilon,
         )
+
+    @staticmethod
+    def _unwrap(out):
+        return out[0] if isinstance(out, tuple) else out
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        intermediate_tensors=None,
+        padding_mask: Optional[torch.Tensor] = None,
+        input_ids=None,  # compat: newer Megatron-LM threads input_ids to MoE layers; unused (hidden_size_per_layer_input=0)
+    ):
+        """MoE forward with HF dual pre-norm.
+
+        Replicates the parent MoELayer.forward but applies pre_shared_layernorm
+        to the shared-expert path and pre_moe_layernorm to the router /
+        routed-expert path, using the same un-normed input.
+        """
+        if self.training and self.attn_tp_group.size() > 1 and not self.config.sequence_parallel:
+            raise ValueError(
+                "During training, performance may degrade if MoE and tensor parallelism"
+                " are enabled without also enabling sequence parallelism."
+            )
+        if padding_mask is not None:
+            padding_mask = padding_mask.transpose(0, 1).bool()
+
+        def custom_forward(hidden_states, intermediate_tensors, padding_mask=None):
+            shared_normed = self._unwrap(self.pre_shared_layernorm(hidden_states))
+            routed_normed = self._unwrap(self.pre_moe_layernorm(hidden_states))
+
+            shared_expert_output = None
+            output, mlp_bias = None, None
+            try:
+                if "route" in self.fwd_execution_map:
+                    shared_expert_output = self.shared_experts_compute(shared_normed)
+                    # Router gets the UN-NORMED residual; Gemma4TopKRouter.gating applies
+                    # parameter-free RMSNorm + scale*root (sglang design). Routed experts
+                    # still consume the w2-normed routed_normed.
+                    probs, routing_map = self.route(hidden_states, padding_mask)
+                    routed_normed, probs = self.preprocess(routed_normed, probs, routing_map)
+                    if intermediate_tensors is not None:
+                        return routed_normed, probs, shared_expert_output
+            except MoECudaGraphPartialCaptureSignal as e:
+                return e.get_early_return_outputs(routed_normed, shared_expert_output)
+
+            if "expert_compute" in self.fwd_execution_map:
+                if intermediate_tensors is not None:
+                    routed_normed, probs = intermediate_tensors
+                dispatched_input, probs = self.dispatch(routed_normed, probs)
+                output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
+                assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+                output = self.combine(output)
+                if intermediate_tensors is not None:
+                    return output, mlp_bias
+
+            if "postprocess" in self.fwd_execution_map:
+                if intermediate_tensors is not None:
+                    output, shared_expert_output = intermediate_tensors
+                output = self.postprocess(output, shared_expert_output)
+                if intermediate_tensors is not None:
+                    return output
+
+            return output, mlp_bias
+
+        if self.moe_layer_recompute:
+            if self.config.fp8 or self.config.fp4:
+                outputs = te_checkpoint(
+                    custom_forward,
+                    False,
+                    tensor_parallel.random.get_cuda_rng_tracker,
+                    parallel_state.get_tensor_model_parallel_group(),
+                    hidden_states,
+                    padding_mask,
+                )
+            else:
+                outputs = tensor_parallel.checkpoint(custom_forward, False, hidden_states, padding_mask)
+        else:
+            outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)
+        return outputs
 
     def postprocess(self, output, shared_expert_output):
         """Apply post-MoE norms to routed and shared expert outputs, then combine."""
@@ -320,8 +400,12 @@ class Gemma4MoELayer(MoELayer):
 
 
 def _logit_softcapping(logits: torch.Tensor, scale: float | None) -> torch.Tensor:
-    """Prevents logits from growing excessively: scale * tanh(logits / scale)."""
-    if not scale:
+    """Apply HF final_logit_softcapping: scale * tanh(logits / scale).
+
+    HF Gemma-4 and sglang's LogitsProcessor both apply this
+    (config.final_logit_softcapping=30.0), so the bridge must match.
+    """
+    if scale is None:
         return logits
     return scale * torch.tanh(logits / scale)
 
@@ -345,17 +429,16 @@ def _install_tied_kv(model: "torch.nn.Module", provider: "Gemma4ModelProvider") 
     :meth:`Gemma4SelfAttention.get_query_key_value_tensors` can enforce V=K in
     the forward pass.
 
-    Skips dense models (``provider.num_moe_experts is None``) where K=V sharing
-    has not been verified.  Must be called after model construction so that the
-    attention modules are already built.
+    K=V sharing is decided by the ``provider.attention_k_eq_v`` field (set from
+    the HF config), covering both MoE and dense variants.  Must be called after
+    model construction so that the attention modules are already built.
 
     Note on gradient routing for LoRA: since V-rows = K-rows in the loaded
     checkpoint, the forward pass is numerically correct without any further
     modification.  Full gradient routing (accumulating dL/dV into K-rows) is
     left as a future improvement.
     """
-    # Only confirmed for MoE models (26B-A4B family); skip dense variants
-    if getattr(provider, "num_moe_experts", None) is None:
+    if not getattr(provider, "attention_k_eq_v", False):
         return
 
     num_global_kv_heads = getattr(provider, "num_global_key_value_heads", None)
@@ -543,14 +626,11 @@ class Gemma4SelfAttention(SelfAttention):
         if len(result) < 3:
             return result
         query, key, value = result[0], result[1], result[2]
-        # For global attention layers K=V tying is required (HF Gemma4 has no v_proj).
-        # Enforced here — after the all-gather — so it is TP-safe for all configs.
-        if getattr(self, "_tied_kv", False):
-            value = key
-        # Parameter-free RMSNorm on V: v / sqrt(mean(v^2) + eps)
+        # Global attention has no v_proj (K=V tying): V weights = K weights at import,
+        # so apply a single param-free RMSNorm to V (matches sglang: v = v_norm(V_raw)).
         v_float = value.float()
-        rms = v_float.pow(2).mean(-1, keepdim=True).add(self._v_norm_eps).sqrt()
-        value = (v_float / rms).to(value.dtype)
+        rsigma = torch.rsqrt(v_float.pow(2).mean(-1, keepdim=True) + self._v_norm_eps)
+        value = (v_float * rsigma).to(value.dtype)
         return (query, key, value) + result[3:]
 
     def forward(
@@ -650,21 +730,31 @@ class Gemma4RotaryEmbedding(RotaryEmbedding):
     ):
         # Global RoPE: proportional partial rotary with high theta
         global_kwargs = {k: v for k, v in kwargs.items() if k not in ("rotary_percent", "kv_channels")}
+        # rotary_percent=1.0: HF applies global RoPE over the FULL head via rotate_half
+        # (dim i <-> dim i+head_dim/2); partial-rotary is realized by zeroing the high
+        # frequencies below, NOT by rotating only the first rotary_dim dims.
         super().__init__(
             kv_channels=global_kv_channels,
             rotary_base=rotary_base,
-            rotary_percent=global_rotary_percent,
+            rotary_percent=1.0,
             **global_kwargs,
         )
 
         # Fix global inv_freq to match HF's proportional RoPE formula.
         # HF proportional: inv_freq = 1/(base^(arange / head_dim)) not 1/(base^(arange / dim))
         # where dim = int(head_dim * percent) and head_dim = global_kv_channels
-        dim = int(global_kv_channels * global_rotary_percent)  # 128
+        # HF 'proportional' global RoPE: inv_freq has global_head_dim/2 entries, but only the
+        # first (rotary_dim/2) are non-zero; the rest are 0 so those dims pass through unrotated.
+        # Combined with rotary_percent=1.0 above, this reproduces HF's exact rotated-dim layout
+        # ({0..rotary_dim/2-1} paired with {head_dim/2 .. head_dim/2+rotary_dim/2-1}).
+        dim = int(global_kv_channels * global_rotary_percent)  # rotary dim = 128
         device = self.inv_freq.device
-        self.inv_freq = 1.0 / (
+        _nz = 1.0 / (
             rotary_base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / global_kv_channels)
-        )
+        )  # 64 non-zero freqs
+        _inv = torch.zeros(global_kv_channels // 2, dtype=torch.float32, device=device)  # 256
+        _inv[: _nz.numel()] = _nz
+        self.inv_freq = _inv
 
         # Local RoPE: full rotary with low theta
         self.rope_local = RotaryEmbedding(
