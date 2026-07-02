@@ -20,13 +20,13 @@ Two DSA sparse-MLA kernel backends are selectable via the provider attribute
 BOTH backends support GLM-5.1 *and* GLM-5.2 (DSA cross-layer index sharing), full or LoRA:
 
   * ``"megatron-bridge-native"`` (default) -- the portable *unfused* megatron-core DSA kernels
-    (``DSAttention`` / ``CrossLayerDSAttention`` in ``cross_layer_dsa.py``). No extra dependencies.
+    (``DSAttention`` / ``CrossLayerDSAttention`` in ``cross_layer_dsa_dispatch.py``). No extra dependencies.
     Works with both the ``bshd`` and ``thd`` query layouts; ``thd`` is the preferred,
     activation-recompute-safe carrier, while ``bshd`` + activation recompute is rejected at forward
-    time (the ``cross_layer_dsa.py`` forward guard).
+    time (the ``cross_layer_dsa_dispatch.py`` forward guard).
 
   * ``"glm-native"`` -- the vendored *fused* TileLang kernels (``SparseMLA`` + ``lighting_indexer`` under
-    ``fused/``, driven by ``GlmNativeMLASelfAttention`` in ``glm_native_mla.py``). Matches slime's rollout
+    ``glm_native/``, driven by ``GlmNativeMLASelfAttention`` in ``glm_native_mla.py``). Matches slime's rollout
     kernels for rollout<->train numerical parity, including R3 indexer replay. Requires the optional
     ``tilelang`` dependency (imported lazily, so the default path stays dependency-free) and the
     ``thd`` (packed) layout (``--qkv-format thd``). **Training/forward-only**: it asserts

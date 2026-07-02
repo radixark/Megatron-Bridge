@@ -191,7 +191,7 @@ def _build_glm5_dsa_block_spec(config, *args, **kwargs):
             getattr(config, "experimental_attention_variant", None) == "dsa"
             and getattr(getattr(spec, "module", None), "__name__", "") == "MLASelfAttention"
         ):
-            from megatron.bridge.models.glm5.fused.glm_native_mla import GlmNativeMLASelfAttention
+            from megatron.bridge.models.glm5.glm_native.glm_native_mla import GlmNativeMLASelfAttention
 
             spec.module = GlmNativeMLASelfAttention
         return spec

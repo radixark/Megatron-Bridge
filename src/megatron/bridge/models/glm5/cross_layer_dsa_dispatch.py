@@ -22,7 +22,7 @@ import threading
 
 import torch
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.bridge.models.glm5.unfused import (
+from megatron.bridge.models.glm5.megatron_bridge_native import (
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
     DSAttention,
@@ -308,10 +308,10 @@ def get_glm5_crosslayer_dsa_spec(config, backend=None):
         backend = _eav._get_backend_spec_provider(config=config)
     spec = _eav.get_dsa_module_spec_for_backend(config=config, backend=backend)
     spec.submodules.core_attention.module = CrossLayerDSAttention
-    # Point the MLA self-attention module at GlmNativeMLASelfAttention so the fused (slime) backend is
+    # Point the MLA self-attention module at GlmNativeMLASelfAttention so the fused (glm-native) backend is
     # dispatchable from the MLA level (where the absorbed-latent q/kv live). With the default
     # "megatron-bridge-native" backend its forward delegates to MLASelfAttention.forward -> unchanged.
-    from megatron.bridge.models.glm5.fused.glm_native_mla import GlmNativeMLASelfAttention
+    from megatron.bridge.models.glm5.glm_native.glm_native_mla import GlmNativeMLASelfAttention
 
     spec.module = GlmNativeMLASelfAttention
     if spec.metainfo is None:

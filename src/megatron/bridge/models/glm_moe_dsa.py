@@ -15,7 +15,7 @@
 """Deprecated import shim for the old ``megatron.bridge.models.glm_moe_dsa`` package.
 
 The GLM-5.x (``glm_moe_dsa``) model was restructured into
-``megatron.bridge.models.glm5`` with an explicit fused/unfused backend split. The HF-facing
+``megatron.bridge.models.glm5`` with an explicit glm_native/megatron_bridge_native backend split. The HF-facing
 identity is unchanged (``model_type="glm_moe_dsa"``, ``GlmMoeDsaForCausalLM``); only the Python
 import path moved. This module re-exports the public API from the new location so existing
 ``import megatron.bridge.models.glm_moe_dsa`` / ``from ... import GLM5Bridge`` code keeps working,

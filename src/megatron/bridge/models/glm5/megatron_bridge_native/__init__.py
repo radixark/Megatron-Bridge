@@ -10,7 +10,7 @@ indexer + ``unfused_dsa_fn``); GLM-5.2 cross-layer index-sharing is layered on
 top by ``CrossLayerDSAttention`` in ``../cross_layer_dsa_dispatch.py``.
 
 Centralising the megatron-core DSA imports here marks the unfused backend's
-single entry point (mirrors how ``../fused/`` is the fused/slime entry point).
+single entry point (mirrors how ``../glm_native/`` is the glm-native entry point).
 """
 
 from megatron.core.transformer.experimental_attention_variant.dsa import (

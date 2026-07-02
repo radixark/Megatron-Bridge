@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``MLASelfAttention`` subclass that runs slime's fused DSA forward (the ``slime`` backend).
+"""``MLASelfAttention`` subclass that runs slime's fused DSA forward (the ``glm-native`` backend).
 
-The default (``megatron-bridge``) backend stays byte-identical: :meth:`GlmNativeMLASelfAttention.forward`
+The default (``megatron-bridge-native``) backend stays byte-identical: :meth:`GlmNativeMLASelfAttention.forward`
 delegates to ``super().forward`` unless ``config.dsa_attention_backend == "glm-native"``. Only the slime
 branch runs the fused TileLang kernels (``SparseMLA`` + ``lighting_indexer``), which are imported
 lazily so the default path stays free of the optional ``tilelang`` dependency.
@@ -56,8 +56,8 @@ from megatron.bridge.models.glm5.cross_layer_dsa_dispatch import _holder
 class GlmNativeMLASelfAttention(MLASelfAttention):
     """``MLASelfAttention`` with an optional slime fused-DSA forward path.
 
-    Default backend (``megatron-bridge``) -> ``super().forward`` (unchanged, regression-safe).
-    ``slime`` backend -> the fused ``SparseMLA`` + ``lighting_indexer`` TileLang kernels, with the
+    Default backend (``megatron-bridge-native``) -> ``super().forward`` (unchanged, regression-safe).
+    ``glm-native`` backend -> the fused ``SparseMLA`` + ``lighting_indexer`` TileLang kernels, with the
     q/kv absorb + RoPE numerics matched to slime so the attention output bit-matches slime.
     """
 
@@ -67,7 +67,7 @@ class GlmNativeMLASelfAttention(MLASelfAttention):
         # top-k is recorded/replayed against the rollout's DSA selection (arxiv 2510.11370). The
         # megatron-core DSAIndexer only self-registers in DeepSeek-V4 mode (dsv4_mode); for GLM
         # (dsv4_mode=False) it does not, so -- exactly like slime's glm5.py -- we register here.
-        # Gated on the slime backend (the unfused path has no fused indexer top-k to replay) and a
+        # Gated on the glm-native backend (the unfused path has no fused indexer top-k to replay) and a
         # no-op unless --use-indexer-replay enabled the manager before the build (register_to_module
         # returns early while disabled). Guarded so the package still imports without miles.
         if getattr(self.config, "dsa_attention_backend", "megatron-bridge-native") == "glm-native":
@@ -139,7 +139,7 @@ class GlmNativeMLASelfAttention(MLASelfAttention):
         # it (the default backend stays dependency-free). Guard the import so a missing optional dep
         # gives a clear, actionable error rather than a deep ImportError from the vendored kernels.
         try:
-            from megatron.bridge.models.glm5.fused import (
+            from megatron.bridge.models.glm5.glm_native import (
                 SparseMLA,
                 generate_varlen_mask_params,
                 lighting_indexer,
@@ -396,7 +396,7 @@ class GlmNativeMLASelfAttention(MLASelfAttention):
         LoRA on the indexer: ``linear_wq_b`` / ``linear_wk`` are applied as forwards in
         :meth:`_glm_native_index_qkw`, so an adapter on them is *used* and differentiable. BUT the fused
         ``lighting_indexer`` returns only the (discrete, non-differentiable) top-k indices -- it does
-        NOT compute the ``FusedDSAIndexerLoss`` the unfused path uses (cross_layer_dsa.py). The
+        NOT compute the ``FusedDSAIndexerLoss`` the unfused path uses (cross_layer_dsa_dispatch.py). The
         indexer projections therefore receive a gradient ONLY from that auxiliary loss, so on the
         fused path their LoRA adapters get NO gradient (verified: ``grad=None``), whereas the unfused
         path gives them a tiny aux-loss gradient (~1e-5). This matches slime's own fused forward
@@ -469,7 +469,7 @@ class GlmNativeMLASelfAttention(MLASelfAttention):
         # ACTIVATION RECOMPUTE: the slime path is thd-only (asserted in _glm_native_forward), so the
         # holder rides on packed_seq_params -- the per-microbatch carrier that megatron's
         # activation-checkpoint custom_forward closure-captures, making this write recompute-safe
-        # (the same property the unfused thd path relies on; see cross_layer_dsa._holder). The
+        # (the same property the unfused thd path relies on; see cross_layer_dsa_dispatch._holder). The
         # bshd thread-local fallback that the unfused guard rejects under recompute is unreachable
         # here because slime never runs bshd. The rest of _glm_native_forward is functionally pure
         # (projections + RoPE + the differentiable SparseMLA / lighting_indexer kernels), so full /
