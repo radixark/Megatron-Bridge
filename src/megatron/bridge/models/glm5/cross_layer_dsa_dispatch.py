@@ -154,14 +154,14 @@ class CrossLayerDSAttention(DSAttention):
         attention_bias=None,
         packed_seq_params=None,
     ):
-        backend = getattr(self.config, "dsa_attention_backend", "megatron-bridge")
+        backend = getattr(self.config, "dsa_attention_backend", "megatron-bridge-native")
 
         # GLM-5.1 / no cross-layer sharing. With the default (unfused) backend this stays byte-for-
-        # byte the base class. With the ``slime`` backend we run the single-layer logic in-class so
+        # byte the base class. With the ``glm-native`` backend we run the single-layer logic in-class so
         # the sparse-attention kernel is dispatchable -- the base ``DSAttention.forward`` calls the
         # unfused kernel directly and lives in megatron-core, so it cannot be intercepted there.
         if not self._index_share:
-            if backend != "slime":
+            if backend != "glm-native":
                 return super().forward(
                     query,
                     key,
@@ -214,13 +214,13 @@ class CrossLayerDSAttention(DSAttention):
     def _sparse_attention(self, query, key, value, topk_indices):
         """Dispatch the sparse-MLA attention kernel to the configured backend.
 
-        Both branches currently call the unfused megatron-core kernel; the ``slime`` fused TileLang
+        Both branches currently call the unfused megatron-core kernel; the ``glm-native`` fused TileLang
         ``SparseMLA`` path is wired in a later step. Centralising the call here keeps the GLM-5.1 and
         GLM-5.2 forwards on a single, backend-agnostic dispatch point.
         """
-        if getattr(self.config, "dsa_attention_backend", "megatron-bridge") == "slime":
+        if getattr(self.config, "dsa_attention_backend", "megatron-bridge-native") == "glm-native":
             # TODO(fused backend, Step 4): call the TileLang SparseMLA kernel here. Until it is
-            # wired the slime backend uses the unfused kernel so the plumbing is regression-safe.
+            # wired the glm-native backend uses the unfused kernel so the plumbing is regression-safe.
             return unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
         return unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
 
@@ -308,12 +308,12 @@ def get_glm5_crosslayer_dsa_spec(config, backend=None):
         backend = _eav._get_backend_spec_provider(config=config)
     spec = _eav.get_dsa_module_spec_for_backend(config=config, backend=backend)
     spec.submodules.core_attention.module = CrossLayerDSAttention
-    # Point the MLA self-attention module at SlimeMLASelfAttention so the fused (slime) backend is
+    # Point the MLA self-attention module at GlmNativeMLASelfAttention so the fused (slime) backend is
     # dispatchable from the MLA level (where the absorbed-latent q/kv live). With the default
-    # "megatron-bridge" backend its forward delegates to MLASelfAttention.forward -> unchanged.
-    from megatron.bridge.models.glm5.fused.slime_mla import SlimeMLASelfAttention
+    # "megatron-bridge-native" backend its forward delegates to MLASelfAttention.forward -> unchanged.
+    from megatron.bridge.models.glm5.fused.glm_native_mla import GlmNativeMLASelfAttention
 
-    spec.module = SlimeMLASelfAttention
+    spec.module = GlmNativeMLASelfAttention
     if spec.metainfo is None:
         spec.metainfo = {}
     spec.metainfo.setdefault("fuse_input_layernorm", False)

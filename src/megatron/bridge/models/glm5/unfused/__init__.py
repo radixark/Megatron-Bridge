@@ -4,7 +4,7 @@
 
 """GLM-5 UNFUSED DSA backend (goes through megatron-core / megatron-bridge).
 
-Selected when ``dsa_attention_backend != "slime"`` (the default). The unfused
+Selected when ``dsa_attention_backend != "glm-native"`` (the default). The unfused
 sparse-MLA path reuses megatron-core's experimental ``DSAttention`` (lightning
 indexer + ``unfused_dsa_fn``); GLM-5.2 cross-layer index-sharing is layered on
 top by ``CrossLayerDSAttention`` in ``../cross_layer_dsa_dispatch.py``.

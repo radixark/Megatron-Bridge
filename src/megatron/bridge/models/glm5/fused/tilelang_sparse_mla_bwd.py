@@ -16,7 +16,7 @@
 #
 # Vendored from THUDM/slime (miles_plugins/models/glm5/ops) for the GLM DSA fused attention
 # backend. Kept close to upstream; the only change is removing the miles-only indexer replay
-# hook. Imported lazily by glm_moe_dsa/cross_layer_dsa.py only when dsa_attention_backend="slime".
+# hook. Imported lazily by glm_moe_dsa/cross_layer_dsa.py only when dsa_attention_backend="glm-native".
 
 # ruff: noqa
 # Adapt from https://github.com/tile-ai/tilelang/blob/4ff81c7d40803d269569e157e847623e84553f78/examples/deepseek_v32/sparse_mla_bwd.py
