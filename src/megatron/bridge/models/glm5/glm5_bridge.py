@@ -31,6 +31,10 @@ from megatron.bridge.models.mla_provider import MLAModelProvider
 
 logger = logging.getLogger(__name__)
 
+# Canonical GlmMoeDsa DSA-indexer split (dsa_indexer_head_dim, qk_pos_emb_head_dim). Single source
+# of truth for the config-less PP-broadcast export fallback in _IndexerRopeHalfSwapMapping._dims.
+_GLM_DSA_INDEXER_FALLBACK_DIMS = (128, 64)
+
 
 class _IndexerRopeHalfSwapMapping(AutoMapping):
     """HF<->Megatron mapping for the DSA-indexer ``wq_b``/``wk`` with a rope-half swap.
@@ -83,8 +87,20 @@ class _IndexerRopeHalfSwapMapping(AutoMapping):
         head_dim = getattr(cfg, "dsa_indexer_head_dim", None)
         rope_dim = getattr(cfg, "qk_pos_emb_head_dim", None)
         if head_dim is None or rope_dim is None:
-            # GlmMoeDsa indexer split; only reached on the config-less PP-broadcast (non-owning) rank.
-            head_dim, rope_dim = 128, 64
+            # Only reached on the config-less PP-broadcast (non-owning) rank during export under
+            # pipeline_model_parallel_size > 1. Fall back to the canonical GlmMoeDsa indexer split;
+            # the swap must be IDENTICAL on every rank, and this is correct for every current GLM-5.x
+            # model. If a future GLM indexer ever uses a different split this rank would diverge from
+            # the owning rank silently, so warn -- the owning rank still validates the real dims via
+            # the range guard below. Update _GLM_DSA_INDEXER_FALLBACK_DIMS if that day comes.
+            head_dim, rope_dim = _GLM_DSA_INDEXER_FALLBACK_DIMS
+            logger.warning(
+                "DSA-indexer rope-half swap: no config on this rank (PP-broadcast export); assuming "
+                "GlmMoeDsa indexer dims head_dim=%s, qk_pos_emb_head_dim=%s. Correct for all current "
+                "GLM-5.x models; a different indexer layout would need _GLM_DSA_INDEXER_FALLBACK_DIMS.",
+                head_dim,
+                rope_dim,
+            )
         if not 0 < rope_dim < head_dim:
             raise ValueError(
                 f"DSA-indexer rope-half swap: expected 0 < qk_pos_emb_head_dim ({rope_dim}) < "
@@ -273,23 +289,41 @@ class GLM5Bridge(MegatronModelBridge):
         # the config.json value (64); the base config-mapping then sizes MLA's decoupled-rope key
         # by 192, giving linear_kv_down_proj = kv_lora_rank + 192 = 704. The checkpoint is ground
         # truth: kv_a_proj_with_mqa = kv_lora_rank + qk_rope_head_dim = 576 = 512 + 64, and MLA
-        # applies rotary over qk_pos_emb_head_dim. Read the rope dim straight from config.json so
-        # the dims match the weights for both GLM-5.1 (64) and GLM-5.2 (64). No-op when correct.
+        # applies rotary over qk_pos_emb_head_dim. Read the true rope dim so the dims match the
+        # weights for both GLM-5.1 (64) and GLM-5.2 (64). No-op when already correct.
+        #
+        # We MUST read the RAW config.json value, not hf_config.qk_rope_head_dim: transformers
+        # overwrites that in-memory attribute with the mis-parsed 192 (== provider.qk_pos_emb_head_dim),
+        # so trusting the attribute would silently skip the correction. Resolve config.json for BOTH
+        # load styles: a local dir on disk, else the HF cache (cached_file) for a repo-id load -- the
+        # previous local-only os.path.join(_name_or_path, "config.json") no-op'd for repo ids
+        # (_name_or_path == "zai-org/GLM-5.2" is not a real file), leaving the mis-parsed 192.
         import json as _json
-        import os as _os
 
+        _cfg_json = None
         _cfg_dir = getattr(hf_config, "_name_or_path", "") or ""
-        _cfg_json = _os.path.join(_cfg_dir, "config.json")
-        if _os.path.isfile(_cfg_json):
-            _rope = _json.load(open(_cfg_json)).get("qk_rope_head_dim")
-            if _rope and _rope != provider.qk_pos_emb_head_dim:
-                logger.info(
-                    "GLM5 bridge: overriding qk_pos_emb_head_dim %s -> %s from config.json "
-                    "(transformers mis-parse of qk_rope_head_dim)",
-                    provider.qk_pos_emb_head_dim,
-                    _rope,
-                )
-                provider.qk_pos_emb_head_dim = _rope
+        if _cfg_dir:
+            import os as _os
+
+            _local = _os.path.join(_cfg_dir, "config.json")
+            if _os.path.isfile(_local):
+                _cfg_json = _local
+            else:
+                try:  # resolve from the HF cache for repo-id loads
+                    from transformers.utils import cached_file
+
+                    _cfg_json = cached_file(_cfg_dir, "config.json")
+                except Exception:
+                    _cfg_json = None
+        _rope = _json.load(open(_cfg_json)).get("qk_rope_head_dim") if _cfg_json else None
+        if _rope and _rope != provider.qk_pos_emb_head_dim:
+            logger.info(
+                "GLM5 bridge: overriding qk_pos_emb_head_dim %s -> %s (raw qk_rope_head_dim; "
+                "transformers mis-parse of the derived head_dim)",
+                provider.qk_pos_emb_head_dim,
+                _rope,
+            )
+            provider.qk_pos_emb_head_dim = _rope
 
         # DSA indexer params
         provider.experimental_attention_variant = "dsa"
