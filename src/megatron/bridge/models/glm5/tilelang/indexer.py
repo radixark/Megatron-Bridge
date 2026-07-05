@@ -16,7 +16,7 @@
 #
 # Vendored from THUDM/slime (miles_plugins/models/glm5/ops) for the GLM DSA fused attention
 # backend. Kept close to upstream; the only change is removing the miles-only indexer replay
-# hook. Imported lazily by glm5/glm_native/glm_native_mla.py only when dsa_attention_backend="glm-native".
+# hook. Imported lazily by glm5/tilelang/tilelang_mla.py only when dsa_attention_backend="tilelang".
 
 import torch
 

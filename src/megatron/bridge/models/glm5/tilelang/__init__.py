@@ -14,11 +14,11 @@
 
 """Fused TileLang DSA kernels for GLM ``glm_moe_dsa`` (vendored from THUDM/slime).
 
-Provides the ``glm-native`` sparse-attention backend: ``SparseMLA`` (sparse-MLA attention) and
+Provides the ``tilelang`` sparse-attention backend: ``SparseMLA`` (sparse-MLA attention) and
 ``lighting_indexer`` (the DSA indexer), both with fwd+bwd TileLang kernels. Importing this
 package pulls in the optional ``tilelang`` dependency, so
-``cross_layer_dsa_dispatch.py`` imports it lazily — only when ``config.dsa_attention_backend == "glm-native"``
-— keeping the default unfused (``megatron-bridge-native``) path dependency-free.
+``cross_layer_dsa_dispatch.py`` imports it lazily — only when ``config.dsa_attention_backend == "tilelang"``
+— keeping the default unfused (``megatron``) path dependency-free.
 """
 from .indexer import generate_varlen_mask_params, lighting_indexer
 from .sparse_mla import SparseMLA

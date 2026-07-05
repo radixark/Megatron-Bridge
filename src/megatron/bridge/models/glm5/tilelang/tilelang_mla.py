@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``MLASelfAttention`` subclass that runs slime's fused DSA forward (the ``glm-native`` backend).
+"""``MLASelfAttention`` subclass that runs slime's fused DSA forward (the ``tilelang`` backend).
 
-The default (``megatron-bridge-native``) backend stays byte-identical: :meth:`GlmNativeMLASelfAttention.forward`
-delegates to ``super().forward`` unless ``config.dsa_attention_backend == "glm-native"``. Only the slime
+The default (``megatron``) backend stays byte-identical: :meth:`TileLangMLASelfAttention.forward`
+delegates to ``super().forward`` unless ``config.dsa_attention_backend == "tilelang"``. Only the slime
 branch runs the fused TileLang kernels (``SparseMLA`` + ``lighting_indexer``), which are imported
 lazily so the default path stays free of the optional ``tilelang`` dependency.
 
@@ -53,11 +53,11 @@ from megatron.core.utils import deprecate_inference_params
 from megatron.bridge.models.glm5.cross_layer_dsa_dispatch import _holder
 
 
-class GlmNativeMLASelfAttention(MLASelfAttention):
+class TileLangMLASelfAttention(MLASelfAttention):
     """``MLASelfAttention`` with an optional slime fused-DSA forward path.
 
-    Default backend (``megatron-bridge-native``) -> ``super().forward`` (unchanged, regression-safe).
-    ``glm-native`` backend -> the fused ``SparseMLA`` + ``lighting_indexer`` TileLang kernels, with the
+    Default backend (``megatron``) -> ``super().forward`` (unchanged, regression-safe).
+    ``tilelang`` backend -> the fused ``SparseMLA`` + ``lighting_indexer`` TileLang kernels, with the
     q/kv absorb + RoPE numerics matched to slime so the attention output bit-matches slime.
     """
 
@@ -67,10 +67,10 @@ class GlmNativeMLASelfAttention(MLASelfAttention):
         # top-k is recorded/replayed against the rollout's DSA selection (arxiv 2510.11370). The
         # megatron-core DSAIndexer only self-registers in DeepSeek-V4 mode (dsv4_mode); for GLM
         # (dsv4_mode=False) it does not, so -- exactly like slime's glm5.py -- we register here.
-        # Gated on the glm-native backend (the unfused path has no fused indexer top-k to replay) and a
+        # Gated on the tilelang backend (the unfused path has no fused indexer top-k to replay) and a
         # no-op unless --use-indexer-replay enabled the manager before the build (register_to_module
         # returns early while disabled). Guarded so the package still imports without miles.
-        if getattr(self.config, "dsa_attention_backend", "megatron-bridge-native") == "glm-native":
+        if getattr(self.config, "dsa_attention_backend", "megatron") == "tilelang":
             try:
                 from miles.utils.replay_base import indexer_replay_manager
 
@@ -96,7 +96,7 @@ class GlmNativeMLASelfAttention(MLASelfAttention):
         inference_params=None,
     ):
         """Forward pass; delegates to the base class unless the slime backend is selected."""
-        if getattr(self.config, "dsa_attention_backend", "megatron-bridge-native") != "glm-native":
+        if getattr(self.config, "dsa_attention_backend", "megatron") != "tilelang":
             return super().forward(
                 hidden_states,
                 attention_mask,
@@ -112,7 +112,7 @@ class GlmNativeMLASelfAttention(MLASelfAttention):
                 sequence_len_offset=sequence_len_offset,
                 inference_params=inference_params,
             )
-        return self._glm_native_forward(
+        return self._tilelang_forward(
             hidden_states,
             attention_mask,
             key_value_states=key_value_states,
@@ -123,7 +123,7 @@ class GlmNativeMLASelfAttention(MLASelfAttention):
             inference_params=inference_params,
         )
 
-    def _glm_native_forward(
+    def _tilelang_forward(
         self,
         hidden_states,
         attention_mask,
@@ -139,14 +139,14 @@ class GlmNativeMLASelfAttention(MLASelfAttention):
         # it (the default backend stays dependency-free). Guard the import so a missing optional dep
         # gives a clear, actionable error rather than a deep ImportError from the vendored kernels.
         try:
-            from megatron.bridge.models.glm5.glm_native import (
+            from megatron.bridge.models.glm5.tilelang import (
                 SparseMLA,
                 generate_varlen_mask_params,
                 lighting_indexer,
             )
         except ImportError as e:
             raise ImportError(
-                "dsa_attention_backend='glm-native' needs the optional fused-kernel dependency "
+                "dsa_attention_backend='tilelang' needs the optional fused-kernel dependency "
                 "tilelang, which is not installed. Install it, or "
                 "select the default backend (--dsa-attention-backend megatron-bridge)."
             ) from e
@@ -155,10 +155,10 @@ class GlmNativeMLASelfAttention(MLASelfAttention):
         # The slime fused kernels require packed (thd) inputs: lighting_indexer / SparseMLA index by
         # cu_seqlens, and the absorbed q/kv layout is [t, heads, dim]. bshd has no cu_seqlens.
         assert packed_seq_params is not None and packed_seq_params.qkv_format == "thd", (
-            "The glm-native DSA backend (dsa_attention_backend='glm-native') requires the thd layout "
+            "The tilelang DSA backend (dsa_attention_backend='tilelang') requires the thd layout "
             "(packed_seq_params with qkv_format='thd'); got "
             f"packed_seq_params={'None' if packed_seq_params is None else packed_seq_params.qkv_format}. "
-            "Use --qkv-format thd, or select the 'megatron-bridge-native' backend."
+            "Use --qkv-format thd, or select the 'megatron' backend."
         )
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -183,7 +183,7 @@ class GlmNativeMLASelfAttention(MLASelfAttention):
         #   The unfused path feeds the SAME q/k/weights to its top-k, so the fused top-k matches it.
         # Skip layers (GLM-5.2 cross-layer sharing) reuse the anchor's top-k from the holder.
         # =====================================================================
-        topk_indices = self._glm_native_topk(
+        topk_indices = self._tilelang_topk(
             core_attention,
             hidden_states,
             q_compressed,
@@ -382,7 +382,7 @@ class GlmNativeMLASelfAttention(MLASelfAttention):
         out = fused_apply_rotary_pos_emb_thd(t, cu_seqlens, freqs)
         return out[cp_rank * seq_len : (cp_rank + 1) * seq_len]
 
-    def _glm_native_topk(
+    def _tilelang_topk(
         self,
         core_attention,
         hidden_states,
@@ -394,7 +394,7 @@ class GlmNativeMLASelfAttention(MLASelfAttention):
         """Compute (or reuse, for GLM-5.2 skip layers) the sparse top-k via the fused indexer kernel.
 
         LoRA on the indexer: ``linear_wq_b`` / ``linear_wk`` are applied as forwards in
-        :meth:`_glm_native_index_qkw`, so an adapter on them is *used* and differentiable. BUT the fused
+        :meth:`_tilelang_index_qkw`, so an adapter on them is *used* and differentiable. BUT the fused
         ``lighting_indexer`` returns only the (discrete, non-differentiable) top-k indices -- it does
         NOT compute the ``FusedDSAIndexerLoss`` the unfused path uses (cross_layer_dsa_dispatch.py). The
         indexer projections therefore receive a gradient ONLY from that auxiliary loss, so on the
@@ -423,7 +423,7 @@ class GlmNativeMLASelfAttention(MLASelfAttention):
         # baseline rope that slime does not, so its index_q/index_k differ from slime by ~rel 1.4
         # (orthogonal Hadamard => logits ~preserved, hence the old 0.999 top-k overlap, but the extra
         # rotation + baseline-rope rounding flips ~0.1% of the top-k, which the MoE router amplifies).
-        index_q, index_k, weights = self._glm_native_index_qkw(
+        index_q, index_k, weights = self._tilelang_index_qkw(
             core_attention.indexer, hidden_states, q_compressed, packed_seq_params
         )
 
@@ -435,7 +435,7 @@ class GlmNativeMLASelfAttention(MLASelfAttention):
         # cu_seqlens_q spans the FULL packed sequence, so generate_varlen_mask_params yields
         # per-query starts/ends of length S_full. The fused lighting_indexer kernel derives its
         # query count from index_q.shape[0] and requires starts/ends (CuSeqLenKS/KE) to have the
-        # SAME first dim. After _glm_native_index_qkw, index_q/index_k/weights are SP-gathered to the
+        # SAME first dim. After _tilelang_index_qkw, index_q/index_k/weights are SP-gathered to the
         # full-over-TP, CP-local token dim (S_full/CP per rank); the FULL-length starts/ends must
         # be brought to the same token dim. Mirror slime's glm5.py exactly: scatter starts/ends
         # over the CONTEXT-PARALLEL group (CP=1 -> no-op, so SP-only runs keep the full length to
@@ -466,19 +466,19 @@ class GlmNativeMLASelfAttention(MLASelfAttention):
         topk_indices = topk_indices.unsqueeze(1)
 
         # Anchor / plain-DSA layer: publish for any skip layers sharing this top-k.
-        # ACTIVATION RECOMPUTE: the slime path is thd-only (asserted in _glm_native_forward), so the
+        # ACTIVATION RECOMPUTE: the slime path is thd-only (asserted in _tilelang_forward), so the
         # holder rides on packed_seq_params -- the per-microbatch carrier that megatron's
         # activation-checkpoint custom_forward closure-captures, making this write recompute-safe
         # (the same property the unfused thd path relies on; see cross_layer_dsa_dispatch._holder). The
         # bshd thread-local fallback that the unfused guard rejects under recompute is unreachable
-        # here because slime never runs bshd. The rest of _glm_native_forward is functionally pure
+        # here because slime never runs bshd. The rest of _tilelang_forward is functionally pure
         # (projections + RoPE + the differentiable SparseMLA / lighting_indexer kernels), so full /
         # selective recompute re-executes it correctly.
         if index_share:
             _holder(packed_seq_params)[core_attention.layer_number] = topk_indices
         return topk_indices
 
-    def _glm_native_index_qkw(self, indexer, hidden_states, q_compressed, packed_seq_params):
+    def _tilelang_index_qkw(self, indexer, hidden_states, q_compressed, packed_seq_params):
         """Build the indexer index_q / index_k / head_weights to match slime's inline path exactly.
 
         Faithful port of slime ``get_absorb_query_key_value_tensors`` (indexer section): same
@@ -515,7 +515,7 @@ class GlmNativeMLASelfAttention(MLASelfAttention):
         #     RoPE gathered=True). (slime l.544-546)
         #   * head_weights: SP all-gather -> matches index_q's token dim. (slime l.554-555)
         # At CP=1 the CP gathers are no-ops; SP=1 makes the SP gathers no-ops. starts/ends are
-        # reconciled symmetrically in _glm_native_topk (CP-scatter of the FULL-length starts/ends).
+        # reconciled symmetrically in _tilelang_topk (CP-scatter of the FULL-length starts/ends).
 
         # index_q: wq_b on the (post-q_layernorm) compressed q.
         index_q, _ = indexer.linear_wq_b(q_compressed)
