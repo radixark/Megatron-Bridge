@@ -211,7 +211,7 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
             while non-expert layers keep the full dim. This normalizes the total adapter capacity for MoE models
             so it is comparable to a dense model. Defaults to False.
         share_expert_adapters (bool): When True, grouped MoE expert linears share one adapter across all local
-            experts on the EP rank. Set to False to create one adapter per local expert instead. Defaults to True.
+            experts on the EP rank. Defaults to False (one adapter per local expert).
     """
 
     target_modules: List[str] = field(
@@ -232,7 +232,7 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
     lora_A_init_method: str = "xavier"
     lora_B_init_method: str = "zero"
     normalize_moe_lora: bool = False
-    share_expert_adapters: bool = True
+    share_expert_adapters: bool = False
 
     def __post_init__(self) -> None:
         """Eagerly build ``canonical_mapping`` from the initial ``target_modules``.

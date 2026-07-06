@@ -92,7 +92,7 @@ class LoRA(PEFT, ModuleMatcher):
             while non-expert layers keep the full dim. This normalizes the total adapter capacity for MoE models
             so it is comparable to a dense model. Defaults to False.
         share_expert_adapters (bool): When True, grouped MoE expert linears share one adapter across all local
-            experts on the EP rank. Set to False to create one adapter per local expert instead. Defaults to True.
+            experts on the EP rank. Defaults to False (one adapter per local expert).
         experts_shared_outer_loras (bool): When True, grouped-expert LoRA
             (``TE*ParallelGroupedLinear`` base modules) uses
             :class:`SharedOuterGroupedExpertAdapter` — ``gate_up`` lora_A and
@@ -114,7 +114,7 @@ class LoRA(PEFT, ModuleMatcher):
     a2a_experimental: bool = False
     lora_dtype: torch.dtype = None
     normalize_moe_lora: bool = False
-    share_expert_adapters: bool = True
+    share_expert_adapters: bool = False
     experts_shared_outer_loras: bool = False
 
     def transform(self, module: nn.Module, name: Optional[str] = None, prefix: Optional[str] = None) -> nn.Module:
