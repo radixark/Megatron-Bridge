@@ -26,7 +26,7 @@ from megatron.bridge.models.conversion.param_mapping import (
     QKVMapping,
 )
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
-from megatron.bridge.models.mla_provider import MLAModelProvider
+from megatron.bridge.models.glm5.glm5_provider import GLM5ModelProvider
 
 
 logger = logging.getLogger(__name__)
@@ -204,7 +204,7 @@ def _build_glm5_dsa_block_spec(config, *args, **kwargs):
 
 
 @MegatronModelBridge.register_bridge(
-    source=GlmMoeDsaForCausalLM, target=GPTModel, provider=MLAModelProvider, model_type="glm_moe_dsa"
+    source=GlmMoeDsaForCausalLM, target=GPTModel, provider=GLM5ModelProvider, model_type="glm_moe_dsa"
 )
 class GLM5Bridge(MegatronModelBridge):
     """
@@ -225,7 +225,7 @@ class GLM5Bridge(MegatronModelBridge):
         >>> provider = bridge.to_megatron_provider()
     """
 
-    def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> MLAModelProvider:
+    def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> GLM5ModelProvider:
         provider = super().provider_bridge(hf_pretrained)
         hf_config = hf_pretrained.config
 
@@ -337,12 +337,6 @@ class GLM5Bridge(MegatronModelBridge):
         # only on computing layers and skip layers reuse the most recent computing layer's top-k.
         provider.dsa_index_topk_freq = getattr(hf_config, "index_topk_freq", 1) or 1
         provider.dsa_index_skip_topk_offset = getattr(hf_config, "index_skip_topk_offset", 0) or 0
-        # DSA sparse-attention kernel backend. Default "megatron" = the portable unfused
-        # megatron-core kernels (current behavior); "tilelang" = the fused TileLang kernels. Set by the
-        # miles --dsa-attention-backend arg; CrossLayerDSAttention reads it via getattr (same
-        # extra-attr pattern as dsa_index_topk_freq above, so no megatron-core config change).
-        provider.dsa_attention_backend = "megatron"
-
         return provider
 
     def mapping_registry(self) -> MegatronMappingRegistry:

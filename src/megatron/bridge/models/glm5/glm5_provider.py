@@ -12,9 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""GLM5 uses MLAModelProvider directly. This module is kept for import compatibility."""
+"""GLM5 model provider: MLAModelProvider plus the GLM-5 DSA configuration fields."""
 
-from megatron.bridge.models.mla_provider import MLAModelProvider as GLM5ModelProvider  # noqa: F401
+from dataclasses import dataclass
+
+from megatron.bridge.models.mla_provider import MLAModelProvider
+
+
+@dataclass
+class GLM5ModelProvider(MLAModelProvider):
+    """GLM-5 (glm_moe_dsa) provider: MLA plus DeepSeek Sparse Attention."""
+
+    # DSA sparse-MLA kernel backend; set from the miles --dsa-attention-backend arg. Declared
+    # as a real field (rather than an ad-hoc attribute) so it survives any fields-based config
+    # copy and reaches every module's config without caller-side propagation.
+    dsa_attention_backend: str = "megatron"
 
 
 __all__ = ["GLM5ModelProvider"]
