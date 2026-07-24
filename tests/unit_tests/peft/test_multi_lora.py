@@ -68,6 +68,24 @@ def multi_lora_topk_router_patch(router_cls: type):
     return patch.object(multi_lora_module, "TopKRouter", router_cls)
 
 
+class FakeMultiLoRAGroupedExpertLinear(nn.Module):
+    """Stand-in for ``MultiLoRAGroupedExpertLinear`` recording constructor kwargs.
+
+    Lets us test ``MultiLoRA.transform`` routing to the grouped-expert layer on CPU
+    without building real grouped adapters / parallel state.
+    """
+
+    def __init__(self, to_wrap: nn.Module, **kwargs) -> None:
+        super().__init__()
+        self.to_wrap = to_wrap
+        self.init_kwargs = kwargs
+
+
+def multi_lora_grouped_patch():
+    """Patch ``MultiLoRAGroupedExpertLinear`` in the transform module with a fake."""
+    return patch.object(multi_lora_module, "MultiLoRAGroupedExpertLinear", FakeMultiLoRAGroupedExpertLinear)
+
+
 # ======================================================================
 # Test models (plain nn.Linear; MultiLoRALinear is patched out for matching)
 # ======================================================================
@@ -119,6 +137,32 @@ class MoEModel(nn.Module):
         layer.mlp.linear_fc1 = nn.Linear(32, 64)  # dense -> should be wrapped
         layer.mlp.experts = nn.Module()
         layer.mlp.experts.linear_fc1 = nn.Linear(32, 64)  # expert -> should be skipped
+
+
+class _FakeGroupedExpert(nn.Module):
+    """Minimal grouped-expert base linear: exposes ``num_gemms`` and a parameter so
+    ``MultiLoRA.transform`` can read ``module.num_gemms`` and ``next(parameters())``."""
+
+    def __init__(self, num_gemms: int = 4) -> None:
+        super().__init__()
+        self.num_gemms = num_gemms
+        self.weight0 = nn.Parameter(torch.randn(4, 4))
+
+
+class MoEGroupedModel(nn.Module):
+    """Model whose experts are a grouped expert linear (``num_gemms``), plus a
+    non-grouped ``local_experts`` linear, to exercise the moe_expert_lora branch."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.decoder = nn.Module()
+        self.decoder.layers = nn.ModuleList([nn.Module()])
+        layer = self.decoder.layers[0]
+        layer.mlp = nn.Module()
+        layer.mlp.experts = nn.Module()
+        layer.mlp.experts.linear_fc1 = _FakeGroupedExpert()  # grouped -> wrap when enabled
+        layer.mlp.experts.local_experts = nn.ModuleList([nn.Module()])
+        layer.mlp.experts.local_experts[0].linear_fc1 = nn.Linear(32, 64)  # non-grouped -> skip
 
 
 class _DummyTopKRouter(nn.Module):
@@ -287,6 +331,46 @@ class TestMultiLoRATransform:
         # Dense MLP linear is wrapped; the routed-expert linear of the same name is skipped.
         assert isinstance(layer.mlp.linear_fc1, FakeMultiLoRALinear)
         assert isinstance(layer.mlp.experts.linear_fc1, nn.Linear)
+
+    def test_transform_skips_grouped_expert_when_moe_expert_lora_disabled(self) -> None:
+        # Default (moe_expert_lora=False): grouped expert linears stay unwrapped,
+        # preserving the historical behavior byte-for-byte.
+        model = MoEGroupedModel()
+        peft = MultiLoRA(target_modules=["linear_fc1"])
+
+        with multi_lora_grouped_patch():
+            transformed = peft(model, training=True)
+
+        expert = transformed.decoder.layers[0].mlp.experts.linear_fc1
+        assert isinstance(expert, _FakeGroupedExpert)
+        assert not isinstance(expert, FakeMultiLoRAGroupedExpertLinear)
+
+    def test_transform_wraps_grouped_expert_when_moe_expert_lora_enabled(self) -> None:
+        # moe_expert_lora=True: grouped expert linears are wrapped with the grouped
+        # multi-adapter layer, and the constructor is fed num_local_experts=num_gemms.
+        model = MoEGroupedModel()
+        peft = MultiLoRA(target_modules=["linear_fc1"], moe_expert_lora=True, n_adapters=3)
+
+        with multi_lora_grouped_patch():
+            transformed = peft(model, training=True)
+
+        expert = transformed.decoder.layers[0].mlp.experts.linear_fc1
+        assert isinstance(expert, FakeMultiLoRAGroupedExpertLinear)
+        assert expert.init_kwargs["num_local_experts"] == 4
+        assert expert.init_kwargs["n_adapters"] == 3
+
+    def test_transform_skips_non_grouped_expert_even_when_enabled(self) -> None:
+        # SequentialMLP (.local_experts.N.) is expert but not grouped; it is skipped
+        # even with moe_expert_lora=True (grouped-only support for now).
+        model = MoEGroupedModel()
+        peft = MultiLoRA(target_modules=["linear_fc1"], moe_expert_lora=True)
+
+        with multi_lora_grouped_patch():
+            transformed = peft(model, training=True)
+
+        non_grouped = transformed.decoder.layers[0].mlp.experts.local_experts[0].linear_fc1
+        assert isinstance(non_grouped, nn.Linear)
+        assert not isinstance(non_grouped, FakeMultiLoRAGroupedExpertLinear)
 
     def test_transform_skips_topk_router(self) -> None:
         router = _DummyTopKRouter()

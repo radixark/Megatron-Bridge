@@ -38,7 +38,16 @@ from megatron.core.tensor_parallel.mappings import (
 )
 
 from megatron.bridge.peft.adapter_wrapper import AdapterWrapper
-from megatron.bridge.peft.utils import ParallelLinearAdapter, all2all_hp2sp, get_adapter_attributes_from_linear
+from megatron.bridge.peft.moe_multi_lora_dispatch import dispatch_expert_lora_by_slot
+from megatron.bridge.peft.utils import (
+    GroupedExpertLinearAdapter,
+    ParallelLinearAdapter,
+    SharedOuterGroupedExpertAdapter,
+    align_expert_dim_for_tp,
+    all2all_hp2sp,
+    get_adapter_attributes_from_linear,
+    get_effective_lora_dim,
+)
 
 
 class MultiLoRALinear(AdapterWrapper):
@@ -276,11 +285,236 @@ class MultiLoRALinear(AdapterWrapper):
         return sharded_sd
 
 
+class MultiLoRAGroupedExpertLinear(AdapterWrapper):
+    """Grouped MoE expert linear wrapped with *N* concurrent LoRA adapters.
+
+    The multi-adapter analogue of :class:`MultiLoRALinear` for grouped expert
+    linears (``TE*ParallelGroupedLinear``). It holds *N* single-adapter
+    grouped-expert adapters in an ``nn.ModuleList`` — one of
+    :class:`~megatron.bridge.peft.utils.GroupedExpertLinearAdapter` (per-expert),
+    :class:`~megatron.bridge.peft.utils.SharedOuterGroupedExpertAdapter`
+    (shared-outer), or :class:`~megatron.bridge.peft.utils.ParallelLinearAdapter`
+    (``share_expert_adapters``) — reusing their tested grouped-GEMM /
+    expert-TP / sharded-checkpoint math rather than re-implementing it.
+
+    Routing. On an expert linear the tokens are permuted into expert-major order
+    (and shuffled across ranks under EP) before the grouped GEMM, so the
+    contiguous per-slot spans that :class:`MultiLoRALinear` relies on no longer
+    exist. Instead, the active adapter for each *permuted* token is selected by a
+    per-token slot id threaded through the MoE token dispatcher and exposed on the
+    wrapped grouped linear as ``._companion_slot_ids`` (see the Megatron-LM
+    companion-channel change). The forward delegates the (slot, expert) routing to
+    :func:`~megatron.bridge.peft.moe_multi_lora_dispatch.dispatch_expert_lora_by_slot`.
+
+    Inert by default. When ``._companion_slot_ids`` is absent (e.g. the Megatron-LM
+    companion channel is not installed, or the base model is not being driven by the
+    multi-LoRA trainer) the layer returns the base output unchanged — so wrapping an
+    expert linear never changes the base-model result on its own.
+    """
+
+    def __init__(
+        self,
+        to_wrap: nn.Module,
+        n_adapters: int,
+        dim: int,
+        alpha: float,
+        full_name: str,
+        num_local_experts: int,
+        experts_shared_outer_loras: bool = False,
+        share_expert_adapters: bool = False,
+        normalize_moe_lora: bool = False,
+        column_init_method: str = "xavier",
+        row_init_method: str = "zero",
+        dropout: float = 0.0,
+        dropout_position: str = "pre",
+    ) -> None:
+        nn.Module.__init__(self)
+        self.to_wrap = to_wrap
+        self._adapter_enabled = True
+        self.n_adapters = n_adapters
+        self.full_name = full_name
+        self.num_local_experts = num_local_experts
+        self._column_init_method = column_init_method
+        self._row_init_method = row_init_method
+
+        # Expert linears live on the expert-TP group, so attributes/rank sizing must
+        # be resolved with is_expert=True (mirrors LoRA.transform for grouped experts).
+        attrs = get_adapter_attributes_from_linear(to_wrap, is_expert=True)
+        effective_dim = get_effective_lora_dim(
+            to_wrap, dim=dim, normalize_moe_lora=normalize_moe_lora, is_expert=True
+        )
+        effective_dim = align_expert_dim_for_tp(
+            to_wrap,
+            effective_dim,
+            normalize_moe_lora=normalize_moe_lora,
+            is_expert=True,
+            input_is_parallel=attrs.input_is_parallel,
+        )
+        self.max_rank = effective_dim
+        self.input_is_parallel = attrs.input_is_parallel
+
+        use_shared_outer = experts_shared_outer_loras
+        use_per_expert = not share_expert_adapters and not use_shared_outer
+        use_grouped_expert_adapter = use_shared_outer or use_per_expert
+        if use_shared_outer:
+            adapter_cls = SharedOuterGroupedExpertAdapter
+        elif use_per_expert:
+            adapter_cls = GroupedExpertLinearAdapter
+        else:
+            adapter_cls = ParallelLinearAdapter
+
+        adapter_kwargs = dict(
+            base_linear_name=full_name,
+            activation="identity",
+            column_init_method=column_init_method,
+            row_init_method=row_init_method,
+            input_is_parallel=attrs.input_is_parallel,
+            dropout=dropout,
+            dropout_position=dropout_position,
+            model_parallel_config=to_wrap.config,
+            alpha=alpha,
+            base_linear_is_parallel=attrs.base_linear_is_parallel,
+        )
+        if use_grouped_expert_adapter:
+            first_param = next(to_wrap.parameters())
+            adapter_kwargs.update(
+                num_local_experts=num_local_experts,
+                params_device=first_param.device,
+                params_dtype=first_param.dtype,
+            )
+        else:
+            adapter_kwargs.update(is_expert=True)
+
+        # One single-adapter grouped-expert adapter per slot (per-slot optimizer-state
+        # isolation, clean checkpoint keys, bridge-export compatibility — same rationale
+        # as MultiLoRALinear's ModuleList).
+        self.adapters = nn.ModuleList(
+            [adapter_cls(attrs.in_features, attrs.out_features, effective_dim, **adapter_kwargs) for _ in range(n_adapters)]
+        )
+
+        # set_tokens_per_adapter_slot() sets this on every multi-LoRA module; it is the
+        # routing signal for dense layers but unused here (expert routing rides
+        # ._companion_slot_ids through the dispatcher instead). Kept for interface parity.
+        self.tokens_per_adapter: Optional[torch.Tensor] = None
+        device = next(to_wrap.parameters()).device
+        dtype = next(to_wrap.parameters()).dtype
+        self.register_buffer("alpha_values", torch.ones(n_adapters, dtype=dtype, device=device), persistent=False)
+        self.register_buffer(
+            "rank_values", torch.full((n_adapters,), effective_dim, dtype=dtype, device=device), persistent=False
+        )
+
+    def _extract_expert_splits(self, args: Any, kwargs: Any):
+        """Pull the per-expert token counts the base grouped linear was called with."""
+        splits = kwargs.get("m_splits")
+        if splits is None:
+            splits = kwargs.get("tokens_per_expert")
+        if splits is None and args:
+            splits = args[0]
+        if splits is None:
+            raise ValueError(
+                f"MultiLoRAGroupedExpertLinear on {self.full_name} requires grouped expert token splits."
+            )
+        return splits
+
+    def forward(
+        self, x: torch.Tensor, *args: Any, **kwargs: Any
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        linear_output, bias, layernorm_output = self.base_linear_forward(x, *args, **kwargs)
+        if not self._adapter_enabled:
+            return linear_output, bias
+
+        # Per-permuted-token adapter slot id, threaded through the MoE dispatcher.
+        # Absent -> the layer is inert (base-only), so wrapping never changes the
+        # base result on its own.
+        permuted_slot_ids = getattr(self.to_wrap, "_companion_slot_ids", None)
+        if permuted_slot_ids is None:
+            return linear_output, bias
+
+        tokens_per_expert = self._extract_expert_splits(args, kwargs)
+        x_in = layernorm_output.contiguous()
+        x_flat = x_in.reshape(-1, x_in.shape[-1])
+        out_features = linear_output.shape[-1]
+
+        def adapter_fn(slot: int, x_s: torch.Tensor, tpe_s: torch.Tensor) -> torch.Tensor:
+            # ParallelLinearAdapter ignores the extra split arg; the grouped adapters
+            # consume it via their own _extract_expert_splits.
+            return self.adapters[slot](x_s, tpe_s)
+
+        delta = dispatch_expert_lora_by_slot(
+            x_flat,
+            tokens_per_expert,
+            permuted_slot_ids,
+            self.num_local_experts,
+            out_features,
+            adapter_fn,
+        )
+        return linear_output + delta.reshape(linear_output.shape), bias
+
+    def init_adapter_slot(self, idx: int, rank: int, alpha: float) -> None:
+        """Claim slot ``idx``: bind ``alpha`` (and ``rank``) for this adapter.
+
+        v1 constraint: expert slots share one rank (the constructed ``max_rank``);
+        variable-rank per-expert masking is deferred. The per-slot scaling is applied
+        inside the slot's grouped adapter via its ``alpha/dim`` factor.
+        """
+        assert rank == self.max_rank, (
+            f"MultiLoRAGroupedExpertLinear currently requires all expert slots to share "
+            f"rank == max_rank ({self.max_rank}); got rank={rank}. Variable per-expert rank "
+            f"is not implemented yet."
+        )
+        self.alpha_values[idx] = alpha
+        self.rank_values[idx] = rank
+        self.adapters[idx].alpha = alpha
+
+    def clear_adapter_slot(self, idx: int) -> None:
+        """Free slot ``idx``: zero its contribution and re-init its weights."""
+        self.alpha_values[idx] = 0
+        self.rank_values[idx] = self.max_rank
+        self.adapters[idx].alpha = 0.0
+        self.reset_adapter(idx)
+
+    def reset_adapter(self, idx: int) -> None:
+        """Re-init slot ``idx`` weights through the model-parallel RNG tracker so every
+        DP replica produces identical weights on slot reuse (mirrors MultiLoRALinear)."""
+        from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
+
+        adapter = self.adapters[idx]
+        col_fn = ParallelLinearAdapter._get_init_fn(None, self._column_init_method)
+        row_fn = ParallelLinearAdapter._get_init_fn(None, self._row_init_method)
+        with get_cuda_rng_tracker().fork():
+            col_fn(adapter.linear_in.weight.data)
+            row_fn(adapter.linear_out.weight.data)
+
+    def state_dict(
+        self,
+        destination: Optional[Dict[str, Any]] = None,
+        prefix: str = "",
+        keep_vars: bool = False,
+    ) -> Dict[str, Any]:
+        if destination is None:
+            destination = {}
+        self.to_wrap.state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
+        self.adapters.state_dict(destination=destination, prefix=f"{prefix}adapters.", keep_vars=keep_vars)
+        return destination
+
+    def sharded_state_dict(
+        self,
+        prefix: str = "",
+        sharded_offsets: Tuple[Tuple[int, int, int], ...] = (),
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        sharded_sd: Dict[str, Any] = {}
+        sharded_sd.update(self.to_wrap.sharded_state_dict(prefix, sharded_offsets, metadata))
+        for i, adapter in enumerate(self.adapters):
+            sharded_sd.update(adapter.sharded_state_dict(f"{prefix}adapters.{i}.", sharded_offsets, metadata))
+        return sharded_sd
+
+
 # ==================================================================
 # Standalone functions
 # ==================================================================
 
-_MULTI_LORA_TYPES = (MultiLoRALinear)
+_MULTI_LORA_TYPES = (MultiLoRALinear, MultiLoRAGroupedExpertLinear)
 
 
 def _iter_multi_lora_modules(model):
@@ -440,7 +674,10 @@ def hide_adapters(model):
         modules = list(_iter_multi_lora_modules(model))
         saved = {}
         for m in modules:
-            if isinstance(m, MultiLoRALinear) and "adapters" in m._modules:
+            # Duck-typed on the ``.adapters`` ModuleList (like ``expose_adapter_slot``) so
+            # every multi-LoRA layer type — MultiLoRALinear and MultiLoRAGroupedExpertLinear —
+            # is hidden during base-checkpoint loading, not just the dense one.
+            if "adapters" in m._modules:
                 saved[id(m)] = m._modules.pop("adapters")
         # try/finally: restore even if base-checkpoint loading raises, else the
         # adapters stay hidden from the model permanently.

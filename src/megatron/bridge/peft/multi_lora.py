@@ -29,14 +29,15 @@ from megatron.core.transformer.moe.router import TopKRouter
 
 from megatron.bridge.peft.base import PEFT
 from megatron.bridge.peft.module_matcher import ModuleMatcher
-from megatron.bridge.peft.multi_lora_layers import MultiLoRALinear
-from megatron.bridge.peft.utils import is_expert_linear
+from megatron.bridge.peft.multi_lora_layers import MultiLoRAGroupedExpertLinear, MultiLoRALinear
+from megatron.bridge.peft.utils import is_expert_linear, is_grouped_expert_linear
 
 logger = logging.getLogger(__name__)
 
-# One-shot flag so the "expert modules are skipped" warning fires once per
+# One-shot flags so the "expert modules are skipped" warnings fire once per
 # process rather than once per (many) expert linear.
 _EXPERT_SKIP_WARNED = False
+_NONGROUPED_EXPERT_SKIP_WARNED = False
 
 
 @dataclass
@@ -68,29 +69,69 @@ class MultiLoRA(PEFT, ModuleMatcher):
     lora_B_init_method: str = "zero"
     a2a_experimental: bool = False
     lora_dtype: Optional[torch.dtype] = None
+    # MoE expert multi-LoRA. Opt-in: default False preserves the historical
+    # behavior of skipping expert linears (see ``transform``). When True, grouped
+    # expert linears (TEGroupedMLP) are wrapped with ``MultiLoRAGroupedExpertLinear``;
+    # non-grouped (SequentialMLP ``local_experts``) are still skipped for now.
+    moe_expert_lora: bool = False
+    experts_shared_outer_loras: bool = False
+    share_expert_adapters: bool = False
+    normalize_moe_lora: bool = False
 
     def transform(self, module: nn.Module, name: Optional[str] = None, prefix: Optional[str] = None) -> nn.Module:
-        if isinstance(module, MultiLoRALinear):
+        if isinstance(module, (MultiLoRALinear, MultiLoRAGroupedExpertLinear)):
             return module
 
         if (ans := self.match(module, name, prefix)) is not None:
             (match, full_name) = ans
 
             if is_expert_linear(full_name):
-                # MoE expert linears are not supported by the grouped-GEMM
-                # multi-LoRA layer; skipping keeps them from crashing, but on an
-                # MoE model that silently drops the experts (most of the
-                # trainable capacity) from LoRA. Warn once so it isn't invisible.
-                global _EXPERT_SKIP_WARNED
-                if not _EXPERT_SKIP_WARNED:
-                    logger.warning(
-                        "MultiLoRA does not support MoE expert linears; skipping all expert "
-                        "modules (e.g. %s). On MoE models only non-expert (attention/dense) "
-                        "layers will receive LoRA adapters.",
-                        full_name,
-                    )
-                    _EXPERT_SKIP_WARNED = True
-                return module
+                if not self.moe_expert_lora:
+                    # Historical behavior (moe_expert_lora=False): MoE expert linears are
+                    # skipped. On an MoE model that silently drops the experts (most of the
+                    # trainable capacity) from LoRA, so warn once. Set moe_expert_lora=True
+                    # to adapt grouped expert layers.
+                    global _EXPERT_SKIP_WARNED
+                    if not _EXPERT_SKIP_WARNED:
+                        logger.warning(
+                            "MultiLoRA is skipping MoE expert linears (moe_expert_lora=False); "
+                            "e.g. %s. On MoE models only non-expert (attention/dense) layers "
+                            "will receive LoRA adapters. Set moe_expert_lora=True to enable "
+                            "grouped expert adapters.",
+                            full_name,
+                        )
+                        _EXPERT_SKIP_WARNED = True
+                    return module
+                if not is_grouped_expert_linear(full_name):
+                    # SequentialMLP (``.local_experts.N.``) is not covered by the grouped
+                    # multi-adapter layer yet; skip it explicitly rather than crash.
+                    global _NONGROUPED_EXPERT_SKIP_WARNED
+                    if not _NONGROUPED_EXPERT_SKIP_WARNED:
+                        logger.warning(
+                            "MultiLoRA moe_expert_lora only supports grouped expert linears "
+                            "(TEGroupedMLP); skipping non-grouped expert module %s.",
+                            full_name,
+                        )
+                        _NONGROUPED_EXPERT_SKIP_WARNED = True
+                    return module
+                logger.info(
+                    f"Adding multi-lora ({self.n_adapters} adapters) to grouped experts: {full_name}"
+                )
+                return MultiLoRAGroupedExpertLinear(
+                    to_wrap=module,
+                    n_adapters=self.n_adapters,
+                    dim=self.dim,
+                    alpha=self.alpha,
+                    full_name=full_name,
+                    num_local_experts=module.num_gemms,
+                    experts_shared_outer_loras=self.experts_shared_outer_loras,
+                    share_expert_adapters=self.share_expert_adapters,
+                    normalize_moe_lora=self.normalize_moe_lora,
+                    column_init_method=self.lora_A_init_method,
+                    row_init_method=self.lora_B_init_method,
+                    dropout=self.dropout,
+                    dropout_position=self.dropout_position,
+                )
             if isinstance(module, TopKRouter):
                 return module
 
