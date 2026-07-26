@@ -1333,7 +1333,20 @@ class GroupedExpertLinearAdapter(nn.Module):
             non_tensor_args = tuple(available[name] for name in field_names)
 
             empty_biases = [x.new_empty(0) for _ in range(num_gemms)]
-            leading = (x, m_splits, non_tensor_args) if takes_m_splits else (x, non_tensor_args)
+            if takes_m_splits:
+                # TE >= 2.17 types the hoisted parameter as a Tensor and calls
+                # `.tolist()` on it. TE normalises a list argument in its public
+                # wrapper (`GroupedLinear.forward`), but we call the autograd
+                # function directly and so have to do it ourselves, with the same
+                # dtype and device TE uses.
+                splits = m_splits
+                if not isinstance(splits, torch.Tensor):
+                    splits = torch.tensor(splits, dtype=torch.int64, device="cpu")
+                elif splits.dtype != torch.int64:
+                    splits = splits.to(dtype=torch.int64)
+                leading = (x, splits, non_tensor_args)
+            else:
+                leading = (x, non_tensor_args)
             tensors = (*[weight[i] for i in range(num_gemms)], *empty_biases)
             if torch.is_grad_enabled():
                 out = TEPytorchGroupedLinearAutograd.apply(*leading, *tensors)
