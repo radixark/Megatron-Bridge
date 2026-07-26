@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import logging
 import math
 import re
+import textwrap
 from dataclasses import dataclass
 from importlib.metadata import version
 from typing import Callable, Dict, List, Optional, Tuple
@@ -77,6 +79,44 @@ ModelOptLinear, HAVE_MODELOPT_LINEAR = safe_import_from("megatron.core.post_trai
 
 TECL = (TEColumnParallelLinear, TELayerNormColumnParallelLinear, TEColumnParallelGroupedLinear)
 TERL = (TERowParallelLinear, TERowParallelGroupedLinear)
+
+
+def _te_grouped_linear_contract() -> Tuple[bool, List[str]]:
+    """Read the private ``_GroupedLinear.forward`` contract off the installed TE.
+
+    ``_GroupedLinear`` is not public API and its calling convention has moved:
+
+    * TE <= 2.14  ``forward(ctx, inp, non_tensor_args, *weights_and_biases)``
+      with ``m_splits`` as the first tuple field and a ``module`` handle near the end.
+    * TE 2.15/2.16  same signature; ``module`` replaced by
+      ``weight_workspaces`` + ``cache_weight`` (22 fields).
+    * TE >= 2.17  ``forward(ctx, inp, m_splits, non_tensor_args, *weights_and_biases)``
+      -- ``m_splits`` promoted to its own positional parameter (21 fields).
+
+    Pinning a version table here means silently passing a misaligned tuple the next
+    time TE moves: the tuple lands in the ``m_splits`` slot, a weight tensor lands in
+    ``non_tensor_args``, and the failure surfaces as an unrelated
+    ``ValueError: not enough values to unpack`` from inside TE. Deriving the order
+    from the installed source keeps this shim honest and makes a future change a
+    named error instead.
+
+    Returns ``(m_splits_is_positional, non_tensor_args_field_names)``.
+    """
+    forward = TEPytorchGroupedLinearAutograd.forward
+    takes_m_splits = "m_splits" in inspect.signature(forward).parameters
+    try:
+        source = textwrap.dedent(inspect.getsource(forward))
+    except (OSError, TypeError) as exc:  # pragma: no cover - source-less install
+        raise RuntimeError(
+            "cannot read transformer_engine's _GroupedLinear.forward source to determine its non_tensor_args layout"
+        ) from exc
+    match = re.search(r"\(\s*\n((?:\s*\w+,\s*\n)+)\s*\)\s*=\s*non_tensor_args", source)
+    if match is None:
+        raise RuntimeError(
+            "transformer_engine's _GroupedLinear.forward no longer unpacks "
+            "non_tensor_args in the expected form; update this shim"
+        )
+    return takes_m_splits, [line.strip().rstrip(",") for line in match.group(1).strip().splitlines()]
 
 
 def is_modelopt_linear(m: nn.Module) -> bool:
@@ -1245,44 +1285,65 @@ class GroupedExpertLinearAdapter(nn.Module):
                 grad_weight_quantizers,
                 grad_output_quantizers,
             ) = helper._get_quantizers()
-            non_tensor_args = (
-                m_splits,
-                helper.apply_bias,
-                None,
-                helper.fp8,
-                helper.fp8_calibration,
-                helper.wgrad_store,
-                input_quantizers,
-                weight_quantizers,
-                output_quantizers,
-                grad_input_quantizers,
-                grad_weight_quantizers,
-                grad_output_quantizers,
-                helper.fuse_wgrad_accumulation,
-                False,
-                helper.sequence_parallel,
-                helper.activation_dtype,
-                torch.is_grad_enabled(),
-                helper,
-                None,
-                helper.save_original_input,
-                False,
-            )
-            empty_biases = [x.new_empty(0) for _ in range(weight.shape[0])]
-            if torch.is_grad_enabled():
-                return TEPytorchGroupedLinearAutograd.apply(
-                    x,
-                    non_tensor_args,
-                    *[weight[i] for i in range(weight.shape[0])],
-                    *empty_biases,
+            num_gemms = weight.shape[0]
+            # `_GroupedLinear` is TE-private and its contract has changed twice:
+            # TE 2.15 replaced the `module` handle with `weight_workspaces` +
+            # `cache_weight`, and TE 2.17 hoisted `m_splits` out of the tuple into
+            # its own positional parameter and started returning
+            # (out, new_workspaces). Rather than pin a version, read the field
+            # order off the TE that is actually installed -- see
+            # `_te_grouped_linear_contract`.
+            takes_m_splits, field_names = _te_grouped_linear_contract()
+            available = {
+                "m_splits": m_splits,
+                "use_bias": helper.apply_bias,
+                "is_first_microbatch": None,
+                "fp8": helper.fp8,
+                "fp8_calibration": helper.fp8_calibration,
+                "wgrad_store": helper.wgrad_store,
+                "input_quantizers": input_quantizers,
+                "weight_quantizers": weight_quantizers,
+                "output_quantizers": output_quantizers,
+                "grad_input_quantizers": grad_input_quantizers,
+                "grad_weight_quantizers": grad_weight_quantizers,
+                "grad_output_quantizers": grad_output_quantizers,
+                "fuse_wgrad_accumulation": helper.fuse_wgrad_accumulation,
+                "cpu_offloading": False,
+                "sequence_parallel": helper.sequence_parallel,
+                "activation_dtype": helper.activation_dtype,
+                "is_grad_enabled": torch.is_grad_enabled(),
+                # TE <= 2.14 took the owning module here to stash fp8 workspaces on;
+                # TE >= 2.15 takes the workspaces explicitly. We never cache them
+                # (is_first_microbatch is None), so an empty set is correct for both.
+                "module": helper,
+                "weight_workspaces": [None] * num_gemms,
+                "cache_weight": False,
+                "skip_fp8_weight_update": None,
+                "save_original_input": helper.save_original_input,
+                "debug": False,
+            }
+            missing = [name for name in field_names if name not in available]
+            if missing:
+                raise RuntimeError(
+                    "transformer_engine's _GroupedLinear.forward expects "
+                    f"non_tensor_args fields this shim does not supply: {missing}. "
+                    "TE changed its private grouped-linear contract; update "
+                    "_forward_te_grouped_linear to match."
                 )
-            return TEPytorchGroupedLinearAutograd.forward(
-                None,
-                x,
-                non_tensor_args,
-                *[weight[i] for i in range(weight.shape[0])],
-                *empty_biases,
-            )
+            non_tensor_args = tuple(available[name] for name in field_names)
+
+            empty_biases = [x.new_empty(0) for _ in range(num_gemms)]
+            leading = (x, m_splits, non_tensor_args) if takes_m_splits else (x, non_tensor_args)
+            tensors = (*[weight[i] for i in range(num_gemms)], *empty_biases)
+            if torch.is_grad_enabled():
+                out = TEPytorchGroupedLinearAutograd.apply(*leading, *tensors)
+            else:
+                out = TEPytorchGroupedLinearAutograd.forward(None, *leading, *tensors)
+            # TE >= 2.17 returns (out, new_workspaces); older releases return the
+            # tensor. We pass no workspaces in, so the returned set is discarded.
+            if isinstance(out, tuple):
+                out = out[0]
+            return out
         finally:
             helper.end_forward()
 
