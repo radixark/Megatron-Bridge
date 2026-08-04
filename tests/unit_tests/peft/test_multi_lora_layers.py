@@ -173,6 +173,13 @@ class TestMultiLoRALinearSlots:
         assert torch.equal(layer.alpha_values, torch.ones(3))
         assert torch.equal(layer.rank_values, torch.full((3,), 8.0))
 
+    def test_dense_layer_records_base_linear_name(self) -> None:
+        # forward's token-span guard formats this name in its diagnostic;
+        # before the fix only the MoE subclass assigned it and the dense
+        # guard raised AttributeError instead of the intended RuntimeError.
+        layer = _build_multi_lora_linear(full_name="decoder.layers.0.mlp.linear_fc1")
+        assert layer.base_linear_name == "decoder.layers.0.mlp.linear_fc1"
+
     def test_constructor_forwards_wrapped_module_runtime_config(self) -> None:
         """Adapter construction mirrors the single-LoRA path (LoRA.transform)."""
         base = nn.Linear(16, 32)
@@ -325,6 +332,20 @@ class TestMultiLoRAModelHelpers:
 
         for module in container.mods:
             assert module.tokens_per_adapter is tokens
+
+    def test_set_tokens_per_adapter_slot_validates_input(self) -> None:
+        # A wrong length silently mis-groups the grouped GEMM; negative counts
+        # produce non-monotonic (out-of-bounds) offsets; floats break the
+        # int32 cumsum contract — all must fail loudly at the setter.
+        container = _MultiLoRAContainer(n_layers=1)
+        with pytest.raises(ValueError, match="1-D"):
+            set_tokens_per_adapter_slot(container, torch.tensor([[3, 5]], dtype=torch.int32))
+        with pytest.raises(ValueError, match="integer"):
+            set_tokens_per_adapter_slot(container, torch.tensor([3.0, 5.0]))
+        with pytest.raises(ValueError, match="nonnegative"):
+            set_tokens_per_adapter_slot(container, torch.tensor([3, -1], dtype=torch.int32))
+        with pytest.raises(ValueError, match="n_adapters"):
+            set_tokens_per_adapter_slot(container, torch.tensor([3, 5, 7], dtype=torch.int32))
 
     def test_init_and_clear_adapter_slot_across_model(self) -> None:
         container = _MultiLoRAContainer(n_layers=2)
@@ -784,6 +805,92 @@ class TestMultiLoRALinearGPU:
         # scaling must not promote the activation dtype (bf16 * fp32 -> fp32)
         assert out.dtype == torch.bfloat16
         assert torch.isfinite(out.float()).all()
+
+    def test_backward_matches_per_slot_reference(self):
+        # The grouped-GEMM forward AND backward must equal per-slot dense
+        # matmuls: mixed counts with a zero-count tail slot, two different
+        # (rank, alpha) pairs. Guards the batched-weight stacking, the
+        # repeat_interleave scaling, and graph inclusion of empty slots —
+        # none of which any prior dense test backwarded through.
+        from megatron.bridge.peft.multi_lora_layers import (
+            init_adapter_slot,
+            set_tokens_per_adapter_slot,
+        )
+
+        mlora = self._build(dim=8, n_adapters=3, alpha=16)
+        init_adapter_slot([mlora], 0, rank=4, alpha=8)
+        init_adapter_slot([mlora], 1, rank=8, alpha=16)
+        # B is zero-initialized; randomize so adapter outputs and A-grads are
+        # non-trivial (rank masks re-apply zeros where they must stay zero).
+        with torch.no_grad():
+            for slot in range(3):
+                mlora.adapters[slot].linear_out.weight.normal_(std=0.02)
+            mlora._apply_rank_mask(0)
+        counts = [3, 5, 0]
+        set_tokens_per_adapter_slot([mlora], torch.tensor(counts, dtype=torch.int32, device="cuda"))
+        x = torch.randn(sum(counts), 16, dtype=torch.bfloat16, device="cuda")
+
+        out, _ = mlora(x)
+        out.float().sum().backward()
+
+        # Per-slot reference on cloned leaf weights: same math, no grouping.
+        a_refs = [a.linear_in.weight.detach().clone().requires_grad_(True) for a in mlora.adapters]
+        b_refs = [a.linear_out.weight.detach().clone().requires_grad_(True) for a in mlora.adapters]
+        scaling = (mlora.alpha_values / mlora.rank_values).tolist()
+        ref_rows, start = [], 0
+        for slot, count in enumerate(counts):
+            xs = x[start : start + count]
+            ref_rows.append(scaling[slot] * ((xs @ a_refs[slot].t()) @ b_refs[slot].t()))
+            start += count
+        adapter_ref = torch.cat(ref_rows, dim=0)
+        base_out = mlora.to_wrap(x)[0]
+        torch.testing.assert_close(out, base_out + adapter_ref)
+
+        adapter_ref.float().sum().backward()
+        for slot in range(2):
+            torch.testing.assert_close(mlora.adapters[slot].linear_in.weight.grad, a_refs[slot].grad)
+            torch.testing.assert_close(mlora.adapters[slot].linear_out.weight.grad, b_refs[slot].grad)
+        # The zero-count slot stays in the autograd graph (its DDP grad hooks
+        # must fire on every rank) with grads present and exactly zero.
+        assert mlora.adapters[2].linear_in.weight.grad is not None
+        assert torch.count_nonzero(mlora.adapters[2].linear_in.weight.grad) == 0
+        assert mlora.adapters[2].linear_out.weight.grad is not None
+        assert torch.count_nonzero(mlora.adapters[2].linear_out.weight.grad) == 0
+
+    def test_consecutive_forwards_with_different_counts(self):
+        # Counts are per-micro-batch state stashed on the layer; a second
+        # forward with a different split (and total) must not see the first
+        # batch's routing. Guards stale-count caching regressions.
+        from megatron.bridge.peft.multi_lora_layers import (
+            init_adapter_slot,
+            set_tokens_per_adapter_slot,
+        )
+
+        mlora = self._build(dim=8, n_adapters=2, alpha=16)
+        for slot in range(2):
+            init_adapter_slot([mlora], slot, rank=8, alpha=16)
+        with torch.no_grad():
+            for slot in range(2):
+                mlora.adapters[slot].linear_out.weight.normal_(std=0.02)
+        scaling = (mlora.alpha_values / mlora.rank_values).tolist()
+
+        def reference(x, counts):
+            rows, start = [], 0
+            for slot, count in enumerate(counts):
+                xs = x[start : start + count]
+                a = mlora.adapters[slot].linear_in.weight
+                b = mlora.adapters[slot].linear_out.weight
+                rows.append(scaling[slot] * ((xs @ a.t()) @ b.t()))
+                start += count
+            return mlora.to_wrap(x)[0] + torch.cat(rows, dim=0)
+
+        for counts in ([3, 5], [6, 2], [0, 4]):
+            set_tokens_per_adapter_slot(
+                [mlora], torch.tensor(counts, dtype=torch.int32, device="cuda")
+            )
+            x = torch.randn(sum(counts), 16, dtype=torch.bfloat16, device="cuda")
+            out, _ = mlora(x)
+            torch.testing.assert_close(out, reference(x, counts))
 
     def test_reset_adapter_through_rng_tracker(self):
         mlora = self._build()

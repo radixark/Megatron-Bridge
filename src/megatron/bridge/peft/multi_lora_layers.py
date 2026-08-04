@@ -91,6 +91,7 @@ class MultiLoRALinear(AdapterWrapper):
         self._adapter_enabled = True
         self.n_adapters = n_adapters
         self.max_rank = dim
+        self.base_linear_name = full_name
         # Kept so a slot re-init (reset_adapter) mirrors the construction-time
         # init methods instead of hardcoding xavier/zero.
         self._column_init_method = column_init_method
@@ -620,13 +621,43 @@ def set_tokens_per_adapter_slot(model, tokens_per_adapter: torch.Tensor) -> None
 
     ``tokens_per_adapter[i]`` is the number of contiguous tokens in the
     upcoming forward that belong to adapter slot ``i``. Must sum to the total
-    token count of the micro-batch.
+    token count of the micro-batch — validated at forward time per layer,
+    where the row count is actually known.
     """
-    # One host sync per micro-batch: layers whose base linear consumes the
-    # SP-sharded sequence (replicated bases) compare their row count against
-    # this total to narrow the spans to their shard without a per-layer sync.
-    total = int(tokens_per_adapter.sum().item())
-    for module in _iter_multi_lora_modules(model):
+    if tokens_per_adapter.dim() != 1:
+        raise ValueError(
+            f"tokens_per_adapter must be a 1-D tensor of per-slot counts; "
+            f"got shape {tuple(tokens_per_adapter.shape)}"
+        )
+    if tokens_per_adapter.is_floating_point() or tokens_per_adapter.is_complex():
+        raise ValueError(
+            f"tokens_per_adapter must be an integer tensor; got dtype {tokens_per_adapter.dtype}"
+        )
+    # One host sync per micro-batch (the tolist doubles as the sync the SP-shard
+    # narrowing needs): layers whose base linear consumes the SP-sharded sequence
+    # compare their row count against this total to narrow the spans to their
+    # shard without a per-layer sync.
+    counts = tokens_per_adapter.tolist()
+    if any(count < 0 for count in counts):
+        raise ValueError(
+            f"tokens_per_adapter must be nonnegative (negative counts produce "
+            f"non-monotonic grouped-GEMM offsets); got {counts}"
+        )
+    total = int(sum(counts))
+    modules = list(_iter_multi_lora_modules(model))
+    if modules:
+        n_adapters = modules[0].n_adapters
+        if len(counts) != n_adapters:
+            raise ValueError(
+                f"tokens_per_adapter has {len(counts)} entries but the model was "
+                f"built with n_adapters={n_adapters}"
+            )
+        # The dense grouped GEMM consumes the counts on the model's device; the
+        # MoE routing already moves them defensively — do it once here for both.
+        first_param = next(modules[0].parameters(), None)
+        if first_param is not None and tokens_per_adapter.device != first_param.device:
+            tokens_per_adapter = tokens_per_adapter.to(first_param.device)
+    for module in modules:
         module.tokens_per_adapter = tokens_per_adapter
         module.tokens_per_adapter_total = total
 
