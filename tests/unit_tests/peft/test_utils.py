@@ -670,6 +670,45 @@ class TestParallelLinearAdapter:
 class TestGroupedExpertLinearAdapter:
     """Tests for grouped-expert per-expert LoRA adapters."""
 
+    @pytest.mark.parametrize(
+        ("tp_size", "expected_allreduce"),
+        [(2, False), (1, True)],
+    )
+    def test_grouped_expert_linear_adapter_weight_flags_follow_expert_process_groups(
+        self, tp_size, expected_allreduce
+    ):
+        """allreduce mirrors upstream's use_expert_process_groups condition.
+
+        With ETP != TP (here ETP=1, TP=2) the TP-duplicated adapter weights
+        must route to DDP's expert bucket (allreduce=False) whose reduce group
+        folds in the TP peers; the old EP-only condition left them in the
+        dense bucket, so cross-TP gradients never synchronized and replicas
+        silently diverged. When the groups coincide (EP=1, ETP == TP) the
+        dense bucket is equivalent and allreduce stays True.
+        """
+        config = MockModelParallelConfig()
+        config.tensor_model_parallel_size = tp_size
+        adapter = GroupedExpertLinearAdapter(
+            in_features=4,
+            out_features=4,
+            dim=2,
+            num_local_experts=2,
+            base_linear_name="decoder.layers.0.mlp.experts.linear_fc2",
+            activation="identity",
+            input_is_parallel=True,
+            model_parallel_config=config,
+        )
+
+        for weight, expected_axis in (
+            (adapter.linear_in.weight, 2),
+            (adapter.linear_out.weight, 1),
+        ):
+            assert weight.allreduce is expected_allreduce
+            assert weight.tensor_model_parallel is True
+            assert weight.partition_dim == expected_axis
+            assert weight.partition_stride == 1
+        assert adapter.is_expert is True
+
     @pytest.mark.parametrize("split_kwarg", ["m_splits", "tokens_per_expert"])
     def test_grouped_expert_linear_adapter_accepts_tensor_split_kwargs(self, split_kwarg):
         """Tensor-valued split kwargs should not trigger ambiguous truth-value errors."""

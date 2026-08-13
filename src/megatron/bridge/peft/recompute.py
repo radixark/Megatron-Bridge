@@ -75,9 +75,14 @@ def maybe_enable_recompute_inputs_grad(model, peft_recompute_patched: Set[int] |
                 continue
 
             params = list(unwrapped_model.named_parameters())
-            trainable_adapter = any(p.requires_grad and ".adapter." in n.lower() for n, p in params)
+            # Multi-LoRA slots live under ".adapters.<slot>."; single-LoRA under ".adapter.".
+            trainable_adapter = any(
+                p.requires_grad and (".adapter." in n.lower() or ".adapters." in n.lower()) for n, p in params
+            )
             trainable_base = any(
-                p.requires_grad and (".to_wrap." not in n.lower() and ".adapter." not in n.lower()) for n, p in params
+                p.requires_grad
+                and (".to_wrap." not in n.lower() and ".adapter." not in n.lower() and ".adapters." not in n.lower())
+                for n, p in params
             )
 
             if not (trainable_adapter and not trainable_base):
