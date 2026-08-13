@@ -27,6 +27,7 @@ import torch.nn as nn
 from megatron.core import ModelParallelConfig, parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict, ShardedTensor, ShardedTensorFactory
 from megatron.core.tensor_parallel import ColumnParallelLinear, RowParallelLinear
+from megatron.core.tensor_parallel.layers import set_tensor_model_parallel_attributes
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
@@ -1119,23 +1120,31 @@ class GroupedExpertLinearAdapter(nn.Module):
         ParallelLinearAdapter._get_init_fn(self, column_init_method)(linear_in_weight)
         ParallelLinearAdapter._get_init_fn(self, row_init_method)(linear_out_weight)
 
-        expert_parallel = (
-            parallel_state.get_expert_model_parallel_world_size() or model_parallel_config.expert_model_parallel_size
-        ) > 1
         self._linear_in_tp_axis = linear_in_tp_axis
         self._linear_out_tp_axis = linear_out_tp_axis
         self.linear_in = nn.Module()
         self.linear_in.weight = nn.Parameter(linear_in_weight)
         self.linear_out = nn.Module()
         self.linear_out.weight = nn.Parameter(linear_out_weight)
+        # Ported from upstream (NVIDIA-NeMo/Megatron-Bridge main): adapter
+        # gradients must reduce over the expert process groups whenever the
+        # experts are EP-sharded or the expert TP size differs from the dense
+        # TP size — with ETP < TP the weights are TP-duplicated and only the
+        # expert DP group folds those replicas' gradients together. The dense
+        # bucket is safe only when both groups coincide (EP == 1, ETP == TP);
+        # deriving the flag from EP size alone left EP=1, TP>1 runs unsynced.
+        use_expert_process_groups = (
+            parallel_state.get_expert_model_parallel_world_size() or model_parallel_config.expert_model_parallel_size
+        ) > 1 or expert_tp_size != (
+            parallel_state.get_tensor_model_parallel_world_size() or model_parallel_config.tensor_model_parallel_size
+        )
         for weight, tp_axis in (
             (self.linear_in.weight, linear_in_tp_axis),
             (self.linear_out.weight, linear_out_tp_axis),
         ):
-            setattr(weight, "allreduce", not expert_parallel)
+            setattr(weight, "allreduce", not use_expert_process_groups)
             if tp_axis is not None:
-                setattr(weight, "partition_dim", tp_axis)
-                setattr(weight, "partition_stride", 1)
+                set_tensor_model_parallel_attributes(weight, True, tp_axis, 1)
 
         if dropout > 0.0:
             self.dropout = nn.Dropout(dropout)
