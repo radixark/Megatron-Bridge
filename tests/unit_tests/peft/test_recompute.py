@@ -59,6 +59,25 @@ class DummyModel(torch.nn.Module):
             yield module
 
 
+class DummyMultiLoRAModel(torch.nn.Module):
+    """Model whose only trainable params are multi-LoRA slots (".adapters.<i>.")."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(recompute_method="uniform")
+        self.block = DummyTransformerBlock()
+
+        # Frozen base parameter (not trainable)
+        self.base = torch.nn.Linear(1, 1, bias=False)
+        self.base.weight.requires_grad = False
+
+        # Multi-LoRA wrappers hold one adapter per slot in an ``adapters``
+        # ModuleList, so parameter names contain ".adapters.<i>." rather than
+        # ".adapter.". Nest under a ModuleDict so the full name carries the
+        # leading dot (e.g. "linear_fc1.adapters.0.weight").
+        self.linear_fc1 = torch.nn.ModuleDict({"adapters": torch.nn.ModuleList([DummyAdapter(), DummyAdapter()])})
+
+
 def _patch_transformer_block(monkeypatch):
     import megatron.core.transformer.transformer_block as transformer_block
 
@@ -90,3 +109,46 @@ def test_maybe_enable_recompute_inputs_grad_patches_block(monkeypatch):
     # Second invocation should be a no-op (no duplicate patch)
     maybe_enable_recompute_inputs_grad(model, patched_registry)
     assert model.block.forward is patched_forward
+
+
+def test_maybe_enable_recompute_inputs_grad_patches_block_multi_lora(monkeypatch):
+    """Multi-LoRA slot params (".adapters.<i>.") must be recognized as adapters.
+
+    Regression test: they used to be classified as trainable base weights, the
+    patch was skipped, and under full activation recompute the checkpointed
+    region never replayed in backward — every adapter grad stayed zero.
+    """
+    _patch_transformer_block(monkeypatch)
+    recompute_mod.PEFT_RECOMPUTE_PATCHED.clear()
+
+    model = DummyMultiLoRAModel()
+    param_names = [n for n, _ in model.named_parameters()]
+    assert any(".adapters." in n for n in param_names)
+    assert not any(".adapter." in n for n in param_names)
+
+    patched_registry = maybe_enable_recompute_inputs_grad(model, set())
+
+    assert id(model) in patched_registry
+
+    input_tensor = torch.zeros(2, 2)
+    assert input_tensor.requires_grad is False
+
+    model.block(input_tensor)
+    assert model.block.last_input_requires_grad is True
+
+
+def test_maybe_enable_recompute_inputs_grad_skips_trainable_base(monkeypatch):
+    """A genuinely trainable base weight must still disable the patch."""
+    _patch_transformer_block(monkeypatch)
+    recompute_mod.PEFT_RECOMPUTE_PATCHED.clear()
+
+    model = DummyMultiLoRAModel()
+    model.base.weight.requires_grad = True
+
+    patched_registry = maybe_enable_recompute_inputs_grad(model, set())
+
+    assert id(model) not in patched_registry
+
+    input_tensor = torch.zeros(2, 2)
+    model.block(input_tensor)
+    assert model.block.last_input_requires_grad is False
