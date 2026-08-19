@@ -98,7 +98,9 @@ def postprocess(
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-        tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True,
+        # Aggressive smem merge can alias buffers that are still live and
+        # produce NaN dQ/dKV, so keep it disabled for correctness.
+        tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: False,
     },
 )
 def bwd(
@@ -168,6 +170,7 @@ def bwd(
             KV_tail_shared = T.alloc_shared([BS, D_tail], dtype)
             dO_shared = T.alloc_shared([block_H, D], dtype)
             mask = T.alloc_fragment([BS], "bool")
+            kv_i = T.alloc_fragment([BS], indices_dtype)
 
             P_shared_cast = T.alloc_shared([block_H, BS], dtype)
             dP_shared_cast = T.alloc_shared([block_H, BS], dtype)
@@ -198,6 +201,10 @@ def bwd(
                 for bi_i in T.Parallel(BS):
                     # Changed here for thd
                     mask[bi_i] = Indices[by, s_i, bz // NH, i_i * BS + bi_i] != -1
+                # A padded slot contains -1. Clamp its address and load a true
+                # zero instead of allowing 0 * garbage/inf to become NaN.
+                for bi_i in T.Parallel(BS):
+                    kv_i[bi_i] = T.max(Indices[by, s_i, bz // NH, i_i * BS + bi_i], 0)
 
                 # Compute attention scores
                 for h_i, bi_i in T.Parallel(block_H, BS):
@@ -205,12 +212,12 @@ def bwd(
 
                 # Load KV, V for this block of indices
                 for bi_i, d_i in T.Parallel(BS, D):
-                    KV_shared[bi_i, d_i] = KV[by, Indices[by, s_i, bz // NH, i_i * BS + bi_i], bz // NH, d_i]
+                    KV_shared[bi_i, d_i] = T.if_then_else(mask[bi_i], KV[by, kv_i[bi_i], bz // NH, d_i], 0)
 
                 T.gemm(Q_shared, KV_shared, acc_p, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
 
                 for bi_i, d_i in T.Parallel(BS, D_tail):
-                    KV_tail_shared[bi_i, d_i] = KV[by, Indices[by, s_i, bz // NH, i_i * BS + bi_i], bz // NH, D + d_i]
+                    KV_tail_shared[bi_i, d_i] = T.if_then_else(mask[bi_i], KV[by, kv_i[bi_i], bz // NH, D + d_i], 0)
                 T.gemm(Q_tail_shared, KV_tail_shared, acc_p, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
 
                 for h_i, bi_i in T.Parallel(block_H, BS):
@@ -255,14 +262,11 @@ def bwd(
                         if bi_i < BS // split_store:
                             acc_dkv_tail_shared[bi_i, d_i] = acc_dkv_tail[bi_i + s * (BS // split_store), d_i]
 
+                    # Padded slots have exact-zero P/dP columns, so the clamped
+                    # address turns these atomics into no-ops instead of OOB writes.
                     for bi_i, d_i in T.Parallel(BS // split_store, D // 4):
                         T.atomic_addx4(
-                            dKV[
-                                by,
-                                Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
-                                bz // NH,
-                                d_i * 4,
-                            ],
+                            dKV[by, kv_i[bi_i + s * (BS // split_store)], bz // NH, d_i * 4],
                             acc_dkv_shared[bi_i, d_i * 4],
                         )
 
@@ -271,7 +275,7 @@ def bwd(
                         T.atomic_addx4(
                             dKV[
                                 by,
-                                Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
+                                kv_i[bi_i + s * (BS // split_store)],
                                 bz // NH,
                                 D + d_i * 4,
                             ],
