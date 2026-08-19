@@ -51,6 +51,7 @@ from megatron.bridge.peft import multi_lora as multi_lora_mod
 from megatron.bridge.peft import multi_lora_layers as multi_lora_layers_module
 from megatron.bridge.peft.multi_lora import MultiLoRA
 from megatron.bridge.peft.multi_lora_layers import (
+    _PYTORCH_GROUPED_MM_ALIGNMENT_BYTES,
     MultiLoRALinear,
     _iter_multi_lora_modules,
     clear_adapter_slot,
@@ -714,6 +715,25 @@ def test_narrow_window_covering_many_small_slots():
     assert sum(_narrow([4, 3, 5, 0], start=3, num_rows=6)) == 6
 
 
+def test_narrow_twins_agree_on_random_windows():
+    # Property check that the device- and host-side narrows are true twins:
+    # random per-slot counts (including zeros) against random windows that come
+    # out empty, interior, or overshooting the total token count.
+    generator = torch.Generator().manual_seed(20260819)
+    for _ in range(50):
+        n_slots = int(torch.randint(1, 6, (1,), generator=generator))
+        counts = torch.randint(0, 9, (n_slots,), dtype=torch.int32, generator=generator)
+        total = int(counts.sum())
+        start = int(torch.randint(0, total + 4, (1,), generator=generator))
+        num_rows = int(torch.randint(0, total + 4, (1,), generator=generator))
+
+        device_counts = multi_lora_layers_module._narrow_token_counts_to_window(counts, start, num_rows)
+        host_counts = multi_lora_layers_module._narrow_token_counts_to_window_host(
+            tuple(counts.tolist()), start, num_rows
+        )
+        assert tuple(device_counts.tolist()) == host_counts
+
+
 # --------------------------------------------------------------------------- #
 # Forward smoke / B4 reset: single-GPU integration through a real
 # ColumnParallelLinear.
@@ -931,7 +951,7 @@ class TestMultiLoRALinearGPU:
         offsets = torch.tensor(counts, dtype=torch.int32, device="cuda").cumsum(dim=0)
 
         assert input_.stride() == (8, 1)
-        assert input_.data_ptr() % 16 != 0
+        assert input_.data_ptr() % _PYTORCH_GROUPED_MM_ALIGNMENT_BYTES != 0
         assert not multi_lora_layers_module._can_use_grouped_mm(input_, weights)
 
         with patch.object(
@@ -951,6 +971,37 @@ class TestMultiLoRALinearGPU:
         torch.testing.assert_close(out, reference)
         assert input_.grad is not None
         assert weights.grad is not None
+
+    @pytest.mark.skipif(not hasattr(torch, "_grouped_mm"), reason="needs torch._grouped_mm")
+    def test_exactly_16_byte_aligned_input_stays_on_grouped_mm(self):
+        """Boundary canary: 16-but-not-32-byte alignment must stay on the fast path.
+
+        Allocator-natural CUDA tensors are 256-byte aligned, so ordinary inputs
+        could never reveal PyTorch tightening its alignment contract beyond
+        ``_PYTORCH_GROUPED_MM_ALIGNMENT_BYTES``; this probes the exact boundary.
+        """
+
+        counts = [3, 5]
+        features = 8
+        # A storage offset of 8 BF16 elements = 16 bytes from the allocator's
+        # 256-byte-aligned base leaves the data pointer exactly 16-byte aligned
+        # but not 32-byte aligned.
+        storage = torch.randn(sum(counts) * features + 8, dtype=torch.bfloat16, device="cuda")
+        assert storage.data_ptr() % (2 * _PYTORCH_GROUPED_MM_ALIGNMENT_BYTES) == 0
+        input_ = storage[8:].view(sum(counts), features)
+        weights = torch.randn(2, features, features, dtype=torch.bfloat16, device="cuda")
+        offsets = torch.tensor(counts, dtype=torch.int32, device="cuda").cumsum(dim=0, dtype=torch.int32)
+
+        assert input_.data_ptr() % _PYTORCH_GROUPED_MM_ALIGNMENT_BYTES == 0
+        assert input_.data_ptr() % (2 * _PYTORCH_GROUPED_MM_ALIGNMENT_BYTES) != 0
+        assert multi_lora_layers_module._can_use_grouped_mm(input_, weights)
+
+        out = torch._grouped_mm(input_, weights.transpose(-2, -1), offsets)
+
+        reference = torch.cat(
+            [nn.functional.linear(chunk, weight) for chunk, weight in zip(input_.split(counts), weights)]
+        )
+        torch.testing.assert_close(out, reference)
 
     def test_fp32_uses_fallback(self):
         """FP32 grouped-MM backward is unsupported on the validated PyTorch stack."""

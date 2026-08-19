@@ -56,7 +56,14 @@ from megatron.bridge.peft.utils import (
 )
 
 
-_GROUPED_MM_ALIGNMENT_BYTES = 16
+# ``torch._grouped_mm`` operand contract. Both values mirror the CUDA layout
+# checks in PyTorch ATen's GroupedMMUtils.h — see
+# https://github.com/pytorch/pytorch/blob/ab5fb26f8ffc6e4dc97b51b5611bce957645b1db/aten/src/ATen/native/GroupedMMUtils.h#L24-L48
+# — and are not user-configurable tuning parameters. The failure modes are
+# asymmetric: gating too strictly only routes an eligible tensor to the safe
+# per-slot fallback, while gating too loosely sends it to the fast path where
+# PyTorch's host-side TORCH_CHECK fails loudly.
+_PYTORCH_GROUPED_MM_ALIGNMENT_BYTES = 16
 _GROUPED_MM_SUPPORTED_DTYPES = frozenset((torch.float16, torch.bfloat16))
 
 
@@ -64,8 +71,8 @@ def _has_aligned_grouped_mm_layout(tensor: torch.Tensor) -> bool:
     """Return whether a tensor's address and non-unit strides are 16-byte aligned."""
 
     element_size = tensor.element_size()
-    return tensor.data_ptr() % _GROUPED_MM_ALIGNMENT_BYTES == 0 and all(
-        stride == 1 or stride * element_size % _GROUPED_MM_ALIGNMENT_BYTES == 0 for stride in tensor.stride()
+    return tensor.data_ptr() % _PYTORCH_GROUPED_MM_ALIGNMENT_BYTES == 0 and all(
+        stride == 1 or stride * element_size % _PYTORCH_GROUPED_MM_ALIGNMENT_BYTES == 0 for stride in tensor.stride()
     )
 
 
@@ -95,7 +102,7 @@ def _can_use_grouped_mm(input_: torch.Tensor, weights: torch.Tensor) -> bool:
     if not _has_aligned_grouped_mm_layout(input_) or not _has_aligned_grouped_mm_layout(grouped_weights):
         return False
     contiguous_output_stride_bytes = weights.shape[-2] * input_.element_size()
-    return contiguous_output_stride_bytes % _GROUPED_MM_ALIGNMENT_BYTES == 0
+    return contiguous_output_stride_bytes % _PYTORCH_GROUPED_MM_ALIGNMENT_BYTES == 0
 
 
 def _apply_per_slot_linear(
