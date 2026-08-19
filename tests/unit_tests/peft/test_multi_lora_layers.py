@@ -332,6 +332,7 @@ class TestMultiLoRAModelHelpers:
 
         for module in container.mods:
             assert module.tokens_per_adapter is tokens
+            assert module.tokens_per_adapter_host == (3, 5)
 
     def test_set_tokens_per_adapter_slot_validates_input(self) -> None:
         # A wrong length silently mis-groups the grouped GEMM; negative counts
@@ -681,9 +682,12 @@ def test_load_adapter_unused_keys_raises():
 # an out-of-bounds grouped GEMM, not a shape error.
 # --------------------------------------------------------------------------- #
 def _narrow(counts, start, num_rows):
-    return multi_lora_layers_module._narrow_token_counts_to_window(
+    device_counts = multi_lora_layers_module._narrow_token_counts_to_window(
         torch.tensor(counts, dtype=torch.int32), start, num_rows
     ).tolist()
+    host_counts = list(multi_lora_layers_module._narrow_token_counts_to_window_host(counts, start, num_rows))
+    assert host_counts == device_counts
+    return device_counts
 
 
 def test_narrow_window_spanning_a_slot_boundary():
@@ -830,8 +834,13 @@ class TestMultiLoRALinearGPU:
         set_tokens_per_adapter_slot([mlora], torch.tensor(counts, dtype=torch.int32, device="cuda"))
         x = torch.randn(sum(counts), 16, dtype=torch.bfloat16, device="cuda")
 
-        out, _ = mlora(x)
-        out.float().sum().backward()
+        with patch.object(
+            multi_lora_layers_module,
+            "_apply_per_slot_linear",
+            side_effect=AssertionError("aligned rank unexpectedly used the fallback"),
+        ):
+            out, _ = mlora(x)
+            out.float().sum().backward()
 
         # Per-slot reference on cloned leaf weights: same math, no grouping.
         a_refs = [a.linear_in.weight.detach().clone().requires_grad_(True) for a in mlora.adapters]
@@ -856,6 +865,188 @@ class TestMultiLoRALinearGPU:
         assert torch.count_nonzero(mlora.adapters[2].linear_in.weight.grad) == 0
         assert mlora.adapters[2].linear_out.weight.grad is not None
         assert torch.count_nonzero(mlora.adapters[2].linear_out.weight.grad) == 0
+
+    def test_unaligned_local_rank_backward_matches_per_slot_reference(self):
+        """A physical BF16 rank of two must bypass grouped MM for both projections."""
+
+        from megatron.bridge.peft.multi_lora_layers import (
+            init_adapter_slot,
+            set_tokens_per_adapter_slot,
+        )
+
+        mlora = self._build(dim=2, n_adapters=3, alpha=4)
+        init_adapter_slot([mlora], 0, rank=1, alpha=2)
+        init_adapter_slot([mlora], 1, rank=2, alpha=4)
+        with torch.no_grad():
+            for slot in range(3):
+                mlora.adapters[slot].linear_out.weight.normal_(std=0.02)
+            mlora._apply_rank_mask(0)
+
+        counts = [3, 5, 0]
+        set_tokens_per_adapter_slot([mlora], torch.tensor(counts, dtype=torch.int32, device="cuda"))
+        x = torch.randn(sum(counts), 16, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+        grad_output = torch.randn(sum(counts), 16, dtype=torch.bfloat16, device="cuda")
+
+        with patch.object(
+            torch,
+            "_grouped_mm",
+            side_effect=AssertionError("unaligned rank unexpectedly used grouped MM"),
+        ):
+            out, _ = mlora(x)
+            out.backward(grad_output)
+
+        x_ref = x.detach().clone().requires_grad_(True)
+        a_refs = [adapter.linear_in.weight.detach().clone().requires_grad_(True) for adapter in mlora.adapters]
+        b_refs = [adapter.linear_out.weight.detach().clone().requires_grad_(True) for adapter in mlora.adapters]
+        scaling = (mlora.alpha_values / mlora.rank_values).tolist()
+        ref_rows = []
+        start = 0
+        for slot, count in enumerate(counts):
+            slot_input = x_ref.narrow(0, start, count)
+            hidden = nn.functional.linear(slot_input, a_refs[slot])
+            ref_rows.append(scaling[slot] * nn.functional.linear(hidden, b_refs[slot]))
+            start += count
+        ref_out = mlora.to_wrap(x_ref)[0] + torch.cat(ref_rows, dim=0)
+        ref_out.backward(grad_output)
+
+        torch.testing.assert_close(out, ref_out)
+        torch.testing.assert_close(x.grad, x_ref.grad)
+        for slot in range(2):
+            torch.testing.assert_close(mlora.adapters[slot].linear_in.weight.grad, a_refs[slot].grad)
+            torch.testing.assert_close(mlora.adapters[slot].linear_out.weight.grad, b_refs[slot].grad)
+        assert mlora.adapters[2].linear_in.weight.grad is not None
+        assert torch.count_nonzero(mlora.adapters[2].linear_in.weight.grad) == 0
+        assert mlora.adapters[2].linear_out.weight.grad is not None
+        assert torch.count_nonzero(mlora.adapters[2].linear_out.weight.grad) == 0
+
+    def test_misaligned_storage_offset_uses_fallback(self):
+        """Aligned strides are insufficient when an operand's data pointer is offset."""
+
+        counts = [3, 5]
+        # Slicing one BF16 element keeps a contiguous (8, 1) stride but moves
+        # the data pointer by two bytes, which torch._grouped_mm rejects.
+        storage = torch.randn(sum(counts) * 8 + 1, dtype=torch.bfloat16, device="cuda")
+        input_ = storage[1:].view(sum(counts), 8).requires_grad_(True)
+        weights = torch.randn(2, 8, 8, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+        offsets = torch.tensor(counts, dtype=torch.int32, device="cuda").cumsum(dim=0)
+
+        assert input_.stride() == (8, 1)
+        assert input_.data_ptr() % 16 != 0
+        assert not multi_lora_layers_module._can_use_grouped_mm(input_, weights)
+
+        with patch.object(
+            torch,
+            "_grouped_mm",
+            side_effect=AssertionError("misaligned pointer unexpectedly used grouped MM"),
+        ):
+            out = multi_lora_layers_module._apply_multi_lora_projection(input_, weights, offsets, counts)
+            out.float().sum().backward()
+
+        reference = torch.cat(
+            [
+                nn.functional.linear(chunk, weight)
+                for chunk, weight in zip(input_.detach().split(counts), weights.detach())
+            ]
+        )
+        torch.testing.assert_close(out, reference)
+        assert input_.grad is not None
+        assert weights.grad is not None
+
+    def test_fp32_uses_fallback(self):
+        """FP32 grouped-MM backward is unsupported on the validated PyTorch stack."""
+
+        counts = [3, 5]
+        input_ = torch.randn(sum(counts), 8, dtype=torch.float32, device="cuda", requires_grad=True)
+        weights = torch.randn(2, 8, 8, dtype=torch.float32, device="cuda", requires_grad=True)
+        offsets = torch.tensor(counts, dtype=torch.int32, device="cuda").cumsum(dim=0)
+
+        assert not multi_lora_layers_module._can_use_grouped_mm(input_, weights)
+        with patch.object(
+            torch,
+            "_grouped_mm",
+            side_effect=AssertionError("FP32 unexpectedly used grouped MM"),
+        ):
+            out = multi_lora_layers_module._apply_multi_lora_projection(input_, weights, offsets, counts)
+            out.sum().backward()
+
+        assert torch.isfinite(out).all()
+        assert input_.grad is not None
+        assert weights.grad is not None
+
+    def test_all_zero_counts_use_fallback(self):
+        """An empty grouped-MM output cannot safely participate in backward."""
+
+        counts = [0, 0, 0]
+        input_ = torch.empty(0, 8, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+        weights = torch.randn(3, 8, 8, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+        offsets = torch.zeros(3, dtype=torch.int32, device="cuda")
+
+        assert not multi_lora_layers_module._can_use_grouped_mm(input_, weights)
+        with patch.object(
+            torch,
+            "_grouped_mm",
+            side_effect=AssertionError("empty batch unexpectedly used grouped MM"),
+        ):
+            out = multi_lora_layers_module._apply_multi_lora_projection(input_, weights, offsets, counts)
+            out.float().sum().backward()
+
+        assert out.shape == (0, 8)
+        assert input_.grad is not None
+        assert weights.grad is not None
+        assert torch.count_nonzero(weights.grad) == 0
+
+    def test_unaligned_fallback_uses_sp_narrowed_host_counts(self):
+        """The fallback follows a sequence-parallel window that crosses slots."""
+
+        from megatron.bridge.peft.multi_lora_layers import set_tokens_per_adapter_slot
+
+        mlora = self._build(dim=2, n_adapters=3, alpha=4)
+        with torch.no_grad():
+            for adapter in mlora.adapters:
+                adapter.linear_out.weight.normal_(std=0.02)
+
+        # Full spans [3, 5, 0] narrow to [3, 1, 0] for rank 0's four-row
+        # sequence-parallel window, crossing the slot-0/slot-1 boundary.
+        full_counts = [3, 5, 0]
+        local_counts = [3, 1, 0]
+        set_tokens_per_adapter_slot([mlora], torch.tensor(full_counts, dtype=torch.int32, device="cuda"))
+        x = torch.randn(sum(local_counts), 16, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+
+        with (
+            patch.object(
+                multi_lora_layers_module.parallel_state, "get_tensor_model_parallel_world_size", return_value=2
+            ),
+            patch.object(multi_lora_layers_module.parallel_state, "get_tensor_model_parallel_rank", return_value=0),
+            patch.object(
+                multi_lora_layers_module, "gather_from_tensor_model_parallel_region", side_effect=lambda value: value
+            ),
+            patch.object(
+                torch, "_grouped_mm", side_effect=AssertionError("unaligned rank unexpectedly used grouped MM")
+            ),
+        ):
+            out, _ = mlora(x)
+            out.float().sum().backward()
+
+        a_refs = [adapter.linear_in.weight.detach().clone().requires_grad_(True) for adapter in mlora.adapters]
+        b_refs = [adapter.linear_out.weight.detach().clone().requires_grad_(True) for adapter in mlora.adapters]
+        x_ref = x.detach().clone().requires_grad_(True)
+        scaling = (mlora.alpha_values / mlora.rank_values).tolist()
+        rows = []
+        start = 0
+        for slot, count in enumerate(local_counts):
+            slot_input = x_ref.narrow(0, start, count)
+            rows.append(
+                scaling[slot] * nn.functional.linear(nn.functional.linear(slot_input, a_refs[slot]), b_refs[slot])
+            )
+            start += count
+        reference = mlora.to_wrap(x_ref)[0] + torch.cat(rows)
+        reference.float().sum().backward()
+
+        torch.testing.assert_close(out, reference)
+        torch.testing.assert_close(x.grad, x_ref.grad)
+        for slot in range(3):
+            torch.testing.assert_close(mlora.adapters[slot].linear_in.weight.grad, a_refs[slot].grad)
+            torch.testing.assert_close(mlora.adapters[slot].linear_out.weight.grad, b_refs[slot].grad)
 
     def test_consecutive_forwards_with_different_counts(self):
         # Counts are per-micro-batch state stashed on the layer; a second
@@ -885,9 +1076,7 @@ class TestMultiLoRALinearGPU:
             return mlora.to_wrap(x)[0] + torch.cat(rows, dim=0)
 
         for counts in ([3, 5], [6, 2], [0, 4]):
-            set_tokens_per_adapter_slot(
-                [mlora], torch.tensor(counts, dtype=torch.int32, device="cuda")
-            )
+            set_tokens_per_adapter_slot([mlora], torch.tensor(counts, dtype=torch.int32, device="cuda"))
             x = torch.randn(sum(counts), 16, dtype=torch.bfloat16, device="cuda")
             out, _ = mlora(x)
             torch.testing.assert_close(out, reference(x, counts))

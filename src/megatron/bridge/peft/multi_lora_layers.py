@@ -19,8 +19,9 @@
 via per-layer ``tokens_per_adapter`` set by :func:`set_tokens_per_adapter_slot`.
 
 Forward stacks the raw weights of all adapters and uses ``torch._grouped_mm``
-for a single fused kernel; TP/SP collectives are issued once around the two
-GEMMs to match the layout of the wrapped base linear.
+when its 16-byte alignment contract is satisfied, otherwise falling back to
+per-slot linear projections. TP/SP collectives are still issued once around
+the two projections to match the layout of the wrapped base linear.
 
 :class:`MultiLoRAGroupedExpertLinear` is the MoE counterpart, wrapping a grouped
 expert linear (``mlp.experts.linear_fc{1,2}`` of a ``TEGroupedMLP``) with one
@@ -55,12 +56,86 @@ from megatron.bridge.peft.utils import (
 )
 
 
+_GROUPED_MM_ALIGNMENT_BYTES = 16
+_GROUPED_MM_SUPPORTED_DTYPES = frozenset((torch.float16, torch.bfloat16))
+
+
+def _has_aligned_grouped_mm_layout(tensor: torch.Tensor) -> bool:
+    """Return whether a tensor's address and non-unit strides are 16-byte aligned."""
+
+    element_size = tensor.element_size()
+    return tensor.data_ptr() % _GROUPED_MM_ALIGNMENT_BYTES == 0 and all(
+        stride == 1 or stride * element_size % _GROUPED_MM_ALIGNMENT_BYTES == 0 for stride in tensor.stride()
+    )
+
+
+def _can_use_grouped_mm(input_: torch.Tensor, weights: torch.Tensor) -> bool:
+    """Return whether grouped MM is safe for one dense multi-LoRA projection.
+
+    ``weights`` has the ``[groups, output_features, input_features]`` layout
+    consumed by :func:`torch.nn.functional.linear`. Grouped MM receives its
+    transpose, and its backward may receive a contiguous output gradient after
+    a TP collective. Conservatively require that layout to remain 16-byte
+    aligned as well as the current input and weight strides.
+    """
+
+    # PyTorch 2.11 accepts FP32 grouped MM in forward but its backward fails
+    # for this layout, so keep FP32 on the autograd-safe fallback.
+    if (
+        not input_.is_cuda
+        or not weights.is_cuda
+        or input_.device != weights.device
+        or input_.shape[0] == 0
+        or not hasattr(torch, "_grouped_mm")
+        or input_.dtype != weights.dtype
+        or input_.dtype not in _GROUPED_MM_SUPPORTED_DTYPES
+    ):
+        return False
+    grouped_weights = weights.transpose(-2, -1)
+    if not _has_aligned_grouped_mm_layout(input_) or not _has_aligned_grouped_mm_layout(grouped_weights):
+        return False
+    contiguous_output_stride_bytes = weights.shape[-2] * input_.element_size()
+    return contiguous_output_stride_bytes % _GROUPED_MM_ALIGNMENT_BYTES == 0
+
+
+def _apply_per_slot_linear(
+    input_: torch.Tensor,
+    weights: torch.Tensor,
+    token_counts: Sequence[int],
+) -> torch.Tensor:
+    """Apply one weight per contiguous adapter slot without grouped MM."""
+
+    if len(token_counts) != weights.shape[0] or sum(token_counts) != input_.shape[0]:
+        raise RuntimeError(
+            f"Per-slot projection received {input_.shape[0]} rows, {weights.shape[0]} weight groups, "
+            f"and token counts {tuple(token_counts)}."
+        )
+    chunks = input_.split(tuple(token_counts), dim=0)
+    return torch.cat(
+        [nn.functional.linear(chunk, weight) for chunk, weight in zip(chunks, weights)],
+        dim=0,
+    )
+
+
+def _apply_multi_lora_projection(
+    input_: torch.Tensor,
+    weights: torch.Tensor,
+    offsets: torch.Tensor,
+    token_counts: Sequence[int],
+) -> torch.Tensor:
+    """Apply a dense multi-LoRA projection through grouped MM or its safe fallback."""
+
+    if _can_use_grouped_mm(input_, weights):
+        return torch._grouped_mm(input_, weights.transpose(-2, -1), offsets)
+    return _apply_per_slot_linear(input_, weights, token_counts)
+
+
 class MultiLoRALinear(AdapterWrapper):
     """Megatron parallel linear wrapped with *N* concurrent LoRA adapters.
 
     Each adapter slot is a :class:`ParallelLinearAdapter` stored in an
-    ``nn.ModuleList``. Forward uses grouped GEMM with a single set of
-    TP/SP comms for efficiency.
+    ``nn.ModuleList``. Forward uses grouped GEMM where its operand strides are
+    supported, with a safe per-slot fallback and a single set of TP/SP comms.
 
     For bridge export compatibility, use :func:`expose_adapter_slot` to
     temporarily expose one slot as ``.adapter``.
@@ -145,6 +220,10 @@ class MultiLoRALinear(AdapterWrapper):
         )
 
         self.tokens_per_adapter: Optional[torch.Tensor] = None
+        # Host copy written by set_tokens_per_adapter_slot. The safe fallback
+        # needs Python split sizes, and retaining the setter's one synchronization
+        # avoids a device-to-host sync in every adapted layer.
+        self.tokens_per_adapter_host: Optional[Tuple[int, ...]] = None
         # Host-side sum of tokens_per_adapter (set alongside it); lets forward
         # detect an SP-sharded input without a per-layer device sync.
         self.tokens_per_adapter_total: Optional[int] = None
@@ -163,6 +242,11 @@ class MultiLoRALinear(AdapterWrapper):
             return linear_output, bias
 
         tokens_per_adapter = self.tokens_per_adapter
+        token_counts = self.tokens_per_adapter_host
+        if tokens_per_adapter is None or token_counts is None:
+            raise RuntimeError(
+                f"{self.base_linear_name}: set_tokens_per_adapter_slot() must run before every forward."
+            )
         x = layernorm_output.contiguous()
 
         # SP gather (once) — for column-parallel base layers without an LN-fused
@@ -190,13 +274,14 @@ class MultiLoRALinear(AdapterWrapper):
                 )
             start = parallel_state.get_tensor_model_parallel_rank() * x_flat.shape[0]
             tokens_per_adapter = _narrow_token_counts_to_window(tokens_per_adapter, start, x_flat.shape[0])
+            token_counts = _narrow_token_counts_to_window_host(token_counts, start, x_flat.shape[0])
 
         offsets = tokens_per_adapter.cumsum(dim=0, dtype=torch.int32)
 
         stacked_A = torch.stack([a.linear_in.weight for a in self.adapters])
         stacked_B = torch.stack([a.linear_out.weight for a in self.adapters])
 
-        mid = torch._grouped_mm(x_flat, stacked_A.transpose(-2, -1), offsets)
+        mid = _apply_multi_lora_projection(x_flat, stacked_A, offsets, token_counts)
 
         # TP collective between A and B: row-parallel base needs an all-reduce
         # of the partial sums; every other base (column-parallel and replicated
@@ -208,7 +293,7 @@ class MultiLoRALinear(AdapterWrapper):
         else:
             mid = gather_from_tensor_model_parallel_region(mid)
 
-        out = torch._grouped_mm(mid, stacked_B.transpose(-2, -1), offsets)
+        out = _apply_multi_lora_projection(mid, stacked_B, offsets, token_counts)
 
         # Per-token scaling is applied *before* the output-side TP/SP comms.
         # ``per_token_scaling`` is indexed by the full token count
@@ -483,6 +568,7 @@ class MultiLoRAGroupedExpertLinear(MultiLoRALinear):
         )
 
         self.tokens_per_adapter: Optional[torch.Tensor] = None
+        self.tokens_per_adapter_host: Optional[Tuple[int, ...]] = None
         # Written by set_tokens_per_adapter_slot alongside tokens_per_adapter;
         # unused here (the slot-routing hook owns the expert-side SP narrow).
         self.tokens_per_adapter_total: Optional[int] = None
@@ -608,6 +694,23 @@ def _narrow_token_counts_to_window(counts: torch.Tensor, start: int, num_rows: i
     return (cum.clamp(max=start + num_rows) - (cum - counts).clamp(min=start)).clamp(min=0).to(counts.dtype)
 
 
+def _narrow_token_counts_to_window_host(
+    counts: Sequence[int],
+    start: int,
+    num_rows: int,
+) -> Tuple[int, ...]:
+    """Host-side equivalent of :func:`_narrow_token_counts_to_window`."""
+
+    end = start + num_rows
+    slot_start = 0
+    narrowed = []
+    for count in counts:
+        slot_end = slot_start + count
+        narrowed.append(max(0, min(slot_end, end) - max(slot_start, start)))
+        slot_start = slot_end
+    return tuple(narrowed)
+
+
 def _iter_multi_lora_modules(model):
     models = model if isinstance(model, list) else [model]
     for model_chunk in models:
@@ -626,13 +729,10 @@ def set_tokens_per_adapter_slot(model, tokens_per_adapter: torch.Tensor) -> None
     """
     if tokens_per_adapter.dim() != 1:
         raise ValueError(
-            f"tokens_per_adapter must be a 1-D tensor of per-slot counts; "
-            f"got shape {tuple(tokens_per_adapter.shape)}"
+            f"tokens_per_adapter must be a 1-D tensor of per-slot counts; got shape {tuple(tokens_per_adapter.shape)}"
         )
     if tokens_per_adapter.is_floating_point() or tokens_per_adapter.is_complex():
-        raise ValueError(
-            f"tokens_per_adapter must be an integer tensor; got dtype {tokens_per_adapter.dtype}"
-        )
+        raise ValueError(f"tokens_per_adapter must be an integer tensor; got dtype {tokens_per_adapter.dtype}")
     # One host sync per micro-batch (the tolist doubles as the sync the SP-shard
     # narrowing needs): layers whose base linear consumes the SP-sharded sequence
     # compare their row count against this total to narrow the spans to their
@@ -644,13 +744,13 @@ def set_tokens_per_adapter_slot(model, tokens_per_adapter: torch.Tensor) -> None
             f"non-monotonic grouped-GEMM offsets); got {counts}"
         )
     total = int(sum(counts))
+    host_counts = tuple(counts)
     modules = list(_iter_multi_lora_modules(model))
     if modules:
         n_adapters = modules[0].n_adapters
         if len(counts) != n_adapters:
             raise ValueError(
-                f"tokens_per_adapter has {len(counts)} entries but the model was "
-                f"built with n_adapters={n_adapters}"
+                f"tokens_per_adapter has {len(counts)} entries but the model was built with n_adapters={n_adapters}"
             )
         # The dense grouped GEMM consumes the counts on the model's device; the
         # MoE routing already moves them defensively — do it once here for both.
@@ -659,6 +759,7 @@ def set_tokens_per_adapter_slot(model, tokens_per_adapter: torch.Tensor) -> None
             tokens_per_adapter = tokens_per_adapter.to(first_param.device)
     for module in modules:
         module.tokens_per_adapter = tokens_per_adapter
+        module.tokens_per_adapter_host = host_counts
         module.tokens_per_adapter_total = total
 
 
