@@ -1330,6 +1330,11 @@ class GroupedExpertLinearAdapter(nn.Module):
                 "skip_fp8_weight_update": None,
                 "save_original_input": helper.save_original_input,
                 "debug": False,
+                # ROCm TE adds these optional fields. Other TE builds do not select
+                # them because the tuple is assembled from their own field_names.
+                "m_splits_tensor": None,
+                "actual_m_splits": None,
+                "unpad_output": False,
             }
             missing = [name for name in field_names if name not in available]
             if missing:

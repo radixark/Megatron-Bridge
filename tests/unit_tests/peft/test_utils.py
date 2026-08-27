@@ -958,6 +958,58 @@ class TestGroupedExpertLinearAdapter:
         assert mock_te_backend.call_args_list[0].kwargs["m_splits"] == [1, 2]
         assert mock_te_backend.call_args_list[1].kwargs["m_splits"] == [1, 2]
 
+    @patch(
+        "megatron.bridge.peft.utils.parallel_state.get_tensor_model_parallel_world_size",
+        return_value=1,
+    )
+    def test_te_grouped_linear_supplies_rocm_optional_fields(self, _mock_tp_world_size):
+        """ROCm-only fields should use the defaults from TE's public wrapper."""
+        adapter = GroupedExpertLinearAdapter(
+            in_features=2,
+            out_features=2,
+            dim=2,
+            num_local_experts=2,
+            base_linear_name="decoder.layers.0.mlp.experts.linear_fc2",
+            activation="identity",
+            input_is_parallel=False,
+            model_parallel_config=MockModelParallelConfig(),
+        )
+        helper = Mock(
+            apply_bias=False,
+            fp8=False,
+            fp8_calibration=False,
+            wgrad_store=None,
+            fuse_wgrad_accumulation=False,
+            sequence_parallel=False,
+            activation_dtype=torch.float32,
+            save_original_input=False,
+        )
+        helper.prepare_forward.side_effect = lambda value, **_kwargs: value
+        helper._get_quantizers.return_value = (None, None, None, None, None, None)
+        x = torch.ones(2, 2)
+        weight = torch.ones(2, 2, 2)
+
+        def fake_forward(_ctx, value, non_tensor_args, *_tensors):
+            assert non_tensor_args == (None, None, False)
+            return value
+
+        with (
+            torch.no_grad(),
+            patch.object(adapter, "_get_te_grouped_linear_helper", return_value=helper),
+            patch(
+                "megatron.bridge.peft.utils._te_grouped_linear_contract",
+                return_value=(False, ["m_splits_tensor", "actual_m_splits", "unpad_output"]),
+            ),
+            patch(
+                "megatron.bridge.peft.utils.TEPytorchGroupedLinearAutograd.forward",
+                side_effect=fake_forward,
+            ),
+        ):
+            output = adapter._forward_te_grouped_linear(x, weight=weight, m_splits=[1, 1])
+
+        torch.testing.assert_close(output, x)
+        helper.end_forward.assert_called_once()
+
     def test_grouped_expert_linear_adapter_requires_expert_tp_group_for_gather(self):
         """Per-expert LoRA should fail clearly when expert TP is configured without initialized groups."""
         config = MockModelParallelConfig()
