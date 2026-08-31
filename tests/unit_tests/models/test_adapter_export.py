@@ -596,6 +596,67 @@ class TestSaveHfAdapter:
             "model.layers.0.mlp.experts.gate_up_proj": 1,
         }
 
+    def test_save_shared_outer_expert_adapter_keeps_expert_dims(self, tmp_path):
+        from safetensors.torch import load_file
+
+        from megatron.bridge.peft.lora import LoRA
+
+        lora = LoRA(dim=2, alpha=4)
+        output_dir = tmp_path / "shared_outer_adapter"
+
+        # Shared-outer: lora_A of gate/up and lora_B of down keep expert dim 1,
+        # their partners keep one entry per expert.
+        gate_a = torch.rand(1, 2, 3)
+        gate_b = torch.rand(2, 4, 2)
+        down_a = torch.rand(2, 2, 4)
+        down_b = torch.rand(1, 3, 2)
+
+        fake_weights = [
+            _adapter_export("model.layers.0.mlp.experts.gate_proj.lora_A.weight", gate_a),
+            _adapter_export("model.layers.0.mlp.experts.gate_proj.lora_B.weight", gate_b),
+            _adapter_export("model.layers.0.mlp.experts.down_proj.lora_A.weight", down_a),
+            _adapter_export("model.layers.0.mlp.experts.down_proj.lora_B.weight", down_b),
+        ]
+
+        mock_bridge = MagicMock()
+        mock_bridge.export_adapter_weights.return_value = iter(fake_weights)
+
+        with patch("torch.distributed.is_initialized", return_value=False):
+            from megatron.bridge.models.conversion.auto_bridge import AutoBridge
+
+            AutoBridge.save_hf_adapter(
+                mock_bridge,
+                model=[MagicMock()],
+                path=output_dir,
+                peft_config=lora,
+                base_model_name_or_path="test/shared-outer-experts",
+            )
+
+        with open(output_dir / "adapter_config.json") as f:
+            cfg = json.load(f)
+        assert "target_parameters" not in cfg
+        assert cfg["target_modules"] == ["down_proj", "gate_proj"]
+
+        state = load_file(str(output_dir / "adapter_model.safetensors"))
+        assert set(state) == {
+            "base_model.model.model.layers.0.mlp.experts.gate_proj.lora_A.weight",
+            "base_model.model.model.layers.0.mlp.experts.gate_proj.lora_B.weight",
+            "base_model.model.model.layers.0.mlp.experts.down_proj.lora_A.weight",
+            "base_model.model.model.layers.0.mlp.experts.down_proj.lora_B.weight",
+        }
+        torch.testing.assert_close(
+            state["base_model.model.model.layers.0.mlp.experts.gate_proj.lora_A.weight"], gate_a
+        )
+        torch.testing.assert_close(
+            state["base_model.model.model.layers.0.mlp.experts.gate_proj.lora_B.weight"], gate_b
+        )
+        torch.testing.assert_close(
+            state["base_model.model.model.layers.0.mlp.experts.down_proj.lora_A.weight"], down_a
+        )
+        torch.testing.assert_close(
+            state["base_model.model.model.layers.0.mlp.experts.down_proj.lora_B.weight"], down_b
+        )
+
     def test_save_packed_expert_adapter_uses_target_parameters(self, tmp_path):
         peft = pytest.importorskip("peft", reason="peft library not installed")
         from safetensors.torch import load_file

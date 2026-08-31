@@ -871,76 +871,60 @@ class MegatronPeftBridge:
             # LoRA matrix, the other is the per-expert 3D pack.
             is_shared_outer_lora = is_grouped_expert and linear_in_tensor.ndim != linear_out_tensor.ndim
 
-            # The shared side is replicated on every EP rank, so the default
-            # gather is skipped here and re-done per-side inside the branch.
+            # Both sides leave as packed 3D tensors under the same expert name,
+            # where a leading dim of 1 marks the shared factor and num_moe_experts
+            # the per-expert one. Emitting the per-expert side as numbered 2D
+            # slices instead would leave its 3D partner without a pair, and
+            # convert_adapter_weights_to_peft_state() rejects that.
             if is_shared_outer_lora:
+                base_hf_weight_names = [
+                    re.sub(r"\bexperts\.\d+\.", "experts.", name)
+                    for name in self._get_base_hf_param_names_for_adapter(
+                        mapping_registry,
+                        adapter_task.global_base_prefix,
+                        adapter_task.adapter_key,
+                        ".weight0",
+                    )
+                ]
                 for side_tensor, side_suffix, megatron_side_name in (
                     (linear_in_tensor, ".linear_in.weight", megatron_linear_in_name),
                     (linear_out_tensor, ".linear_out.weight", megatron_linear_out_name),
                 ):
-                    side_is_shared = side_tensor.ndim == 2
-                    side_gathered = (
-                        None if side_is_shared else self._gather_expert_adapter_weight(side_tensor)
-                    )
-                    side_suffixes = (
-                        [".weight0"] if side_is_shared
-                        else [f".weight{i}" for i in range(num_moe_experts)]
-                    )
-                    for base_suffix in side_suffixes:
-                        if side_is_shared:
-                            current = side_tensor
-                        else:
-                            expert_idx = int(base_suffix[len(".weight"):])
-                            current = self._select_expert_adapter_weight(
-                                side_tensor, side_gathered, expert_idx, num_moe_experts,
-                            )
+                    side_hf_names = [
+                        self._make_lora_param_name(base_name, side_suffix) for base_name in base_hf_weight_names
+                    ]
+
+                    if side_tensor.ndim == 2:
+                        # A shared linear_in of a fused linear_fc1 feeds both gate
+                        # and up, so the same tensor is emitted under every name.
+                        shared = side_tensor.unsqueeze(0)
                         if cpu:
-                            current = current.cpu()
-                        if side_is_shared:
-                            current = current.unsqueeze(0)  # 2D -> [1, ..., ...]
+                            shared = shared.cpu()
+                        for hf_name in side_hf_names:
+                            yield HFWeightTuple(hf_name, shared, megatron_side_name)
+                        continue
 
-                        base_hf_weight_names = self._get_base_hf_param_names_for_adapter(
-                            mapping_registry,
-                            adapter_task.global_base_prefix,
-                            adapter_task.adapter_key,
-                            base_suffix,
+                    side_gathered = self._gather_expert_adapter_weight(side_tensor)
+                    per_expert = [
+                        self._select_expert_adapter_weight(side_tensor, side_gathered, expert_idx, num_moe_experts)
+                        for expert_idx in range(num_moe_experts)
+                    ]
+                    if side_suffix == ".linear_out.weight" and adapter_task.adapter_key is None:
+                        packed_by_base = self._build_packed_expert_linear_out_by_base(
+                            megatron_model,
+                            base_hf_weight_names,
+                            per_expert,
+                            is_expert=is_expert,
                         )
-                        if side_is_shared:
-                            # The shared tensor is not "expert N"'s weight;
-                            # strip the experts.N. infix so the serving loader
-                            # takes the 3D-shared branch rather than the
-                            # per-expert dict path.
-                            base_hf_weight_names = [
-                                re.sub(r"\bexperts\.\d+\.", "experts.", n)
-                                for n in base_hf_weight_names
-                            ]
-                        side_hf_names = [
-                            self._make_lora_param_name(bn, side_suffix) for bn in base_hf_weight_names
-                        ]
+                    else:
+                        stacked = torch.stack(per_expert, dim=0)
+                        packed_by_base = {base_name: stacked for base_name in base_hf_weight_names}
 
-                        if side_suffix == ".linear_out.weight" and adapter_task.adapter_key is None:
-                            per_base = self._get_fused_adapter_linear_out_slices(
-                                megatron_model,
-                                base_hf_weight_names,
-                                current,
-                                is_expert=is_expert_linear(adapter_task.global_base_prefix),
-                            )
-                            if per_base is not None:
-                                for index, base_name in enumerate(base_hf_weight_names):
-                                    chunk = per_base.get(base_name)
-                                    assert chunk is not None, f"unknown projection name: {base_name!r}"
-                                    yield HFWeightTuple(side_hf_names[index], chunk, megatron_side_name)
-                                continue
-
-                        # Shared linear_in of a fused linear_fc1 feeds BOTH gate
-                        # and up projections; the same tensor must appear at both
-                        # HF names so gate/up stacking sees a matching pair.
-                        if side_is_shared and len(side_hf_names) > 1:
-                            for hf_name in side_hf_names:
-                                yield HFWeightTuple(hf_name, current, megatron_side_name)
-                            continue
-
-                        yield HFWeightTuple(side_hf_names[0], current, megatron_side_name)
+                    for index, base_name in enumerate(base_hf_weight_names):
+                        packed = packed_by_base[base_name]
+                        if cpu:
+                            packed = packed.cpu()
+                        yield HFWeightTuple(side_hf_names[index], packed, megatron_side_name)
                 continue
 
             expert_linear_in_gathered = None
@@ -1519,7 +1503,7 @@ def convert_adapter_weights_to_peft_state(
 
     adapter_state: Dict[str, torch.Tensor] = {}
     module_weight_names: List[str] = []
-    target_parameters: List[str] = []
+    expert_dim_names: List[str] = []
     parameter_weights: Dict[str, Dict[str, torch.Tensor]] = defaultdict(dict)
 
     for adapter_weight in adapter_weights:
@@ -1527,13 +1511,30 @@ def convert_adapter_weights_to_peft_state(
         tensor = adapter_weight.weight
         base_name, lora_suffix = _split_hf_lora_weight_name(name)
         if tensor.ndim == 3:
-            if base_name not in target_parameters:
-                target_parameters.append(base_name)
+            if base_name not in expert_dim_names:
+                expert_dim_names.append(base_name)
             parameter_weights[base_name][lora_suffix] = tensor
             continue
 
         adapter_state[f"base_model.model.{name}"] = tensor
         module_weight_names.append(name)
+
+    target_parameters: List[str] = []
+    for base_name in expert_dim_names:
+        weights = parameter_weights[base_name]
+        lora_a = weights.get(".lora_A.weight")
+        lora_b = weights.get(".lora_B.weight")
+        # A shared-outer expert adapter holds one side at expert dim 1 and the
+        # other at num_experts, so the two sides cannot fold into one packed
+        # parameter. Keep them as exported; the serving loader reads the expert
+        # dim to tell the shared factor from the per-expert one.
+        if lora_a is not None and lora_b is not None and lora_a.shape[0] != lora_b.shape[0]:
+            for lora_suffix, tensor in weights.items():
+                name = f"{base_name}{lora_suffix}"
+                adapter_state[f"base_model.model.{name}"] = tensor
+                module_weight_names.append(name)
+            continue
+        target_parameters.append(base_name)
 
     target_parameters = _order_target_parameters(target_parameters)
     parameter_prefixes = _build_target_parameter_prefixes(target_parameters)
