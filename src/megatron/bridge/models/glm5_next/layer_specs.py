@@ -24,8 +24,6 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules, get_num_layers_to_build
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
-from megatron.bridge.models.glm5_next.dsa import Glm5NextDSAAttention, Glm5NextDSASubmodules
-from megatron.bridge.models.glm5_next.kda import Glm5NextKDAAttention, Glm5NextKDASubmodules
 from megatron.bridge.models.glm5_next.mhc import (
     Glm5NextHyperConnectionModule,
     MeanStreamContraction,
@@ -36,6 +34,11 @@ from megatron.bridge.models.glm5_next.mhc import (
 
 def glm5_next_dsa_attention_spec(backend: TESpecProvider) -> ModuleSpec:
     """DSA (NoPE absorbed sparse-MLA + kpool indexer) self-attention spec."""
+    # Imported here, not at module level: dsa.py pulls in the TileLang kernels (and kpool_indexer the
+    # triton ones), which must stay optional for `import megatron.bridge.models` -- same pattern as
+    # glm5_bridge.py's lazy TileLangMLASelfAttention import.
+    from megatron.bridge.models.glm5_next.dsa import Glm5NextDSAAttention, Glm5NextDSASubmodules
+
     return ModuleSpec(
         module=Glm5NextDSAAttention,
         params={"attn_mask_type": AttnMaskType.causal},
@@ -58,6 +61,8 @@ def glm5_next_dsa_attention_spec(backend: TESpecProvider) -> ModuleSpec:
 
 def glm5_next_kda_attention_spec(backend: TESpecProvider) -> ModuleSpec:
     """KDA linear-attention self-attention spec (TP-sharded by head)."""
+    from megatron.bridge.models.glm5_next.kda import Glm5NextKDAAttention, Glm5NextKDASubmodules
+
     return ModuleSpec(
         module=Glm5NextKDAAttention,
         submodules=Glm5NextKDASubmodules(
