@@ -655,8 +655,16 @@ class ParallelLinearAdapter(nn.Module):
         if not _sequence_parallel:
             self.disable_sequence_parallel_comm = True
 
+        # A replicated base linear (TELinear parallel_mode="duplicated": MLA linear_q_down_proj /
+        # linear_kv_down_proj, the DSA indexer, KDA gate inputs) consumes the sequence-parallel
+        # *local* slice, so every TP rank holds different tokens. linear_in / linear_out above are
+        # TP-sharded and all-gather along the feature dim, which is only valid when all ranks see
+        # the same tokens: gather the sequence before linear_in and scatter the adapter output
+        # back to this rank's slice afterwards (both no-ops without SP).
+        self.scatter_output_to_sequence_parallel = False
         if not base_linear_is_parallel:
-            self.disable_sequence_parallel_comm = True
+            self.disable_sequence_parallel_comm = not _sequence_parallel
+            self.scatter_output_to_sequence_parallel = _sequence_parallel
 
     def _get_activation_fn(self, activation: str) -> nn.Module:
         """Get activation function by name.
@@ -742,6 +750,9 @@ class ParallelLinearAdapter(nn.Module):
         if self.config.cpu_offloading and self.config.cpu_offloading_activations:
             x.activation_offloading = True
         x, _ = self.linear_out(x)
+        if self.scatter_output_to_sequence_parallel:
+            # replicated base linear under SP: back to this rank's sequence slice
+            x = scatter_to_sequence_parallel_region(x)
 
         if not self.disable_sequence_parallel_comm and self.input_is_parallel and not self.is_expert:
             # for attention_dense and linear_fc2
