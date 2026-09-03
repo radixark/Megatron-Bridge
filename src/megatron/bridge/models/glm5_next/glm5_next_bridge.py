@@ -104,8 +104,17 @@ def _linear_attn_field(text_config, key: str, attr: str, default):
 
 
 def dequant_fp8_blockwise(weight: torch.Tensor, scale_inv: torch.Tensor, block: int = _FP8_BLOCK) -> torch.Tensor:
-    """Block-wise FP8 -> bf16: ``w[i, j] * scale_inv[i // block, j // block]``."""
+    """Block-wise FP8 -> bf16: ``w[i, j] * scale_inv[i // block, j // block]``.
+
+    Runs on the current CUDA device when one is available (the ~300B FP8 parameters of the
+    public checkpoint take an hour per rank to dequantize on the CPU); the result stays on that
+    device and the conversion task moves it wherever the Megatron parameter lives.
+    """
     rows, cols = weight.shape
+    if torch.cuda.is_available() and not weight.is_cuda:
+        device = torch.device("cuda", torch.cuda.current_device())
+        weight = weight.to(device)
+        scale_inv = scale_inv.to(device)
     scale = scale_inv.to(torch.float32)
     scale = scale.repeat_interleave(block, dim=0)[:rows].repeat_interleave(block, dim=1)[:, :cols]
     return (weight.to(torch.float32) * scale).to(torch.bfloat16)
