@@ -101,7 +101,7 @@ class TestNativeDeepSeekV4ConfigTranslation:
         from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
 
         provider = SimpleNamespace(
-            dsv4_n_hash_layers=3,
+            moe_n_hash_layers=3,
             num_layers=5,
             mtp_num_layers=None,
             activation_func_clamp_value=10.0,
@@ -241,4 +241,4 @@ class TestDeepSeekV4RotaryPercent:
             out = bridge.provider_bridge(hf_pretrained)
 
         assert out.rotary_percent == 1.0
-        assert out.dsv4_n_hash_layers == 3
+        assert out.moe_n_hash_layers == 3
