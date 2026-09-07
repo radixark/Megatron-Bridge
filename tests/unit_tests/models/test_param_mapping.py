@@ -273,6 +273,17 @@ class TestAutoMapping:
         with pytest.raises(ValueError):
             mapping._detect_parallelism_type(torch.nn.Linear(5, 5))
 
+    def test_megatron_to_hf_skips_parameter_missing_from_all_pp_stages(self, mock_distributed_env):
+        _, mock_dist = mock_distributed_env(pp_size=2, pp_rank=0)
+        mapping = AutoMapping(megatron_param="optional.weight", hf_param="hf.optional.weight")
+
+        mock_dist.all_gather_object.side_effect = lambda output, obj, group: output.__setitem__(
+            slice(None), [False, False]
+        )
+
+        assert mapping.megatron_to_hf(None, None) == {}
+        mock_dist.broadcast_object_list.assert_not_called()
+
     def test_detect_parallelism_type_dynamic_module(self):
         mtq = pytest.importorskip("modelopt.torch.quantization")
         DynamicModule = pytest.importorskip("modelopt.torch.opt.dynamic").DynamicModule
