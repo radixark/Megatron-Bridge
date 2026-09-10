@@ -19,7 +19,6 @@ import torch
 import torch.nn as nn
 import transformer_engine.pytorch as te
 from megatron.core.transformer.moe.moe_utils import apply_random_logits
-from torch.distributed.nn.functional import all_gather
 
 from megatron.bridge.peft.adapter_wrapper import AdapterWrapper
 from megatron.bridge.utils.import_utils import safe_import
@@ -39,40 +38,6 @@ class LoRALinear(AdapterWrapper):
     where the adapter's output is added to the main module's output. It extends the AdapterWrapper
     class to provide a specific implementation of the forward method.
     """
-
-    @property
-    def weight(self) -> torch.Tensor:
-        """Return the differentiable local effective weight for absorbed attention.
-
-        Absorbed MLA reads the KV projection matrix without calling ``forward``.
-        Reconstruct the required TP shards with autograd so that this path trains
-        both adapter factors, and recompute on each access after optimizer steps.
-        Stochastic dropout and nonlinear adapters cannot be represented by a matrix.
-        """
-        weight = self.to_wrap.weight
-        if not self._adapter_enabled:
-            return weight
-        if not isinstance(self.adapter.activation, nn.Identity):
-            raise ValueError("An effective LoRA weight requires an identity adapter activation.")
-        dropout = self.adapter.dropout
-        if dropout.training and isinstance(dropout, nn.Dropout) and dropout.p > 0:
-            raise ValueError("Absorbed attention requires zero LoRA dropout during training.")
-
-        linear_in = self.adapter.linear_in.weight
-        linear_out = self.adapter.linear_out.weight
-        # Column-parallel A is sharded over rank; row-parallel B is sharded over
-        # output channels. Replicated base linears need both factors gathered.
-        if linear_in.shape[0] != self.adapter.dim or linear_out.shape[0] != weight.shape[0]:
-            tp_group = self.adapter.linear_in.tp_group
-            if linear_in.shape[0] != self.adapter.dim:
-                linear_in = torch.cat(all_gather(linear_in.contiguous(), group=tp_group), dim=0)
-            if linear_out.shape[0] != weight.shape[0]:
-                linear_out = torch.cat(all_gather(linear_out.contiguous(), group=tp_group), dim=0)
-
-        delta = linear_out.to(weight.dtype) @ linear_in.to(weight.dtype)
-        if delta.shape != weight.shape:
-            raise ValueError(f"LoRA delta shape {delta.shape} does not match base weight shape {weight.shape}.")
-        return weight + delta * (self.adapter.alpha / self.adapter.dim)
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward pass that combines the wrapped module output with the adapter output.

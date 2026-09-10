@@ -308,7 +308,8 @@ class TileLangMLASelfAttention(MLASelfAttention):
         The slime absorb reads the ``linear_kv_up_proj`` weight matrix directly to build ``w_kc`` /
         ``w_vc`` (an absorb cannot be a forward call). When LoRA targets ``kv_b_proj`` the module is
         wrapped (``megatron.bridge.peft.lora_layers.LoRALinear``: base linear under ``to_wrap``,
-        :class:`ParallelLinearAdapter` under ``adapter``). We unwrap to the base linear and **fold the LoRA delta
+        :class:`ParallelLinearAdapter` under ``adapter``); the wrapper exposes no ``.weight``, so a
+        naive read raises ``AttributeError``. We unwrap to the base linear and **fold the LoRA delta
         into the effective weight** so the adapter on ``kv_b_proj`` is genuinely trained on the fused
         path (its gradient flows back through the einsum -> ``SparseMLA`` -> ``w_vc`` chain), keeping
         LoRA semantics identical to the unfused backend (where ``linear_kv_up_proj(kv)`` is a forward
