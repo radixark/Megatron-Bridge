@@ -251,8 +251,8 @@ class TileLangMLASelfAttention(MLASelfAttention):
         if config.sequence_parallel:
             kv_combined = gather_from_sequence_parallel_region(kv_combined)
         kv_compressed, k_pos_emb = torch.split(kv_combined, [kv_lora_rank, qk_pos_emb_head_dim], dim=-1)
-        # kv_layernorm is IdentityOp in the DSA spec (the norm is fused into linear_kv_up_proj); the
-        # absorb path applies the rms-norm explicitly below.
+        # Newer DSA specs use a separate KV norm. Older specs use IdentityOp
+        # here and fuse the norm into linear_kv_up_proj; handle that below.
         kv_compressed = self.kv_layernorm(kv_compressed)
 
         # ---- q up projection + split. q_layernorm is IdentityOp; the norm is in linear_q_up_proj. ----
@@ -275,14 +275,15 @@ class TileLangMLASelfAttention(MLASelfAttention):
         # absorbed q content: [t, np, kv_lora_rank]
         q_no_pe = torch.einsum("thd,hdm->thm", q_no_pe, w_kc)
 
-        # rms-norm the compressed kv in fp32 with the fused up-proj layernorm weight (matches slime
-        # and the unfused LayerNorm-Linear precision), then cast back.
-        kv_compressed = torch.nn.functional.rms_norm(
-            kv_compressed.float(),
-            normalized_shape=(kv_compressed.shape[-1],),
-            weight=kv_up_ln_weight.float(),
-            eps=config.layernorm_epsilon,
-        ).to(kv_compressed.dtype)
+        # Only apply the norm here when it belongs to the fused projection.
+        # A separate kv_layernorm has already normalized the latent above.
+        if kv_up_ln_weight is not None:
+            kv_compressed = torch.nn.functional.rms_norm(
+                kv_compressed.float(),
+                normalized_shape=(kv_compressed.shape[-1],),
+                weight=kv_up_ln_weight.float(),
+                eps=config.layernorm_epsilon,
+            ).to(kv_compressed.dtype)
 
         # CP-gather the kv latent + k_pos_emb (no-op at CP=1; matches slime's gathered=True path for k).
         k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb, group=parallel_state.get_context_parallel_group())
@@ -302,60 +303,14 @@ class TileLangMLASelfAttention(MLASelfAttention):
         return query, key, w_vc, q_compressed
 
     def _kv_up_proj_weight_and_norm(self):
-        """Return ``(weight, layer_norm_weight)`` for the absorb, LoRA-aware.
+        """Return the effective projection and its optional fused norm weight.
 
-        The slime absorb reads the ``linear_kv_up_proj`` weight matrix directly to build ``w_kc`` /
-        ``w_vc`` (an absorb cannot be a forward call). When LoRA targets ``kv_b_proj`` the module is
-        wrapped (``megatron.bridge.peft.lora_layers.LoRALinear``: base linear under ``to_wrap``,
-        :class:`ParallelLinearAdapter` under ``adapter``); the wrapper exposes no ``.weight``, so a
-        naive read raises ``AttributeError``. We unwrap to the base linear and **fold the LoRA delta
-        into the effective weight** so the adapter on ``kv_b_proj`` is genuinely trained on the fused
-        path (its gradient flows back through the einsum -> ``SparseMLA`` -> ``w_vc`` chain), keeping
-        LoRA semantics identical to the unfused backend (where ``linear_kv_up_proj(kv)`` is a forward
-        and the adapter applies natively).
-
-        The adapter is LoRA (identity activation, no bias) so its weight-space delta is exactly
-        ``(alpha/dim) * (linear_out.weight @ linear_in.weight)`` -- the same expression
-        :class:`~megatron.bridge.peft.lora.LoRAMerge` uses. ``linear_kv_up_proj`` is a
-        column-parallel ``LayerNormColumnParallelLinear``: the base weight shard, ``linear_out``
-        (column-parallel), and the absorb's per-head unflatten are all on dim 0 (heads), so folding
-        the local shard is correct at any TP. ``linear_in`` (the LoRA-A) is column-parallel along the
-        rank dim, so we all-gather it across TP to reconstruct the full ``dim`` before the matmul,
-        mirroring ``LoRAMerge.merge`` Case 1. (No LoRA -> just the base weight, byte-identical.)
+        ``LoRALinear.weight`` includes the differentiable adapter delta and TP
+        gathers. A separate ``kv_layernorm`` leaves no norm on the projection.
         """
         module = self.linear_kv_up_proj
         base = getattr(module, "to_wrap", module)
-        weight = base.weight
-        ln_weight = base.layer_norm_weight
-        adapter = getattr(module, "adapter", None)
-        if adapter is None or not getattr(module, "_adapter_enabled", True):
-            return weight, ln_weight
-
-        # Fold the LoRA delta: weight_eff = weight + (alpha/dim) * (linear_out @ linear_in).
-        linear_in = adapter.linear_in.weight  # [dim (maybe /TP), in_features]
-        linear_out = adapter.linear_out.weight  # [out_features (/TP), dim]
-        dim = adapter.dim
-        scale = adapter.alpha / dim
-
-        tp_size = parallel_state.get_tensor_model_parallel_world_size()
-        # Column-parallel base (input_is_parallel=False): linear_in is sharded along `dim` (dim 0),
-        # so all-gather it to the full rank before the matmul. linear_out already matches the local
-        # output shard of the base weight.
-        if tp_size > 1 and not getattr(adapter, "input_is_parallel", False) and linear_in.shape[0] * tp_size == dim:
-            # Differentiable all-gather so the LoRA-A (linear_in) gradient flows back. The gathered
-            # full linear_in is used in EVERY TP rank's local delta, so its adjoint is reduce-scatter
-            # (sum grads across TP ranks, then scatter each rank's shard). Plain torch.distributed
-            # all_gather has no autograd -> it silently detached linear_in and froze LoRA-A on the
-            # fused path; the autograd-aware variant restores the gradient.
-            from torch.distributed.nn.functional import all_gather as _diff_all_gather
-
-            gathered = _diff_all_gather(
-                linear_in.contiguous(), group=parallel_state.get_tensor_model_parallel_group()
-            )
-            linear_in = torch.cat(gathered, dim=0)
-
-        delta = scale * (linear_out.to(weight.dtype) @ linear_in.to(weight.dtype))
-        return weight + delta, ln_weight
+        return module.weight, getattr(base, "layer_norm_weight", None)
 
     @staticmethod
     def _fuse_rope(t, cu_seqlens, rotary_pos_emb, *, gathered):
