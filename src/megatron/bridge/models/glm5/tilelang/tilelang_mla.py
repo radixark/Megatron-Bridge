@@ -303,14 +303,57 @@ class TileLangMLASelfAttention(MLASelfAttention):
         return query, key, w_vc, q_compressed
 
     def _kv_up_proj_weight_and_norm(self):
-        """Return the effective projection and its optional fused norm weight.
+        """Return ``(weight, layer_norm_weight)`` for the absorb, LoRA-aware.
 
-        ``LoRALinear.weight`` includes the differentiable adapter delta and TP
-        gathers. A separate ``kv_layernorm`` leaves no norm on the projection.
+        The slime absorb reads the ``linear_kv_up_proj`` weight matrix directly to build ``w_kc`` /
+        ``w_vc`` (an absorb cannot be a forward call). When LoRA targets ``kv_b_proj`` the module is
+        wrapped (``megatron.bridge.peft.lora_layers.LoRALinear``: base linear under ``to_wrap``,
+        :class:`ParallelLinearAdapter` under ``adapter``). We unwrap to the base linear and **fold the LoRA delta
+        into the effective weight** so the adapter on ``kv_b_proj`` is genuinely trained on the fused
+        path (its gradient flows back through the einsum -> ``SparseMLA`` -> ``w_vc`` chain), keeping
+        LoRA semantics identical to the unfused backend (where ``linear_kv_up_proj(kv)`` is a forward
+        and the adapter applies natively).
+
+        The adapter is LoRA (identity activation, no bias) so its weight-space delta is exactly
+        ``(alpha/dim) * (linear_out.weight @ linear_in.weight)`` -- the same expression
+        :class:`~megatron.bridge.peft.lora.LoRAMerge` uses. ``linear_kv_up_proj`` is a
+        column-parallel ``LayerNormColumnParallelLinear``: the base weight shard, ``linear_out``
+        (column-parallel), and the absorb's per-head unflatten are all on dim 0 (heads), so folding
+        the local shard is correct at any TP. ``linear_in`` (the LoRA-A) is column-parallel along the
+        rank dim, so we all-gather it across TP to reconstruct the full ``dim`` before the matmul,
+        mirroring ``LoRAMerge.merge`` Case 1. (No LoRA -> just the base weight, byte-identical.)
         """
         module = self.linear_kv_up_proj
         base = getattr(module, "to_wrap", module)
-        return module.weight, getattr(base, "layer_norm_weight", None)
+        weight = base.weight
+        ln_weight = getattr(base, "layer_norm_weight", None)
+        adapter = getattr(module, "adapter", None)
+        if adapter is None or not getattr(module, "_adapter_enabled", True):
+            return weight, ln_weight
+
+        # Fold the LoRA delta: weight_eff = weight + (alpha/dim) * (linear_out @ linear_in).
+        linear_in = adapter.linear_in.weight  # [dim (maybe /TP), in_features]
+        linear_out = adapter.linear_out.weight  # [out_features (/TP), dim]
+        dim = adapter.dim
+        scale = adapter.alpha / dim
+
+        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        # Column-parallel base (input_is_parallel=False): linear_in is sharded along `dim` (dim 0),
+        # so all-gather it to the full rank before the matmul. linear_out already matches the local
+        # output shard of the base weight.
+        if tp_size > 1 and not getattr(adapter, "input_is_parallel", False) and linear_in.shape[0] * tp_size == dim:
+            # Differentiable all-gather so the LoRA-A (linear_in) gradient flows back. The gathered
+            # full linear_in is used in EVERY TP rank's local delta, so its adjoint is reduce-scatter
+            # (sum grads across TP ranks, then scatter each rank's shard). Plain torch.distributed
+            # all_gather has no autograd -> it silently detached linear_in and froze LoRA-A on the
+            # fused path; the autograd-aware variant restores the gradient.
+            from torch.distributed.nn.functional import all_gather as _diff_all_gather
+
+            gathered = _diff_all_gather(linear_in.contiguous(), group=parallel_state.get_tensor_model_parallel_group())
+            linear_in = torch.cat(gathered, dim=0)
+
+        delta = scale * (linear_out.to(weight.dtype) @ linear_in.to(weight.dtype))
+        return weight + delta, ln_weight
 
     @staticmethod
     def _fuse_rope(t, cu_seqlens, rotary_pos_emb, *, gathered):

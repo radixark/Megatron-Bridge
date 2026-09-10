@@ -138,6 +138,7 @@ def test_tilelang_absorb_normalizes_kv_once_and_uses_effective_weight(monkeypatc
     attention._kv_up_proj_weight_and_norm = lambda: mla.TileLangMLASelfAttention._kv_up_proj_weight_and_norm(attention)
     monkeypatch.setattr(mla, "gather_from_sequence_parallel_region", lambda x, **_kwargs: x)
     monkeypatch.setattr(mla.parallel_state, "get_context_parallel_group", lambda: None)
+    monkeypatch.setattr(mla.parallel_state, "get_tensor_model_parallel_world_size", lambda: 1)
     hidden = torch.randn(4, 1, 6)
     packed = SimpleNamespace(cu_seqlens_q=None, cu_seqlens_kv=None)
     query, key, w_vc, _ = mla.TileLangMLASelfAttention._absorb_query_key_value_tensors(attention, hidden, packed)
