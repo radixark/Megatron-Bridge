@@ -234,8 +234,14 @@ class MultiLoRALinear(AdapterWrapper):
         # Host-side sum of tokens_per_adapter (set alongside it); lets forward
         # detect an SP-sharded input without a per-layer device sync.
         self.tokens_per_adapter_total: Optional[int] = None
-        device = next(to_wrap.parameters()).device
-        dtype = next(to_wrap.parameters()).dtype
+        # a tied output layer allocates no weight (it forwards the shared embedding
+        # weight per call), so fall back to the model-parallel config
+        reference = next(to_wrap.parameters(), None)
+        if reference is not None:
+            device, dtype = reference.device, reference.dtype
+        else:
+            device = torch.cuda.current_device()
+            dtype = to_wrap.config.params_dtype
         # Non-persistent: slot lifecycle is externally managed, not checkpointed.
         self.register_buffer("alpha_values", torch.ones(n_adapters, dtype=dtype, device=device), persistent=False)
         self.register_buffer(
