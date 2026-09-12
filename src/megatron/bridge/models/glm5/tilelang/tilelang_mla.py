@@ -253,6 +253,9 @@ class TileLangMLASelfAttention(MLASelfAttention):
         kv_compressed, k_pos_emb = torch.split(kv_combined, [kv_lora_rank, qk_pos_emb_head_dim], dim=-1)
         # kv_layernorm is IdentityOp in the DSA spec (the norm is fused into linear_kv_up_proj); the
         # absorb path applies the rms-norm explicitly below.
+        # IdentityOp with the fused-layernorm spec (the absorb applies the fused norm weight
+        # explicitly below); the real RMSNorm with megatron-core's newer DSA spec (plain
+        # column-parallel up-projections + separate q/kv layernorm modules).
         kv_compressed = self.kv_layernorm(kv_compressed)
 
         # ---- q up projection + split. q_layernorm is IdentityOp; the norm is in linear_q_up_proj. ----
@@ -277,12 +280,16 @@ class TileLangMLASelfAttention(MLASelfAttention):
 
         # rms-norm the compressed kv in fp32 with the fused up-proj layernorm weight (matches slime
         # and the unfused LayerNorm-Linear precision), then cast back.
-        kv_compressed = torch.nn.functional.rms_norm(
-            kv_compressed.float(),
-            normalized_shape=(kv_compressed.shape[-1],),
-            weight=kv_up_ln_weight.float(),
-            eps=config.layernorm_epsilon,
-        ).to(kv_compressed.dtype)
+        # Fused-layernorm layout only (kv_up_ln_weight is None when the spec builds a plain
+        # column-parallel up-projection with a separate kv_layernorm module, as megatron-core's DSA
+        # spec does since the dsv4 dual-backend change: that norm was already applied above).
+        if kv_up_ln_weight is not None:
+            kv_compressed = torch.nn.functional.rms_norm(
+                kv_compressed.float(),
+                normalized_shape=(kv_compressed.shape[-1],),
+                weight=kv_up_ln_weight.float(),
+                eps=config.layernorm_epsilon,
+            ).to(kv_compressed.dtype)
 
         # CP-gather the kv latent + k_pos_emb (no-op at CP=1; matches slime's gathered=True path for k).
         k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb, group=parallel_state.get_context_parallel_group())
@@ -326,7 +333,9 @@ class TileLangMLASelfAttention(MLASelfAttention):
         module = self.linear_kv_up_proj
         base = getattr(module, "to_wrap", module)
         weight = base.weight
-        ln_weight = base.layer_norm_weight
+        # None for a plain column-parallel up-projection (separate kv_layernorm module; the norm is
+        # applied in _absorb_query_key_value_tensors before the absorb).
+        ln_weight = getattr(base, "layer_norm_weight", None)
         adapter = getattr(module, "adapter", None)
         if adapter is None or not getattr(module, "_adapter_enabled", True):
             return weight, ln_weight
@@ -349,9 +358,7 @@ class TileLangMLASelfAttention(MLASelfAttention):
             # fused path; the autograd-aware variant restores the gradient.
             from torch.distributed.nn.functional import all_gather as _diff_all_gather
 
-            gathered = _diff_all_gather(
-                linear_in.contiguous(), group=parallel_state.get_tensor_model_parallel_group()
-            )
+            gathered = _diff_all_gather(linear_in.contiguous(), group=parallel_state.get_tensor_model_parallel_group())
             linear_in = torch.cat(gathered, dim=0)
 
         delta = scale * (linear_out.to(weight.dtype) @ linear_in.to(weight.dtype))
