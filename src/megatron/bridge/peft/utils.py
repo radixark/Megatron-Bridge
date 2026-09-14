@@ -654,6 +654,16 @@ class ParallelLinearAdapter(nn.Module):
         self.disable_sequence_parallel_comm = disable_sequence_parallel_comm
         if not _sequence_parallel:
             self.disable_sequence_parallel_comm = True
+        self.disable_tensor_parallel_comm = disable_tensor_parallel_comm
+        # TP world size of the group the adapter linears are sharded over (see forward()).
+        try:
+            self._explicit_comm_tp_size = (
+                parallel_state.get_expert_tensor_parallel_world_size()
+                if is_expert
+                else parallel_state.get_tensor_model_parallel_world_size()
+            )
+        except (AssertionError, RuntimeError):
+            self._explicit_comm_tp_size = 1
 
         if not base_linear_is_parallel:
             self.disable_sequence_parallel_comm = True
@@ -742,6 +752,9 @@ class ParallelLinearAdapter(nn.Module):
         if self.config.cpu_offloading and self.config.cpu_offloading_activations:
             x.activation_offloading = True
         x, _ = self.linear_out(x)
+        if self.disable_tensor_parallel_comm and self.input_is_parallel and self._explicit_comm_tp_size > 1:
+            # The wrapper all-reduces partials, but the adapter already holds the full delta on every rank.
+            x = x / self._explicit_comm_tp_size
 
         if not self.disable_sequence_parallel_comm and self.input_is_parallel and not self.is_expert:
             # for attention_dense and linear_fc2
