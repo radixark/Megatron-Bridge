@@ -199,6 +199,33 @@ class TestNativeDeepSeekV4ConfigTranslation:
         with pytest.raises(ValueError, match="contiguous prefix"):
             _dsv4_num_hash_layers(hf_config)
 
+    def test_export_hash_layers_from_mcore_field(self):
+        from unittest.mock import patch
+
+        from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
+
+        provider = SimpleNamespace(
+            moe_n_hash_layers=3,
+            num_layers=5,
+            mtp_num_layers=None,
+            activation_func_clamp_value=10.0,
+            csa_compress_ratios=None,
+            csa_window_size=128,
+            num_residual_streams=4,
+            mhc_sinkhorn_iterations=20,
+            moe_shared_expert_intermediate_size=2048,
+        )
+        # Stub the generic export to isolate the DSV4 fields without constructing a full Megatron provider.
+        with patch.object(
+            MegatronModelBridge,
+            "megatron_to_hf_config",
+            return_value={"num_hidden_layers": 5, "moe_intermediate_size": 2048},
+        ):
+            hf_config = DeepSeekV4Bridge.megatron_to_hf_config(provider)
+
+        assert hf_config["num_hash_layers"] == 3
+        assert hf_config["mlp_layer_types"] == ["hash_moe", "hash_moe", "hash_moe", "moe", "moe"]
+
 
 class TestDeepSeekV4RouterExpertBias:
     """DSv4 checkpoints may omit their runtime router-bias buffers."""
@@ -530,6 +557,7 @@ class TestDeepSeekV4RotaryPercent:
 
         assert out.rotary_percent == 1.0
         assert out.csa_compress_rotary_base == 160000
+        assert out.moe_n_hash_layers == 3
 
 
 class TestDeepSeekV4MoEDispatcher:

@@ -1971,9 +1971,14 @@ class AutoMapping(MegatronParamMapping[torch.Tensor]):
                 self._detected_type = self.broadcast_obj_from_pp_rank(self._detected_type, "detected_type")
             else:
                 # Receive from owning rank
-                self._detected_type = self.broadcast_obj_from_pp_rank(None, "detected_type")
+                try:
+                    self._detected_type = self.broadcast_obj_from_pp_rank(None, "detected_type")
+                except ValueError as error:
+                    if str(error) != "Object must exist on at least one PP rank":
+                        raise
+                    self._detected_type = None
                 if self._detected_type is None:
-                    # PP group likely has 1 member - skipping.
+                    # No PP stage owns this optional parameter.
                     return {}
 
             # If no PP rank detected a type (e.g. Megatron parameter without an
