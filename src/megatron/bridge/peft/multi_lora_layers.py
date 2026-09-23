@@ -321,18 +321,14 @@ class MultiLoRALinear(AdapterWrapper):
 
         return linear_output + out.reshape(linear_output.shape), bias
 
-    def forward_absorbed(
-        self, x: torch.Tensor, *, qk_head_dim: int, v_head_dim: int, transpose: bool
-    ) -> torch.Tensor:
+    def forward_absorbed(self, x: torch.Tensor, *, qk_head_dim: int, v_head_dim: int, transpose: bool) -> torch.Tensor:
         """Apply per-slot K absorption or V expansion to head-sharded MLA activations."""
         assert self.base_linear_is_parallel and not self.input_is_parallel
         assert not self.replicate_adapter and not self.use_a2a
         weight = self.to_wrap.weight.view(-1, qk_head_dim + v_head_dim, self.to_wrap.weight.shape[-1])
         weight = weight[:, :qk_head_dim] if transpose else weight[:, qk_head_dim:]
         output = (
-            torch.einsum("...hd,hdk->...hk", x, weight)
-            if transpose
-            else torch.einsum("...hk,hdk->...hd", x, weight)
+            torch.einsum("...hd,hdk->...hk", x, weight) if transpose else torch.einsum("...hk,hdk->...hd", x, weight)
         )
         if not self._adapter_enabled:
             return output
@@ -344,9 +340,7 @@ class MultiLoRALinear(AdapterWrapper):
         for slot, part in enumerate(flat.split(splits)):
             adapter = self.adapters[slot]
             # Each TP head shard contributes to the gradient of the same full A matrix.
-            a = gather_from_sequence_parallel_region(
-                adapter.linear_in.weight, tensor_parallel_output_grad=True
-            )
+            a = gather_from_sequence_parallel_region(adapter.linear_in.weight, tensor_parallel_output_grad=True)
             b = adapter.linear_out.weight.view(weight.shape[0], qk_head_dim + v_head_dim, -1)
             b = b[:, :qk_head_dim] if transpose else b[:, qk_head_dim:]
             if transpose:
