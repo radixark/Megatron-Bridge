@@ -168,6 +168,7 @@ class MultiLoRALinear(AdapterWrapper):
         # wrapped base linear's output layout.
         self.input_is_parallel = attrs.input_is_parallel
         self.disable_sequence_parallel_comm = attrs.disable_sequence_parallel_comm
+        self._external_output_reduce = attrs.input_is_parallel and attrs.disable_tensor_parallel_comm
         # False for replicated bases (TELinear parallel_mode="duplicated", e.g. MLA
         # q/kv down-projections): their adapters are unsharded and need no TP
         # collectives between the two adapter projections.
@@ -279,7 +280,12 @@ class MultiLoRALinear(AdapterWrapper):
 
         # TP collective between A and B: row-parallel A needs an all-reduce;
         # column-parallel A needs an all-gather; replicated A is already complete.
-        if not self.replicate_adapter:
+        if self._external_output_reduce:
+            # The outer TP reduction needs local-input deltas; B gradients sum across those inputs.
+            stacked_B = gather_from_sequence_parallel_region(
+                stacked_B.movedim(1, 0).contiguous(), tensor_parallel_output_grad=True
+            ).movedim(0, 1)
+        elif not self.replicate_adapter:
             if self.input_is_parallel:
                 mid = reduce_from_tensor_model_parallel_region(mid)
             else:
@@ -304,7 +310,7 @@ class MultiLoRALinear(AdapterWrapper):
         # Match the wrapped base linear's output layout: row-parallel base
         # produces a fully-summed [tokens, h_out] tensor (which we then SP
         # scatter); column-parallel base keeps the [tokens, h_out/tp] shard.
-        if self._gather_output:
+        if self._gather_output and not self._external_output_reduce:
             out = gather_from_tensor_model_parallel_region(out)
 
         if not self.disable_sequence_parallel_comm and self.input_is_parallel:
