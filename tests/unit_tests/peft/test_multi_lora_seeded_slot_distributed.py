@@ -184,19 +184,27 @@ def test_seeded_reseed_keeps_expert_stream_distinct_across_ep(two_rank_process_g
 @pytest.mark.parametrize("base_cls", [TERowParallelLinear, RowParallelLinear])
 @pytest.mark.parametrize("sequence_parallel", [False, True])
 @pytest.mark.parametrize("bias", [False, True])
-def test_row_parallel_multi_lora_output_and_gradients(
-    two_rank_process_group, base_cls, sequence_parallel, bias
-):
+def test_row_parallel_multi_lora_output_and_gradients(two_rank_process_group, base_cls, sequence_parallel, bias):
     with _model_parallel(tp=2, ep=1):
         rank = parallel_state.get_tensor_model_parallel_rank()
         config = TransformerConfig(
-            num_layers=1, hidden_size=32, num_attention_heads=2,
-            tensor_model_parallel_size=2, sequence_parallel=sequence_parallel,
-            params_dtype=torch.float32, gradient_accumulation_fusion=False,
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=2,
+            tensor_model_parallel_size=2,
+            sequence_parallel=sequence_parallel,
+            params_dtype=torch.float32,
+            gradient_accumulation_fusion=False,
         )
         base = base_cls(
-            32, 32, config=config, init_method=init_method_normal(0.02),
-            bias=bias, is_expert=False, input_is_parallel=True, skip_bias_add=False,
+            32,
+            32,
+            config=config,
+            init_method=init_method_normal(0.02),
+            bias=bias,
+            is_expert=False,
+            input_is_parallel=True,
+            skip_bias_add=False,
         )
         base.requires_grad_(False)
         layer = MultiLoRALinear(base, n_adapters=2, dim=8, alpha=8, full_name="linear_proj")
@@ -221,22 +229,30 @@ def test_row_parallel_multi_lora_output_and_gradients(
         actual_base, output_bias = layer(local_x)
         assert output_bias is None
         torch.testing.assert_close(
-            actual_base, expected_base.chunk(2, dim=0)[rank] if sequence_parallel else expected_base,
-            atol=1e-6, rtol=1e-6,
+            actual_base,
+            expected_base.chunk(2, dim=0)[rank] if sequence_parallel else expected_base,
+            atol=1e-6,
+            rtol=1e-6,
         )
         layer.enable_adapter_layers()
         actual, output_bias = layer(local_x)
         assert output_bias is None
-        expected = expected_base + torch.cat([
-            F.linear(F.linear(tokens, aa), bb) for tokens, aa, bb in zip(x.split((3, 5)), a, b)
-        ])
+        expected = expected_base + torch.cat(
+            [F.linear(F.linear(tokens, aa), bb) for tokens, aa, bb in zip(x.split((3, 5)), a, b)]
+        )
         torch.testing.assert_close(
-            actual, expected.chunk(2, dim=0)[rank] if sequence_parallel else expected,
-            atol=1e-6, rtol=1e-6,
+            actual,
+            expected.chunk(2, dim=0)[rank] if sequence_parallel else expected,
+            atol=1e-6,
+            rtol=1e-6,
         )
         actual.sum().backward()
         expected.sum().backward()
         torch.testing.assert_close(local_x.grad, x.grad.chunk(2, dim=1)[rank], atol=1e-6, rtol=1e-6)
         for slot, adapter in enumerate(layer.adapters):
-            torch.testing.assert_close(adapter.linear_in.weight.grad, a.grad[slot].chunk(2, dim=1)[rank], atol=1e-6, rtol=1e-6)
-            torch.testing.assert_close(adapter.linear_out.weight.grad, b.grad[slot].chunk(2, dim=0)[rank], atol=1e-6, rtol=1e-6)
+            torch.testing.assert_close(
+                adapter.linear_in.weight.grad, a.grad[slot].chunk(2, dim=1)[rank], atol=1e-6, rtol=1e-6
+            )
+            torch.testing.assert_close(
+                adapter.linear_out.weight.grad, b.grad[slot].chunk(2, dim=0)[rank], atol=1e-6, rtol=1e-6
+            )
