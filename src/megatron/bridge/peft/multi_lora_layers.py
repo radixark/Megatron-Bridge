@@ -39,12 +39,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from megatron.core import parallel_state
+from megatron.core.tensor_parallel import RowParallelLinear
 from megatron.core.tensor_parallel.mappings import (
     all_to_all,
     gather_from_sequence_parallel_region,
     gather_from_tensor_model_parallel_region,
     reduce_from_tensor_model_parallel_region,
-    scatter_to_sequence_parallel_region,
+    reduce_scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.moe.moe_utils import sort_chunks_by_idxs
 
@@ -52,7 +53,7 @@ from megatron.bridge.peft.adapter_wrapper import AdapterWrapper
 from megatron.bridge.peft.utils import (
     GroupedExpertLinearAdapter,
     ParallelLinearAdapter,
-    all2all_hp2sp,
+    TERowParallelLinear,
     get_adapter_attributes_from_linear,
 )
 
@@ -233,11 +234,43 @@ class MultiLoRALinear(AdapterWrapper):
             "rank_values", torch.full((n_adapters,), dim, dtype=dtype, device=device), persistent=False
         )
 
+        self._owns_output_reduction = self.input_is_parallel and not self._external_output_reduce
+        self._add_output_bias = False
+        if self._owns_output_reduction:
+            # Reduce base and adapter together, after their local-input contributions are added.
+            if isinstance(to_wrap, RowParallelLinear):
+                self._add_output_bias = not to_wrap.skip_bias_add
+                to_wrap.skip_bias_add = True
+                to_wrap.explicit_expert_comm = True
+            else:
+                assert isinstance(to_wrap, TERowParallelLinear)
+                self._add_output_bias = to_wrap.apply_bias
+                if self._add_output_bias:
+                    to_wrap.apply_bias = False
+                    to_wrap.gemm_bias_unfused_add = False
+                    to_wrap.return_bias = True
+                    to_wrap.te_return_bias = True
+                to_wrap.parallel_mode = None
+                to_wrap.sequence_parallel = False
+                to_wrap.ub_overlap_rs_fprop = False
+                to_wrap.ub_overlap_ag_dgrad = False
+
+    def _finish_forward(self, output, bias):
+        if self._owns_output_reduction:
+            if self.disable_sequence_parallel_comm:
+                output = reduce_from_tensor_model_parallel_region(output)
+            else:
+                output = reduce_scatter_to_sequence_parallel_region(output)
+        if self._add_output_bias:
+            output = output + bias if bias is not None else output
+            bias = None
+        return output, bias
+
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         linear_output, bias, layernorm_output = self.base_linear_forward(x, *args, **kwargs)
 
         if not self._adapter_enabled:
-            return linear_output, bias
+            return self._finish_forward(linear_output, bias)
 
         tokens_per_adapter = self.tokens_per_adapter
         token_splits = self.tokens_per_adapter_splits
@@ -278,18 +311,13 @@ class MultiLoRALinear(AdapterWrapper):
 
         mid = _dense_multi_lora_mm(x_flat, stacked_A, token_splits=token_splits, offsets=offsets)
 
-        # TP collective between A and B: row-parallel A needs an all-reduce;
-        # column-parallel A needs an all-gather; replicated A is already complete.
-        if self._external_output_reduce:
-            # The outer TP reduction needs local-input deltas; B gradients sum across those inputs.
+        if self.input_is_parallel:
+            # Keep local-input deltas until output reduction; sum B gradients across those inputs.
             stacked_B = gather_from_sequence_parallel_region(
                 stacked_B.movedim(1, 0).contiguous(), tensor_parallel_output_grad=True
             ).movedim(0, 1)
         elif not self.replicate_adapter:
-            if self.input_is_parallel:
-                mid = reduce_from_tensor_model_parallel_region(mid)
-            else:
-                mid = gather_from_tensor_model_parallel_region(mid)
+            mid = gather_from_tensor_model_parallel_region(mid)
 
         out = _dense_multi_lora_mm(mid, stacked_B, token_splits=token_splits, offsets=offsets)
 
@@ -307,19 +335,10 @@ class MultiLoRALinear(AdapterWrapper):
         per_token_scaling = torch.repeat_interleave(scaling, tokens_per_adapter).unsqueeze(-1)
         out = out * per_token_scaling
 
-        # Match the wrapped base linear's output layout: row-parallel base
-        # produces a fully-summed [tokens, h_out] tensor (which we then SP
-        # scatter); column-parallel base keeps the [tokens, h_out/tp] shard.
-        if self._gather_output and not self._external_output_reduce:
+        if self._gather_output and not self.input_is_parallel:
             out = gather_from_tensor_model_parallel_region(out)
 
-        if not self.disable_sequence_parallel_comm and self.input_is_parallel:
-            if self.use_a2a:
-                out = all2all_hp2sp(out)
-            else:
-                out = scatter_to_sequence_parallel_region(out)
-
-        return linear_output + out.reshape(linear_output.shape), bias
+        return self._finish_forward(linear_output + out.reshape(linear_output.shape), bias)
 
     def forward_absorbed(self, x: torch.Tensor, *, qk_head_dim: int, v_head_dim: int, transpose: bool) -> torch.Tensor:
         """Apply per-slot K absorption or V expansion to head-sharded MLA activations."""
