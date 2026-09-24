@@ -466,6 +466,14 @@ class TileLangMLASelfAttention(MLASelfAttention):
             from miles.utils.replay_base import indexer_replay_manager
 
             indexer_replay_manager.set_current(_replay)
+        else:
+            # A query never has more than S_kv candidates, so beyond S_kv the selection is only -1
+            # padding -- which SparseMLA still walks block by block, its backward running the GEMMs
+            # and dKV accumulation for every slot. Cap the width at the next power of two >= S_kv
+            # (the kernels need a multiple of 64, the indexer backward a power of two): torch.topk
+            # still takes the same min(topk, S_kv) entries, so only the padding shrinks. Replay keeps
+            # the full width, the shape its rollout-captured top-k was recorded at.
+            index_topk = min(index_topk, max(64, 1 << (index_k.shape[0] - 1).bit_length()))
         _, topk_indices = lighting_indexer(index_q, index_k, weights, starts, ends, index_topk)
         # lighting_indexer returns [S, topk]; SparseMLA wants indices [t, kv_group=1, topk].
         topk_indices = topk_indices.unsqueeze(1)
