@@ -251,11 +251,10 @@ class TileLangMLASelfAttention(MLASelfAttention):
         if config.sequence_parallel:
             kv_combined = gather_from_sequence_parallel_region(kv_combined)
         kv_compressed, k_pos_emb = torch.split(kv_combined, [kv_lora_rank, qk_pos_emb_head_dim], dim=-1)
-        # kv_layernorm is IdentityOp in the DSA spec (the norm is fused into linear_kv_up_proj); the
-        # absorb path applies the rms-norm explicitly below.
+        # A real RMSNorm when linear_kv_up_proj is unfused, IdentityOp when the norm is fused in.
         kv_compressed = self.kv_layernorm(kv_compressed)
 
-        # ---- q up projection + split. q_layernorm is IdentityOp; the norm is in linear_q_up_proj. ----
+        # ---- q up projection + split. q_layernorm follows the same fused/unfused rule. ----
         q_compressed = self.q_layernorm(q_compressed)
         q, _ = self.linear_q_up_proj(q_compressed)
         q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
@@ -276,13 +275,15 @@ class TileLangMLASelfAttention(MLASelfAttention):
         q_no_pe = torch.einsum("thd,hdm->thm", q_no_pe, w_kc)
 
         # rms-norm the compressed kv in fp32 with the fused up-proj layernorm weight (matches slime
-        # and the unfused LayerNorm-Linear precision), then cast back.
-        kv_compressed = torch.nn.functional.rms_norm(
-            kv_compressed.float(),
-            normalized_shape=(kv_compressed.shape[-1],),
-            weight=kv_up_ln_weight.float(),
-            eps=config.layernorm_epsilon,
-        ).to(kv_compressed.dtype)
+        # and the unfused LayerNorm-Linear precision), then cast back. None => unfused, where
+        # kv_layernorm already normed and a second norm here would square it.
+        if kv_up_ln_weight is not None:
+            kv_compressed = torch.nn.functional.rms_norm(
+                kv_compressed.float(),
+                normalized_shape=(kv_compressed.shape[-1],),
+                weight=kv_up_ln_weight.float(),
+                eps=config.layernorm_epsilon,
+            ).to(kv_compressed.dtype)
 
         # CP-gather the kv latent + k_pos_emb (no-op at CP=1; matches slime's gathered=True path for k).
         k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb, group=parallel_state.get_context_parallel_group())
@@ -302,7 +303,10 @@ class TileLangMLASelfAttention(MLASelfAttention):
         return query, key, w_vc, q_compressed
 
     def _kv_up_proj_weight_and_norm(self):
-        """Return ``(weight, layer_norm_weight)`` for the absorb, LoRA-aware.
+        """Return ``(weight, layer_norm_weight_or_None)`` for the absorb, LoRA-aware.
+
+        ``layer_norm_weight`` is ``None`` when ``linear_kv_up_proj`` has no fused norm, and the
+        caller must then leave the norm to ``kv_layernorm``.
 
         The slime absorb reads the ``linear_kv_up_proj`` weight matrix directly to build ``w_kc`` /
         ``w_vc`` (an absorb cannot be a forward call). When LoRA targets ``kv_b_proj`` the module is
@@ -326,7 +330,8 @@ class TileLangMLASelfAttention(MLASelfAttention):
         module = self.linear_kv_up_proj
         base = getattr(module, "to_wrap", module)
         weight = base.weight
-        ln_weight = base.layer_norm_weight
+        # megatron-core's DSA spec builds this unfused, so the attribute may not exist.
+        ln_weight = getattr(base, "layer_norm_weight", None)
         adapter = getattr(module, "adapter", None)
         if adapter is None or not getattr(module, "_adapter_enabled", True):
             return weight, ln_weight
