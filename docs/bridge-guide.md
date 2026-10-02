@@ -363,3 +363,21 @@ AutoBridge.mla_transformer_config -> MLATransformerConfig
 # Introspection / planning
 AutoBridge.get_conversion_tasks(megatron_model: MegatronModule | list[MegatronModule], hf_path: str | Path | None = None) -> list[WeightConversionTask]
 ```
+
+For online weight synchronization where the consumer owns quantization, disable
+source-checkpoint requantization on the conversion tasks without forcing a common
+export dtype:
+
+```python
+from dataclasses import replace
+
+tasks = [replace(task, requantize=False, weight_dtype=None) for task in bridge.get_conversion_tasks(model)]
+weights = bridge.export_hf_weights(model, conversion_tasks=tasks)
+```
+
+This preserves the dtypes produced by the mappings, including BF16 weights and
+FP32-only parameters. Name remapping and padding still apply. The default
+`requantize=True` retains existing behavior in the DeepSeek V4, Kimi K3, and
+Kimi K2.5 export hooks; specifying `weight_dtype` continues to request a plain
+export with an explicit cast. This option does not override explicit quantized
+conversion mappings such as those created by `build_export_fp8_tasks`.

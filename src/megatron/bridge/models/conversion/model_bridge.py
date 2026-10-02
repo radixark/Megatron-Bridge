@@ -209,6 +209,10 @@ class WeightConversionTask(Generic[MappingT]):
             before final device placement.
         required_hf_param_names: Import-only source tensors consumed by the loading
             hook. Defaults to the parameter names declared by ``mapping.hf_param``.
+        requantize: Whether export hooks restore the source checkpoint's quantization.
+            Set False with ``weight_dtype=None`` to preserve converted tensor dtypes
+            without emitting quantized weights or scale companions. This does not
+            disable non-quantization work such as name remapping or padding.
 
     """
 
@@ -224,6 +228,7 @@ class WeightConversionTask(Generic[MappingT]):
         default=None, compare=False, repr=False
     )
     required_hf_param_names: tuple[str, ...] | None = field(default=None, compare=False)
+    requantize: bool = field(default=True, kw_only=True)
 
     @property
     def hf_param_names(self) -> tuple[str, ...]:

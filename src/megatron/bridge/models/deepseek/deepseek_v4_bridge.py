@@ -986,9 +986,9 @@ class DeepSeekV4Bridge(MegatronModelBridge):
 
         Expert-bias buffers synthesized during import are omitted when the source
         checkpoint did not contain them. Legacy indexer scorer names are restored
-        before selecting the export dtype. When ``task.weight_dtype`` is set, skip
-        requantization and return the weights unchanged — the generic export path
-        casts the dtype.
+        before selecting the export dtype. Skip requantization when disabled on
+        the task or when ``task.weight_dtype`` requests a plain export. The generic
+        export path casts the dtype only if explicitly requested.
         """
         omitted_expert_biases = {
             key for key in converted_weights_dict if key.endswith(".ffn.gate.bias") and key not in hf_state_dict
@@ -1010,7 +1010,7 @@ class DeepSeekV4Bridge(MegatronModelBridge):
             if legacy_key in hf_state_dict:
                 converted_weights_dict = dict(converted_weights_dict)
                 converted_weights_dict[legacy_key] = converted_weights_dict.pop(native_scorer_key)
-        if task.weight_dtype is not None:
+        if not getattr(task, "requantize", True) or task.weight_dtype is not None:
             return converted_weights_dict
 
         return quantization_utils.requantize_hf_weight_scale_pairs(

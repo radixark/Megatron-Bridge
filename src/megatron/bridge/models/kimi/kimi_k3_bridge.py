@@ -321,7 +321,7 @@ class KimiK3Bridge(MegatronModelBridge):
                 result[name] = torch.cat((weight, weight.new_zeros(padding_size)))
                 continue
 
-            if task.weight_dtype is not None:
+            if not getattr(task, "requantize", True) or task.weight_dtype is not None:
                 result[name] = weight
                 continue
 
