@@ -61,7 +61,7 @@ class MultiLoRA(PEFT, ModuleMatcher):
         lora_dtype: Data type for adapter weights.
         normalize_moe_lora: Unsupported for multi-LoRA; see :meth:`__call__`.
         share_expert_adapters: Unsupported for multi-LoRA; see :meth:`__call__`.
-        experts_shared_outer_loras: Unsupported for multi-LoRA; see :meth:`__call__`.
+        experts_shared_outer_loras: Share the hidden-side expert factor within each adapter slot.
     """
 
     target_modules: List[str] = field(
@@ -85,15 +85,12 @@ class MultiLoRA(PEFT, ModuleMatcher):
 
     def __call__(self, model, training: bool = True):
         """Apply multi-LoRA, then install MoE slot routing for wrapped expert linears."""
-        # Every slot shares one max-rank buffer and consumers slice all of an
-        # adapter's tensors to a single rank, so an expert-specific rank
-        # (normalize_moe_lora) or a layout that changes the exported tensor
-        # count per expert would break that contract rather than the layers.
-        for unsupported in ("normalize_moe_lora", "share_expert_adapters", "experts_shared_outer_loras"):
+        # Every module in a slot uses the same rank; only outer expert factors may be shared.
+        for unsupported in ("normalize_moe_lora", "share_expert_adapters"):
             if getattr(self, unsupported):
                 raise NotImplementedError(
                     f"MultiLoRA does not support {unsupported}=True; expert adapters use the "
-                    f"per-expert layout at the same max rank as every other target module."
+                    f"same max rank as every other target module and only support sharing the outer factors."
                 )
         # Unlike single-LoRA, the grouped-GEMM path never casts adapter weights:
         # the field is accepted for argument-surface parity but honoring it needs
@@ -144,6 +141,7 @@ class MultiLoRA(PEFT, ModuleMatcher):
                     alpha=self.alpha,
                     full_name=full_name,
                     num_local_experts=module.num_gemms,
+                    experts_shared_outer_loras=self.experts_shared_outer_loras,
                     column_init_method=self.lora_A_init_method,
                     row_init_method=self.lora_B_init_method,
                     dropout=self.dropout,

@@ -52,6 +52,8 @@ from megatron.bridge.peft.adapter_wrapper import AdapterWrapper
 from megatron.bridge.peft.utils import (
     GroupedExpertLinearAdapter,
     ParallelLinearAdapter,
+    SharedOuterGroupedExpertAdapter,
+    _broadcast_shared_expert_weights,
     all2all_hp2sp,
     get_adapter_attributes_from_linear,
 )
@@ -453,11 +455,8 @@ class ExpertSlotRouting:
 class MultiLoRAGroupedExpertLinear(MultiLoRALinear):
     """Grouped MoE expert linear wrapped with *N* concurrent LoRA adapters.
 
-    One :class:`GroupedExpertLinearAdapter` per slot, i.e. an independent
-    low-rank pair per (slot, local expert). Reusing the single-LoRA adapter
-    class keeps the packed ``[num_local_experts, ...]`` weight layout that the
-    bridge's grouped-expert export and distributed checkpointing already
-    understand; this class only owns the multi-slot forward.
+    Each slot reuses a single-LoRA expert adapter, including its shared-outer
+    layout when enabled. This wrapper owns only the multi-slot forward.
 
     Subclassing :class:`MultiLoRALinear` is deliberate: the slot lifecycle
     helpers here and the ``isinstance``-based multi-LoRA discovery in downstream
@@ -482,6 +481,7 @@ class MultiLoRAGroupedExpertLinear(MultiLoRALinear):
         row_init_method: str = "zero",
         dropout: float = 0.0,
         dropout_position: str = "pre",
+        experts_shared_outer_loras: bool = False,
     ) -> None:
         nn.Module.__init__(self)
         # Same reason as the dense layer: the grouped-GEMM forward never runs an
@@ -496,6 +496,7 @@ class MultiLoRAGroupedExpertLinear(MultiLoRALinear):
         self.max_rank = dim
         self.base_linear_name = full_name
         self.num_local_experts = num_local_experts
+        self.experts_shared_outer_loras = experts_shared_outer_loras
         self._column_init_method = column_init_method
         self._row_init_method = row_init_method
 
@@ -559,9 +560,10 @@ class MultiLoRAGroupedExpertLinear(MultiLoRALinear):
         self._gather_output = False
 
         first_param = next(to_wrap.parameters())
+        adapter_cls = SharedOuterGroupedExpertAdapter if experts_shared_outer_loras else GroupedExpertLinearAdapter
         self.adapters = nn.ModuleList(
             [
-                GroupedExpertLinearAdapter(
+                adapter_cls(
                     attrs.in_features,
                     attrs.out_features,
                     dim,
@@ -582,6 +584,12 @@ class MultiLoRAGroupedExpertLinear(MultiLoRALinear):
                 for _ in range(n_adapters)
             ]
         )
+
+        if experts_shared_outer_loras:
+            for adapter in self.adapters:
+                shared = adapter.linear_out.weight if self.input_is_parallel else adapter.linear_in.weight
+                # Megatron excludes replicas marked shared from gradient norms.
+                shared.shared = parallel_state.get_expert_model_parallel_rank() != 0
 
         self.tokens_per_adapter: Optional[torch.Tensor] = None
         # Written by set_tokens_per_adapter_slot alongside tokens_per_adapter;
@@ -631,18 +639,14 @@ class MultiLoRAGroupedExpertLinear(MultiLoRALinear):
                 f"not pad or reorder its input between dispatch and the expert GEMMs."
             )
 
-        # [n_adapters, num_local_experts, ...] -> one group per (slot, expert),
-        # slot-major so group index s*E+e matches the sort key below. The stack
-        # is a copy, but it is what keeps every slot in the graph (see above).
-        stacked_A = torch.stack([a.linear_in.weight for a in self.adapters])
-        stacked_B = torch.stack([a.linear_out.weight for a in self.adapters])
-        num_groups = stacked_A.shape[0] * stacked_A.shape[1]
-        grouped_A = stacked_A.reshape(num_groups, *stacked_A.shape[2:])
-        grouped_B = stacked_B.reshape(num_groups, *stacked_B.shape[2:])
-
+        slot_offsets = routing.group_offsets.view(self.n_adapters, self.num_local_experts)[:, -1].contiguous()
         x_sorted = x_flat.index_select(0, routing.sort_idx)
-        mid = torch._grouped_mm(x_sorted, grouped_A.transpose(-2, -1), routing.group_offsets)
-        out = torch._grouped_mm(mid, grouped_B.transpose(-2, -1), routing.group_offsets)
+        for side in ("linear_in", "linear_out"):
+            weights = torch.stack([getattr(adapter, side).weight for adapter in self.adapters])
+            offsets = routing.group_offsets if weights.ndim == 4 else slot_offsets
+            weights = weights.reshape(-1, *weights.shape[-2:])
+            x_sorted = torch._grouped_mm(x_sorted, weights.transpose(-2, -1), offsets)
+        out = x_sorted
 
         # Scaling is applied in sorted (slot-major) order, before unsorting.
         # Same dtype caveat as the dense layer: the ratio is rounded to the
@@ -672,6 +676,10 @@ class MultiLoRAGroupedExpertLinear(MultiLoRALinear):
             col_fn(adapter.linear_in.weight.data)
             row_fn(adapter.linear_out.weight.data)
 
+        if self.experts_shared_outer_loras:
+            shared = adapter.linear_out.weight if self.input_is_parallel else adapter.linear_in.weight
+            _broadcast_shared_expert_weights([shared], adapter.ep_group)
+
     def _apply_rank_mask(self, idx: int) -> None:
         """Zero the padded rank rows of A and rank columns of B for slot ``idx``.
 
@@ -686,7 +694,7 @@ class MultiLoRAGroupedExpertLinear(MultiLoRALinear):
             return
         adapter = self.adapters[idx]
         with torch.no_grad():
-            adapter.linear_in.weight.data[:, actual_rank:, :].zero_()
+            adapter.linear_in.weight.data[..., actual_rank:, :].zero_()
             adapter.linear_out.weight.data[..., actual_rank:].zero_()
 
 

@@ -332,7 +332,7 @@ class TestMultiLoRATransform:
         assert wrapped.init_kwargs["n_adapters"] == 3
         assert wrapped.init_kwargs["dim"] == 8
 
-    @pytest.mark.parametrize("flag", ["normalize_moe_lora", "share_expert_adapters", "experts_shared_outer_loras"])
+    @pytest.mark.parametrize("flag", ["normalize_moe_lora", "share_expert_adapters"])
     def test_unsupported_expert_layouts_raise(self, flag: str) -> None:
         peft = MultiLoRA(target_modules=["linear_fc1"], **{flag: True})
         with pytest.raises(NotImplementedError, match=flag):
