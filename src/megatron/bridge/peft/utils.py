@@ -2868,7 +2868,7 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
         for shard in shared_sd.values():
             shard.replica_id = (0, get_pg_rank(self.ep_group), get_pg_rank(self.pg_collection.expt_dp))
 
-        if self._is_fc1:
+        if self._is_fc1 and self.base_linear_name.endswith("linear_fc1"):
             singleton_local_shards = (metadata or {}).get("singleton_local_shards", False)
             linear_out_key = f"{prefix}linear_out.weight"
             linear_out_sd[linear_out_key] = _apply_grouped_expert_swiglu_sharded_factory(
