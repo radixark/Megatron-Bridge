@@ -349,7 +349,7 @@ class TestMultiLoRALinearSlots:
     def test_constructor_forwards_wrapped_module_runtime_config(self) -> None:
         """Adapter construction mirrors the single-LoRA path (LoRA.transform)."""
         base = nn.Linear(16, 32)
-        base.config = object()
+        base.config = SimpleNamespace(sequence_parallel=False)
 
         layer = MultiLoRALinear(to_wrap=base, n_adapters=2, dim=8, alpha=16, full_name="linear_proj")
 
