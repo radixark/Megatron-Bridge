@@ -34,17 +34,45 @@ def _assert_close(actual, expected):
 @pytest.mark.usefixtures("two_rank_process_group")
 @pytest.mark.parametrize("row_parallel", [False, True])
 @pytest.mark.parametrize("sequence_parallel", [False, True])
-def test_fused_tp_gradients(row_parallel, sequence_parallel):
+@pytest.mark.parametrize("fused_layernorm", [False, True])
+def test_fused_tp_gradients(row_parallel, sequence_parallel, fused_layernorm):
+    if row_parallel and fused_layernorm:
+        pytest.skip("TE fuses the layernorm into column-parallel layers only")
     with _model_parallel(tp=2, ep=1):
         config = TransformerConfig(
-            num_layers=1, hidden_size=32, num_attention_heads=4, tensor_model_parallel_size=2,
-            sequence_parallel=sequence_parallel, params_dtype=torch.float32, gradient_accumulation_fusion=False,
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            tensor_model_parallel_size=2,
+            sequence_parallel=sequence_parallel,
+            params_dtype=torch.float32,
+            gradient_accumulation_fusion=False,
         )
-        linear_cls = RowParallelLinear if row_parallel else ColumnParallelLinear
-        base = linear_cls(
-            32, 32, config=config, init_method=torch.nn.init.zeros_, bias=False,
-            **({"input_is_parallel": True, "skip_bias_add": True} if row_parallel else {"gather_output": False}),
-        ).cuda().requires_grad_(False)
+        if fused_layernorm:
+            from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
+
+            base = TELayerNormColumnParallelLinear(
+                32,
+                32,
+                config=config,
+                init_method=torch.nn.init.zeros_,
+                bias=False,
+                skip_bias_add=True,
+                tp_comm_buffer_name="qkv",
+                gather_output=False,
+                is_expert=False,
+            )
+        else:
+            linear_cls = RowParallelLinear if row_parallel else ColumnParallelLinear
+            base = linear_cls(
+                32,
+                32,
+                config=config,
+                init_method=torch.nn.init.zeros_,
+                bias=False,
+                **({"input_is_parallel": True, "skip_bias_add": True} if row_parallel else {"gather_output": False}),
+            )
+        base = base.cuda().requires_grad_(False)
         name = "linear_proj" if row_parallel else "linear_qkv"
         layer = MultiLoRA(target_modules=[name], n_adapters=1, dim=8).transform(base, name=name)
         init_adapter_slot(layer, 0, rank=8, alpha=8, seed=11)
@@ -64,7 +92,9 @@ def test_fused_tp_gradients(row_parallel, sequence_parallel):
         adapter = layer.adapters[0]
         a = _gather(adapter.linear_in.weight, dim=-1 if row_parallel else 0)
         b = _gather(adapter.linear_out.weight)
-        expected = F.linear(F.linear(full_x, a), b)
+        # the adapter reads the layernorm output, whose gather it must own under sequence parallelism
+        ref_x = F.layer_norm(full_x, (32,), eps=config.layernorm_epsilon) if fused_layernorm else full_x
+        expected = F.linear(F.linear(ref_x, a), b)
         expected_local = expected.chunk(2)[rank] if row_parallel and sequence_parallel else expected
         if not row_parallel:
             expected_local = expected.chunk(2, dim=-1)[rank]
@@ -77,5 +107,3 @@ def test_fused_tp_gradients(row_parallel, sequence_parallel):
         if not row_parallel and sequence_parallel:
             expected_dx = expected_dx.chunk(2)[rank]
         _assert_close(x.grad, expected_dx)
-
-
