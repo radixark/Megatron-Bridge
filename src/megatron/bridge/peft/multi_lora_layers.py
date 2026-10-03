@@ -41,6 +41,7 @@ import torch.nn.functional as F
 from megatron.core import parallel_state
 from megatron.core.tensor_parallel.mappings import (
     all_to_all,
+    copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
     gather_from_tensor_model_parallel_region,
     reduce_from_tensor_model_parallel_region,
@@ -176,6 +177,9 @@ class MultiLoRALinear(AdapterWrapper):
         # collectives between the two adapter projections.
         self.base_linear_is_parallel = attrs.base_linear_is_parallel
         self.replicate_adapter = attrs.replicate_adapter
+        self._reduce_input_grad = (
+            not attrs.input_is_parallel and not attrs.replicate_adapter and not to_wrap.config.sequence_parallel
+        )
         self.use_a2a = a2a_experimental
         self._adapter_in_features = attrs.in_features
         self._adapter_out_features = attrs.out_features
@@ -273,6 +277,8 @@ class MultiLoRALinear(AdapterWrapper):
             token_splits = _narrow_token_counts_to_window(token_splits, start, x_flat.shape[0])
             tokens_per_adapter = tokens_per_adapter.new_tensor(token_splits)
 
+        if self._reduce_input_grad:
+            x_flat = copy_to_tensor_model_parallel_region(x_flat)
         offsets = tokens_per_adapter.cumsum(dim=0, dtype=torch.int32)
 
         stacked_A = torch.stack([a.linear_in.weight for a in self.adapters])
@@ -289,9 +295,12 @@ class MultiLoRALinear(AdapterWrapper):
             ).movedim(0, 1)
         elif not self.replicate_adapter:
             if self.input_is_parallel:
-                mid = reduce_from_tensor_model_parallel_region(mid)
+                mid = copy_to_tensor_model_parallel_region(reduce_from_tensor_model_parallel_region(mid))
             else:
-                mid = gather_from_tensor_model_parallel_region(mid)
+                # B's output shards all contribute to each rank shard of A.
+                mid = gather_from_sequence_parallel_region(
+                    mid.movedim(-1, 0).contiguous(), tensor_parallel_output_grad=True
+                ).movedim(0, -1)
 
         out = _dense_multi_lora_mm(mid, stacked_B, token_splits=token_splits, offsets=offsets)
 
