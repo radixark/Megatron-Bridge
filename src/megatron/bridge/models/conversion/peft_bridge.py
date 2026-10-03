@@ -125,11 +125,24 @@ class AdapterWeight:
     linear_out_weight: "MegatronWeightTuple"
 
 
+def _canonical_packed_expert_name(hf_name, adapter_key, base_suffix=".weight"):
+    if adapter_key not in ("adapter_gate", "adapter_up"):
+        return hf_name
+    stem = hf_name.removesuffix(".weight")
+    if not stem.endswith(".experts.gate_up_proj"):
+        return hf_name
+    # Canonical factors stay independent even when the base checkpoint packs gate/up.
+    expert = base_suffix.removeprefix(".weight")
+    prefix = stem.removesuffix(".gate_up_proj") + (f".{expert}" if expert else "")
+    return prefix + ADAPTER_KEY_TO_SUFFIX[adapter_key]
+
+
 def _select_hf_base_param_name(base_mapping, adapter_key: Optional[str], expected_suffix: str) -> Optional[str]:
     """Return the HF base parameter name associated with this adapter."""
 
     hf_param = base_mapping.hf_param
     if isinstance(hf_param, str):
+        hf_param = _canonical_packed_expert_name(hf_param, adapter_key)
         return hf_param if hf_param.endswith(expected_suffix) or expected_suffix == ".weight" else None
 
     if isinstance(hf_param, dict):
@@ -228,7 +241,7 @@ class MegatronPeftBridge:
 
         hf_param = base_mapping.hf_param
         if isinstance(hf_param, str):
-            return [hf_param]
+            return [_canonical_packed_expert_name(hf_param, adapter_key, base_suffix)]
 
         values = list(hf_param.values())
         if adapter_key:
@@ -1102,6 +1115,7 @@ class MegatronPeftBridge:
         in_name, out_name = source_names if source_names is not None else (None, None)
 
         if stack_3d_moe:
+            assert adapter_task.adapter_key is None, "vLLM 3D MoE export does not support independent gate/up adapters"
             yield from self._stream_shared_outer_adapter_weights_3d_moe(
                 megatron_model,
                 mapping_registry,
