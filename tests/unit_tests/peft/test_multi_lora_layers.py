@@ -145,8 +145,14 @@ def _build_multi_lora_linear(
 def adapter_deps_patch() -> ExitStack:
     """Patch the layer module's adapter construction dependencies for CPU use."""
     stack = ExitStack()
-    stack.enter_context(patch.object(multi_lora_layers_module, "copy_to_tensor_model_parallel_region", side_effect=lambda x: x))
-    stack.enter_context(patch.object(multi_lora_layers_module, "gather_from_sequence_parallel_region", side_effect=lambda x, **kwargs: x))
+    stack.enter_context(
+        patch.object(multi_lora_layers_module, "copy_to_tensor_model_parallel_region", side_effect=lambda x: x)
+    )
+    stack.enter_context(
+        patch.object(
+            multi_lora_layers_module, "gather_from_sequence_parallel_region", side_effect=lambda x, **kwargs: x
+        )
+    )
     stack.enter_context(patch.object(multi_lora_layers_module, "ParallelLinearAdapter", _FakeParallelLinearAdapter))
     stack.enter_context(patch.object(multi_lora_layers_module, "get_adapter_attributes_from_linear", _fake_get_attrs))
     # ``reset_adapter`` re-inits through the model-parallel RNG tracker, which
