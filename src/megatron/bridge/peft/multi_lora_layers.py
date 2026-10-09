@@ -20,8 +20,8 @@ via per-layer ``tokens_per_adapter`` set by :func:`set_tokens_per_adapter_slot`.
 
 Forward stacks the raw weights of all adapters and uses ``torch._grouped_mm``
 as an eligible fast path, with per-slot linear operations as the fallback;
-TP/SP collectives are issued once around the two projections to match the
-layout of the wrapped base linear.
+SP gathers are shared across logical projections; each low-rank pair uses
+TP collectives matching the wrapped base linear.
 
 :class:`MultiLoRAGroupedExpertLinear` is the MoE counterpart, wrapping a grouped
 expert linear (``mlp.experts.linear_fc{1,2}`` of a ``TEGroupedMLP``) with one
@@ -33,6 +33,7 @@ dispatcher to recover the per-(slot, expert) segmentation.
 """
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -50,6 +51,7 @@ from megatron.core.tensor_parallel.mappings import (
 from megatron.core.transformer.moe.moe_utils import sort_chunks_by_idxs
 
 from megatron.bridge.peft.adapter_wrapper import AdapterWrapper
+from megatron.bridge.peft.canonical_lora import ModuleDict
 from megatron.bridge.peft.utils import (
     GroupedExpertLinearAdapter,
     ParallelLinearAdapter,
@@ -118,12 +120,56 @@ def _dense_multi_lora_mm(
     )
 
 
+def _adapter_leaves(adapter):
+    return adapter.values() if isinstance(adapter, ModuleDict) else (adapter,)
+
+
+def _projection_sizes(to_wrap, out_features, targets):
+    if not targets:
+        return {}
+    if targets <= {"linear_q", "linear_k", "linear_v"}:
+        config = to_wrap.config
+        kv_size = config.kv_channels * config.num_query_groups
+        # Qwen3.5's query projection includes its output gate.
+        return {"adapter_q": out_features - 2 * kv_size, "adapter_k": kv_size, "adapter_v": kv_size}
+    assert targets <= {"linear_fc1_gate", "linear_fc1_up"}, targets
+    assert to_wrap.config.gated_linear_unit, "Independent gate/up adapters require a gated MLP"
+    return {"adapter_gate": out_features // 2, "adapter_up": out_features // 2}
+
+
+def _make_slot_adapter(factory, full_name, out_features, sizes, targets):
+    if not sizes:
+        return factory(out_features=out_features, base_linear_name=full_name)
+    selected = {target.replace("linear_fc1_", "adapter_").replace("linear_", "adapter_") for target in targets}
+    return ModuleDict(
+        {
+            key: factory(out_features=size, base_linear_name=f"{full_name.rsplit('.', 1)[0]}.{key}")
+            for key, size in sizes.items()
+            if key in selected
+        }
+    )
+
+
+def _combine_projections(outputs, sizes, to_wrap, reference):
+    # Infer local widths from the base output, including the expert ETP=1 layout.
+    shard_count = sum(sizes.values()) // reference.shape[-1]
+    parts = [
+        outputs[key] if key in outputs else reference.new_zeros(*reference.shape[:-1], size // shard_count)
+        for key, size in sizes.items()
+    ]
+    if "adapter_q" in sizes:
+        head_size = to_wrap.config.kv_channels
+        groups = parts[1].shape[-1] // head_size
+        parts = [part.reshape(*part.shape[:-1], groups, -1) for part in parts]
+        return torch.cat(parts, dim=-1).flatten(-2)
+    return torch.cat(parts, dim=-1)
+
+
 class MultiLoRALinear(AdapterWrapper):
     """Megatron parallel linear wrapped with *N* concurrent LoRA adapters.
 
-    Each adapter slot is a :class:`ParallelLinearAdapter` stored in an
-    ``nn.ModuleList``. Forward uses grouped GEMM when eligible and otherwise
-    falls back to per-slot linear operations, with one set of TP/SP comms.
+    Slots contain either one adapter or a ModuleDict of independent projections.
+    Forward uses grouped GEMM when eligible and otherwise per-slot linears.
 
     For bridge export compatibility, use :func:`expose_adapter_slot` to
     temporarily expose one slot as ``.adapter``.
@@ -141,6 +187,7 @@ class MultiLoRALinear(AdapterWrapper):
         dropout: float = 0.0,
         dropout_position: str = "pre",
         a2a_experimental: bool = False,
+        projection_targets: Optional[set[str]] = None,
     ) -> None:
         nn.Module.__init__(self)
         # The fused Multi-LoRA forward below never runs each adapter's own
@@ -193,27 +240,28 @@ class MultiLoRALinear(AdapterWrapper):
         # ModuleList of ParallelLinearAdapters gives per-adapter optimizer state
         # isolation, clean checkpoint serialization, and bridge export compatibility.
         # Adapter kwargs mirror the single-LoRA path (LoRA.transform).
+        self._projection_sizes = _projection_sizes(to_wrap, attrs.out_features, projection_targets)
+        factory = partial(
+            ParallelLinearAdapter,
+            in_features=attrs.in_features,
+            dim=dim,
+            activation="identity",
+            alpha=alpha,
+            input_is_parallel=attrs.input_is_parallel,
+            column_init_method=column_init_method,
+            row_init_method=row_init_method,
+            model_parallel_config=getattr(to_wrap, "config", None),
+            disable_tensor_parallel_comm=attrs.disable_tensor_parallel_comm,
+            disable_sequence_parallel_comm=attrs.disable_sequence_parallel_comm,
+            base_linear_is_parallel=attrs.base_linear_is_parallel,
+            replicate_adapter=attrs.replicate_adapter,
+            a2a_experimental=a2a_experimental,
+            dropout=dropout,
+            dropout_position=dropout_position,
+        )
         self.adapters = nn.ModuleList(
             [
-                ParallelLinearAdapter(
-                    in_features=attrs.in_features,
-                    out_features=attrs.out_features,
-                    dim=dim,
-                    base_linear_name=full_name,
-                    activation="identity",
-                    alpha=alpha,
-                    input_is_parallel=attrs.input_is_parallel,
-                    column_init_method=column_init_method,
-                    row_init_method=row_init_method,
-                    model_parallel_config=getattr(to_wrap, "config", None),
-                    disable_tensor_parallel_comm=attrs.disable_tensor_parallel_comm,
-                    disable_sequence_parallel_comm=attrs.disable_sequence_parallel_comm,
-                    base_linear_is_parallel=attrs.base_linear_is_parallel,
-                    replicate_adapter=attrs.replicate_adapter,
-                    a2a_experimental=a2a_experimental,
-                    dropout=dropout,
-                    dropout_position=dropout_position,
-                )
+                _make_slot_adapter(factory, full_name, attrs.out_features, self._projection_sizes, projection_targets)
                 for _ in range(n_adapters)
             ]
         )
@@ -282,28 +330,16 @@ class MultiLoRALinear(AdapterWrapper):
             x_flat = copy_to_tensor_model_parallel_region(x_flat)
         offsets = tokens_per_adapter.cumsum(dim=0, dtype=torch.int32)
 
-        stacked_A = torch.stack([a.linear_in.weight for a in self.adapters])
-        stacked_B = torch.stack([a.linear_out.weight for a in self.adapters])
-
-        mid = _dense_multi_lora_mm(x_flat, stacked_A, token_splits=token_splits, offsets=offsets)
-
-        # TP collective between A and B: row-parallel A needs an all-reduce;
-        # column-parallel A needs an all-gather; replicated A is already complete.
-        if self._external_output_reduce:
-            # The outer TP reduction needs local-input deltas; B gradients sum across those inputs.
-            stacked_B = gather_from_sequence_parallel_region(
-                stacked_B.movedim(1, 0).contiguous(), tensor_parallel_output_grad=True
-            ).movedim(0, 1)
-        elif not self.replicate_adapter:
-            if self.input_is_parallel:
-                mid = copy_to_tensor_model_parallel_region(reduce_from_tensor_model_parallel_region(mid))
-            else:
-                # B's output shards all contribute to each rank shard of A.
-                mid = gather_from_sequence_parallel_region(
-                    mid.movedim(-1, 0).contiguous(), tensor_parallel_output_grad=True
-                ).movedim(0, -1)
-
-        out = _dense_multi_lora_mm(mid, stacked_B, token_splits=token_splits, offsets=offsets)
+        if self._projection_sizes:
+            outputs = {
+                key: self._adapter_forward(x_flat, [slot[key] for slot in self.adapters], token_splits, offsets)
+                for key in self.adapters[0]
+            }
+            out = _combine_projections(
+                outputs, self._projection_sizes, self.to_wrap, linear_output.reshape(-1, linear_output.shape[-1])
+            )
+        else:
+            out = self._adapter_forward(x_flat, self.adapters, token_splits, offsets)
 
         # Per-token scaling is applied *before* the output-side TP/SP comms.
         # ``per_token_scaling`` is indexed by the full token count
@@ -333,6 +369,32 @@ class MultiLoRALinear(AdapterWrapper):
 
         return linear_output + out.reshape(linear_output.shape), bias
 
+    def _adapter_forward(self, x_flat, adapters, token_splits, offsets):
+        stacked_A = torch.stack([a.linear_in.weight for a in adapters])
+        stacked_B = torch.stack([a.linear_out.weight for a in adapters])
+
+        mid = _dense_multi_lora_mm(x_flat, stacked_A, token_splits=token_splits, offsets=offsets)
+
+        # TP collective between A and B: row-parallel A needs an all-reduce;
+        # column-parallel A needs an all-gather; replicated A is already complete.
+        if self._external_output_reduce:
+            # The outer TP reduction needs local-input deltas; B gradients sum across those inputs.
+            stacked_B = gather_from_sequence_parallel_region(
+                stacked_B.movedim(1, 0).contiguous(), tensor_parallel_output_grad=True
+            ).movedim(0, 1)
+        elif not self.replicate_adapter:
+            if self.input_is_parallel:
+                mid = copy_to_tensor_model_parallel_region(reduce_from_tensor_model_parallel_region(mid))
+            else:
+                # B's output shards all contribute to each rank shard of A.
+                mid = gather_from_sequence_parallel_region(
+                    mid.movedim(-1, 0).contiguous(), tensor_parallel_output_grad=True
+                ).movedim(0, -1)
+
+        out = _dense_multi_lora_mm(mid, stacked_B, token_splits=token_splits, offsets=offsets)
+
+        return out
+
     def reset_adapter(self, idx: int) -> None:
         # Re-init through the model-parallel RNG tracker so every DP replica
         # produces identical weights regardless of how far the global RNG has
@@ -346,27 +408,29 @@ class MultiLoRALinear(AdapterWrapper):
 
         from megatron.bridge.peft.utils import ParallelLinearAdapter
 
-        adapter = self.adapters[idx]
-        col_fn = ParallelLinearAdapter._get_init_fn(
-            None,
-            self._column_init_method,
-            fan_in=self._adapter_in_features,
-            fan_out=self.max_rank,
-        )
-        row_fn = ParallelLinearAdapter._get_init_fn(
-            None,
-            self._row_init_method,
-            fan_in=self.max_rank,
-            fan_out=self._adapter_out_features,
-        )
-        rng_context = (
-            get_cuda_rng_tracker().fork(get_data_parallel_rng_tracker_name())
-            if self.replicate_adapter
-            else get_cuda_rng_tracker().fork()
-        )
-        with rng_context:
-            col_fn(adapter.linear_in.weight.data)
-            row_fn(adapter.linear_out.weight.data)
+        adapters = self.adapters[idx]
+        items = adapters.items() if isinstance(adapters, ModuleDict) else ((None, adapters),)
+        for key, adapter in items:
+            col_fn = ParallelLinearAdapter._get_init_fn(
+                None,
+                self._column_init_method,
+                fan_in=self._adapter_in_features,
+                fan_out=self.max_rank,
+            )
+            row_fn = ParallelLinearAdapter._get_init_fn(
+                None,
+                self._row_init_method,
+                fan_in=self.max_rank,
+                fan_out=self._projection_sizes.get(key, self._adapter_out_features),
+            )
+            rng_context = (
+                get_cuda_rng_tracker().fork(get_data_parallel_rng_tracker_name())
+                if self.replicate_adapter
+                else get_cuda_rng_tracker().fork()
+            )
+            with rng_context:
+                col_fn(adapter.linear_in.weight.data)
+                row_fn(adapter.linear_out.weight.data)
 
     def init_adapter_slot(self, idx: int, rank: int, alpha: float) -> None:
         """Claim slot ``idx`` for an adapter: bind ``rank``/``alpha`` and apply the rank mask."""
@@ -397,18 +461,18 @@ class MultiLoRALinear(AdapterWrapper):
         actual_rank = int(self.rank_values[idx].item())
         if actual_rank >= self.max_rank:
             return
-        adapter = self.adapters[idx]
-        local_rank_dim = adapter.linear_in.weight.shape[0]
-        if local_rank_dim < self.max_rank:
-            tp_rank = parallel_state.get_tensor_model_parallel_rank()
-            shard_start = tp_rank * local_rank_dim
-            local_start = max(0, actual_rank - shard_start)
-        else:
-            local_start = actual_rank
-        with torch.no_grad():
-            if local_start < local_rank_dim:
-                adapter.linear_in.weight.data[local_start:].zero_()
-            adapter.linear_out.weight.data[:, actual_rank:].zero_()
+        for adapter in _adapter_leaves(self.adapters[idx]):
+            local_rank_dim = adapter.linear_in.weight.shape[0]
+            if local_rank_dim < self.max_rank:
+                tp_rank = parallel_state.get_tensor_model_parallel_rank()
+                shard_start = tp_rank * local_rank_dim
+                local_start = max(0, actual_rank - shard_start)
+            else:
+                local_start = actual_rank
+            with torch.no_grad():
+                if local_start < local_rank_dim:
+                    adapter.linear_in.weight.data[local_start:].zero_()
+                adapter.linear_out.weight.data[:, actual_rank:].zero_()
 
     def state_dict(
         self,
@@ -492,6 +556,7 @@ class MultiLoRAGroupedExpertLinear(MultiLoRALinear):
         dropout: float = 0.0,
         dropout_position: str = "pre",
         experts_shared_outer_loras: bool = False,
+        projection_targets: Optional[set[str]] = None,
     ) -> None:
         nn.Module.__init__(self)
         # Same reason as the dense layer: the grouped-GEMM forward never runs an
@@ -571,35 +636,37 @@ class MultiLoRAGroupedExpertLinear(MultiLoRALinear):
 
         first_param = next(to_wrap.parameters())
         adapter_cls = SharedOuterGroupedExpertAdapter if experts_shared_outer_loras else GroupedExpertLinearAdapter
+        self._projection_sizes = _projection_sizes(to_wrap, attrs.out_features, projection_targets)
+        factory = partial(
+            adapter_cls,
+            in_features=attrs.in_features,
+            dim=dim,
+            num_local_experts=num_local_experts,
+            activation="identity",
+            column_init_method=column_init_method,
+            row_init_method=row_init_method,
+            input_is_parallel=attrs.input_is_parallel,
+            dropout=dropout,
+            dropout_position=dropout_position,
+            model_parallel_config=config,
+            alpha=alpha,
+            base_linear_is_parallel=attrs.base_linear_is_parallel,
+            params_device=first_param.device,
+            params_dtype=first_param.dtype,
+        )
         self.adapters = nn.ModuleList(
             [
-                adapter_cls(
-                    attrs.in_features,
-                    attrs.out_features,
-                    dim,
-                    num_local_experts=num_local_experts,
-                    base_linear_name=full_name,
-                    activation="identity",
-                    column_init_method=column_init_method,
-                    row_init_method=row_init_method,
-                    input_is_parallel=attrs.input_is_parallel,
-                    dropout=dropout,
-                    dropout_position=dropout_position,
-                    model_parallel_config=config,
-                    alpha=alpha,
-                    base_linear_is_parallel=attrs.base_linear_is_parallel,
-                    params_device=first_param.device,
-                    params_dtype=first_param.dtype,
-                )
+                _make_slot_adapter(factory, full_name, attrs.out_features, self._projection_sizes, projection_targets)
                 for _ in range(n_adapters)
             ]
         )
 
         if experts_shared_outer_loras:
-            for adapter in self.adapters:
-                shared = adapter.linear_out.weight if self.input_is_parallel else adapter.linear_in.weight
-                # Megatron excludes replicas marked shared from gradient norms.
-                shared.shared = parallel_state.get_expert_model_parallel_rank() != 0
+            for slot in self.adapters:
+                for adapter in _adapter_leaves(slot):
+                    shared = adapter.linear_out.weight if self.input_is_parallel else adapter.linear_in.weight
+                    # Megatron excludes replicas marked shared from gradient norms.
+                    shared.shared = parallel_state.get_expert_model_parallel_rank() != 0
 
         self.tokens_per_adapter: Optional[torch.Tensor] = None
         # Written by set_tokens_per_adapter_slot alongside tokens_per_adapter;
@@ -639,7 +706,7 @@ class MultiLoRAGroupedExpertLinear(MultiLoRALinear):
         # would leave its bucket incomplete. torch.stack below provides that in
         # the normal path; the empty path needs an explicit zero term.
         if routing.num_tokens == 0:
-            zero_term = sum((a.linear_in.weight.sum() + a.linear_out.weight.sum()) for a in self.adapters) * 0.0
+            zero_term = sum(p.sum() for p in self.adapters.parameters()) * 0.0
             return linear_output + zero_term, bias
 
         if x_flat.shape[0] != routing.num_tokens:
@@ -651,12 +718,16 @@ class MultiLoRAGroupedExpertLinear(MultiLoRALinear):
 
         slot_offsets = routing.group_offsets.view(self.n_adapters, self.num_local_experts)[:, -1].contiguous()
         x_sorted = x_flat.index_select(0, routing.sort_idx)
-        for side in ("linear_in", "linear_out"):
-            weights = torch.stack([getattr(adapter, side).weight for adapter in self.adapters])
-            offsets = routing.group_offsets if weights.ndim == 4 else slot_offsets
-            weights = weights.reshape(-1, *weights.shape[-2:])
-            x_sorted = torch._grouped_mm(x_sorted, weights.transpose(-2, -1), offsets)
-        out = x_sorted
+        if self._projection_sizes:
+            outputs = {
+                key: self._expert_adapter_forward(
+                    x_sorted, [slot[key] for slot in self.adapters], routing, slot_offsets
+                )
+                for key in self.adapters[0]
+            }
+            out = _combine_projections(outputs, self._projection_sizes, self.to_wrap, linear_output)
+        else:
+            out = self._expert_adapter_forward(x_sorted, self.adapters, routing, slot_offsets)
 
         # Scaling is applied in sorted (slot-major) order, before unsorting.
         # Same dtype caveat as the dense layer: the ratio is rounded to the
@@ -666,6 +737,16 @@ class MultiLoRAGroupedExpertLinear(MultiLoRALinear):
         out = out.index_select(0, routing.inverse_idx)
 
         return linear_output + out.reshape(linear_output.shape), bias
+
+    def _expert_adapter_forward(self, x_sorted, adapters, routing, slot_offsets):
+        for side in ("linear_in", "linear_out"):
+            weights = torch.stack([getattr(adapter, side).weight for adapter in adapters])
+            offsets = routing.group_offsets if weights.ndim == 4 else slot_offsets
+            weights = weights.reshape(-1, *weights.shape[-2:])
+            x_sorted = torch._grouped_mm(x_sorted, weights.transpose(-2, -1), offsets)
+        out = x_sorted
+
+        return out
 
     def reset_adapter(self, idx: int) -> None:
         # Same model-parallel RNG discipline as the dense layer, but forking the
@@ -679,16 +760,16 @@ class MultiLoRAGroupedExpertLinear(MultiLoRALinear):
             get_expert_parallel_rng_tracker_name,
         )
 
-        adapter = self.adapters[idx]
-        col_fn = ParallelLinearAdapter._get_init_fn(None, self._column_init_method)
-        row_fn = ParallelLinearAdapter._get_init_fn(None, self._row_init_method)
-        with get_cuda_rng_tracker().fork(get_expert_parallel_rng_tracker_name()):
-            col_fn(adapter.linear_in.weight.data)
-            row_fn(adapter.linear_out.weight.data)
+        for adapter in _adapter_leaves(self.adapters[idx]):
+            col_fn = ParallelLinearAdapter._get_init_fn(None, self._column_init_method)
+            row_fn = ParallelLinearAdapter._get_init_fn(None, self._row_init_method)
+            with get_cuda_rng_tracker().fork(get_expert_parallel_rng_tracker_name()):
+                col_fn(adapter.linear_in.weight.data)
+                row_fn(adapter.linear_out.weight.data)
 
-        if self.experts_shared_outer_loras:
-            shared = adapter.linear_out.weight if self.input_is_parallel else adapter.linear_in.weight
-            _broadcast_shared_expert_weights([shared], adapter.ep_group)
+            if self.experts_shared_outer_loras:
+                shared = adapter.linear_out.weight if self.input_is_parallel else adapter.linear_in.weight
+                _broadcast_shared_expert_weights([shared], adapter.ep_group)
 
     def _apply_rank_mask(self, idx: int) -> None:
         """Zero the padded rank rows of A and rank columns of B for slot ``idx``.
@@ -702,10 +783,10 @@ class MultiLoRAGroupedExpertLinear(MultiLoRALinear):
         actual_rank = int(self.rank_values[idx].item())
         if actual_rank >= self.max_rank:
             return
-        adapter = self.adapters[idx]
-        with torch.no_grad():
-            adapter.linear_in.weight.data[..., actual_rank:, :].zero_()
-            adapter.linear_out.weight.data[..., actual_rank:].zero_()
+        for adapter in _adapter_leaves(self.adapters[idx]):
+            with torch.no_grad():
+                adapter.linear_in.weight.data[..., actual_rank:, :].zero_()
+                adapter.linear_out.weight.data[..., actual_rank:].zero_()
 
 
 # ==================================================================
@@ -1115,8 +1196,7 @@ def expose_adapter_slot(model, idx: int):
 
     Used by two consumers:
 
-    * The bridge's ``export_adapter_weights`` looks for ``.adapter.linear_in.weight``
-      (single-LoRA layout) on each wrapped module.
+    * The bridge's ``export_adapter_weights`` walks the single-slot ``.adapter`` tree.
     * Megatron-native save/load walk ``model.named_parameters()`` and want names
       that don't contain the slot index, so saving from slot ``A`` and loading into
       slot ``B`` produces matching keys.
@@ -1140,8 +1220,9 @@ def expose_adapter_slot(model, idx: int):
             if "adapters" in m._modules:
                 saved[id(m)] = m._modules.pop("adapters")
                 adapter = saved[id(m)][idx]
-                saved_alphas[id(m)] = adapter.alpha
-                adapter.alpha = float(m.alpha_values[idx]) * m.max_rank / float(m.rank_values[idx])
+                for leaf in _adapter_leaves(adapter):
+                    saved_alphas[id(leaf)] = leaf.alpha
+                    leaf.alpha = float(m.alpha_values[idx]) * m.max_rank / float(m.rank_values[idx])
                 m.adapter = adapter
 
         # try/finally: an exception in the body (e.g. an export/save error, which
@@ -1156,7 +1237,8 @@ def expose_adapter_slot(model, idx: int):
                     if "adapter" in m._modules:
                         del m._modules["adapter"]
                     m._modules["adapters"] = saved[id(m)]
-                    saved[id(m)][idx].alpha = saved_alphas[id(m)]
+                    for leaf in _adapter_leaves(saved[id(m)][idx]):
+                        leaf.alpha = saved_alphas[id(leaf)]
 
     return _ctx()
 
