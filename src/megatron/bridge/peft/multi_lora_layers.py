@@ -32,6 +32,7 @@ adapter-major order, so ``tokens_per_adapter`` alone cannot segment it;
 dispatcher to recover the per-(slot, expert) segmentation.
 """
 
+import itertools
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -108,6 +109,12 @@ def _dense_multi_lora_mm(
     grouped_weights = stacked_weights.transpose(-2, -1)
     if all(split > 0 for split in token_splits) and _can_use_grouped_mm(x, grouped_weights):
         return torch._grouped_mm(x, grouped_weights, offsets)
+
+    active_slots = _active_slots(token_splits)
+    if len(active_slots) == 1:
+        # The per-slot path below would run this one GEMM plus empty ones and a
+        # concatenating copy. Indexing the stack keeps every slot in the graph.
+        return F.linear(x, stacked_weights[active_slots[0]])
 
     inputs = x.split(token_splits, dim=0)
     return torch.cat(
@@ -232,6 +239,10 @@ class MultiLoRALinear(AdapterWrapper):
         self.register_buffer(
             "rank_values", torch.full((n_adapters,), dim, dtype=dtype, device=device), persistent=False
         )
+        # Host copy of "alpha/rank is exactly 1.0" per slot, so forward can skip the
+        # scaling multiply without reading the buffers back. Maintained by
+        # init_adapter_slot/clear_adapter_slot; False (always scale) until claimed.
+        self._unit_scaling: List[bool] = [False] * n_adapters
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         linear_output, bias, layernorm_output = self.base_linear_forward(x, *args, **kwargs)
@@ -303,9 +314,13 @@ class MultiLoRALinear(AdapterWrapper):
         # ratio into an fp32 accumulator. Where train/rollout parity at that
         # level matters, keep alpha/rank ratios exactly representable; closing
         # the gap entirely would require applying the scaling in fp32.
-        scaling = self.alpha_values / self.rank_values
-        per_token_scaling = torch.repeat_interleave(scaling, tokens_per_adapter).unsqueeze(-1)
-        out = out * per_token_scaling
+        # ``output_size`` keeps repeat_interleave from reading the total back from the GPU.
+        if not self._scaling_is_identity(_active_slots(token_splits), out.dtype):
+            scaling = self.alpha_values / self.rank_values
+            per_token_scaling = torch.repeat_interleave(
+                scaling, tokens_per_adapter, output_size=sum(token_splits)
+            ).unsqueeze(-1)
+            out = out * per_token_scaling
 
         # Match the wrapped base linear's output layout: row-parallel base
         # produces a fully-summed [tokens, h_out] tensor (which we then SP
@@ -361,13 +376,29 @@ class MultiLoRALinear(AdapterWrapper):
         assert 0 < rank <= self.max_rank, f"Adapter rank {rank} must be in (0, {self.max_rank}]"
         self.alpha_values[idx] = alpha
         self.rank_values[idx] = rank
+        # Compared in the buffers' dtype, which is what forward multiplies by.
+        self._unit_scaling[idx] = bool((self.alpha_values[idx] / self.rank_values[idx]).item() == 1.0)
         self._apply_rank_mask(idx)
 
     def clear_adapter_slot(self, idx: int) -> None:
         """Free slot ``idx``: zero alpha, restore max rank, re-init weights."""
         self.alpha_values[idx] = 0
         self.rank_values[idx] = self.max_rank
+        self._unit_scaling[idx] = False
         self.reset_adapter(idx)
+
+    def _scaling_is_identity(self, active_slots: Optional[Sequence[int]], out_dtype: torch.dtype) -> bool:
+        """Whether the per-token alpha/rank multiply would leave the output bit-for-bit unchanged.
+
+        True when every slot with tokens in this forward has alpha/rank exactly 1.0
+        and multiplying by the scaling buffer would not promote ``out_dtype``.
+        ``active_slots=None`` means the slots present are unknown.
+        """
+        return (
+            active_slots is not None
+            and all(self._unit_scaling[slot] for slot in active_slots)
+            and torch.promote_types(out_dtype, self.alpha_values.dtype) == out_dtype
+        )
 
     def _apply_rank_mask(self, idx: int) -> None:
         """Zero padded rows of A and padded cols of B for slot ``idx``.
@@ -434,20 +465,25 @@ class ExpertSlotRouting:
     Attributes:
         sort_idx: Permutation ordering the dispatched tokens by
             ``(slot, local_expert)``, so one grouped GEMM covers every
-            (slot, expert) pair.
-        inverse_idx: Inverse of ``sort_idx``, restoring the base layer's order.
+            (slot, expert) pair. ``None`` when the rows are already in that
+            order (e.g. a single adapter slot without expert parallelism).
+        inverse_idx: Inverse of ``sort_idx``, restoring the base layer's order;
+            ``None`` whenever ``sort_idx`` is.
         group_offsets: Inclusive cumsum of the ``n_adapters * num_local_experts``
             group sizes, in ``slot``-major order (group ``s * E + e``).
         slot_token_counts: Tokens per slot, for per-token alpha/rank scaling.
         num_tokens: Row count the routing was built for; guards against a base
             layer that pads its input (e.g. fp8 quantization padding).
+        active_slots: Adapter slots that can own rows, known on the host. ``None``
+            when rows may come from other ranks' micro-batches (expert parallelism).
     """
 
-    sort_idx: torch.Tensor
-    inverse_idx: torch.Tensor
+    sort_idx: Optional[torch.Tensor]
+    inverse_idx: Optional[torch.Tensor]
     group_offsets: torch.Tensor
     slot_token_counts: torch.Tensor
     num_tokens: int
+    active_slots: Optional[Tuple[int, ...]] = None
 
 
 class MultiLoRAGroupedExpertLinear(MultiLoRALinear):
@@ -584,6 +620,9 @@ class MultiLoRAGroupedExpertLinear(MultiLoRALinear):
         )
 
         self.tokens_per_adapter: Optional[torch.Tensor] = None
+        # Host split sizes, read by the slot-routing hook so it never reads
+        # tokens_per_adapter back from the device.
+        self.tokens_per_adapter_splits: Optional[Tuple[int, ...]] = None
         # Written by set_tokens_per_adapter_slot alongside tokens_per_adapter;
         # unused here (the slot-routing hook owns the expert-side SP narrow).
         self.tokens_per_adapter_total: Optional[int] = None
@@ -597,6 +636,7 @@ class MultiLoRAGroupedExpertLinear(MultiLoRALinear):
         self.register_buffer(
             "rank_values", torch.full((n_adapters,), dim, dtype=dtype, device=device), persistent=False
         )
+        self._unit_scaling: List[bool] = [False] * n_adapters
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         linear_output, bias, layernorm_output = self.base_linear_forward(x, *args, **kwargs)
@@ -640,16 +680,22 @@ class MultiLoRAGroupedExpertLinear(MultiLoRALinear):
         grouped_A = stacked_A.reshape(num_groups, *stacked_A.shape[2:])
         grouped_B = stacked_B.reshape(num_groups, *stacked_B.shape[2:])
 
-        x_sorted = x_flat.index_select(0, routing.sort_idx)
+        # ``sort_idx is None``: the rows already arrive in (slot, expert) order.
+        rows_sorted = routing.sort_idx is None
+        x_sorted = x_flat if rows_sorted else x_flat.index_select(0, routing.sort_idx)
         mid = torch._grouped_mm(x_sorted, grouped_A.transpose(-2, -1), routing.group_offsets)
         out = torch._grouped_mm(mid, grouped_B.transpose(-2, -1), routing.group_offsets)
 
         # Scaling is applied in sorted (slot-major) order, before unsorting.
         # Same dtype caveat as the dense layer: the ratio is rounded to the
         # activation dtype while sglang multiplies an exact fp32 ratio.
-        scaling = self.alpha_values / self.rank_values
-        out = out * torch.repeat_interleave(scaling, routing.slot_token_counts).unsqueeze(-1)
-        out = out.index_select(0, routing.inverse_idx)
+        if not self._scaling_is_identity(routing.active_slots, out.dtype):
+            scaling = self.alpha_values / self.rank_values
+            out = out * torch.repeat_interleave(
+                scaling, routing.slot_token_counts, output_size=routing.num_tokens
+            ).unsqueeze(-1)
+        if not rows_sorted:
+            out = out.index_select(0, routing.inverse_idx)
 
         return linear_output + out.reshape(linear_output.shape), bias
 
@@ -713,6 +759,11 @@ def _narrow_token_counts_to_window(counts: Sequence[int], start: int, num_rows: 
         narrowed.append(max(0, min(slot_end, end) - max(slot_start, start)))
         slot_start = slot_end
     return tuple(narrowed)
+
+
+def _active_slots(token_splits: Sequence[int]) -> Tuple[int, ...]:
+    """Adapter slots that own at least one token in ``token_splits``."""
+    return tuple(slot for slot, count in enumerate(token_splits) if count > 0)
 
 
 def _iter_multi_lora_modules(model):
@@ -822,6 +873,18 @@ def _co_permute_slot_ids(dispatcher, slot_ids: torch.Tensor, num_local_experts: 
     return slot_ids
 
 
+def _host_to_device(values: Sequence[int], dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """Copy host integers to ``device`` without making the host wait for the GPU.
+
+    A copy from pageable memory synchronizes the stream; staging it through pinned
+    memory lets it be enqueued like any other kernel.
+    """
+    host = torch.tensor(values, dtype=dtype)
+    if torch.device(device).type != "cuda":
+        return host.to(device)
+    return host.pin_memory().to(device, non_blocking=True)
+
+
 def _build_expert_slot_routing(
     dispatcher,
     tokens_per_expert: Union[torch.Tensor, Sequence[int]],
@@ -829,6 +892,7 @@ def _build_expert_slot_routing(
     n_adapters: int,
     num_local_experts: int,
     device: torch.device,
+    token_splits: Optional[Sequence[int]] = None,
 ) -> ExpertSlotRouting:
     """Derive the per-(slot, expert) segmentation of one MoE layer's dispatched tokens.
 
@@ -839,55 +903,112 @@ def _build_expert_slot_routing(
     on a single rank would hang its expert-parallel peers in that all-to-all
     rather than surfacing the error; every configuration-level requirement is
     therefore checked at layer construction instead, where failure is uniform.
+
+    Every size is taken from the host when it is known there (``token_splits``,
+    the host copy of ``tokens_per_adapter`` cached by
+    :func:`set_tokens_per_adapter_slot`, and a host ``tokens_per_expert``), so
+    building the routing does not stall the host on the GPU queue.
     """
-    slot_ids = torch.repeat_interleave(
-        torch.arange(n_adapters, device=device, dtype=torch.int32),
-        tokens_per_adapter.to(device=device),
-    )
+    if token_splits is None:
+        token_splits = tuple(int(count) for count in tokens_per_adapter.tolist())
+    total_tokens = sum(token_splits)
 
     # ``tokens_per_adapter`` counts the whole micro-batch, while a MoE layer's
     # input is sequence-parallel sharded. The shard is contiguous in the same
     # flattened order the dense layer's spans assume, so slicing by TP rank
     # recovers this rank's slot ids.
     local_tokens = int(dispatcher.hidden_shape_before_permute[0])
-    if slot_ids.shape[0] != local_tokens:
+    if total_tokens != local_tokens:
         tp_size = parallel_state.get_tensor_model_parallel_world_size()
-        if slot_ids.shape[0] != local_tokens * tp_size:
+        if total_tokens != local_tokens * tp_size:
             raise RuntimeError(
-                f"Cannot map {slot_ids.shape[0]} adapter-slot token ids onto {local_tokens} "
+                f"Cannot map {total_tokens} adapter-slot token ids onto {local_tokens} "
                 f"local MoE tokens with tensor_model_parallel_size={tp_size}. Check that "
                 f"set_tokens_per_adapter_slot() was given this micro-batch's token counts."
             )
+
+    if isinstance(tokens_per_expert, torch.Tensor):
+        per_expert_host = tokens_per_expert.tolist() if tokens_per_expert.device.type == "cpu" else None
+    else:
+        per_expert_host = [int(count) for count in tokens_per_expert]
+
+    # Without expert parallelism (expert TP is rejected at construction) every
+    # dispatched row comes from this rank's own micro-batch, so only the slots
+    # with tokens in it can own rows.
+    rows_are_local = getattr(dispatcher, "ep_size", 1) == 1 and getattr(dispatcher, "tp_size", 1) == 1
+    active_slots = _active_slots(token_splits) if rows_are_local else None
+
+    if (
+        active_slots is not None
+        and len(active_slots) == 1
+        and per_expert_host is not None
+        and len(per_expert_host) == num_local_experts
+    ):
+        # One slot owns every row, and the dispatcher hands rows over expert-major,
+        # which is already (slot, expert) order: the sort and both gathers are
+        # identities, and every group size is known on the host.
+        slot = active_slots[0]
+        num_tokens = sum(per_expert_host)
+        group_sizes = [0] * (n_adapters * num_local_experts)
+        group_sizes[slot * num_local_experts : (slot + 1) * num_local_experts] = per_expert_host
+        slot_token_counts = [0] * n_adapters
+        slot_token_counts[slot] = num_tokens
+        return ExpertSlotRouting(
+            sort_idx=None,
+            inverse_idx=None,
+            group_offsets=_host_to_device(list(itertools.accumulate(group_sizes)), torch.int32, device),
+            slot_token_counts=_host_to_device(slot_token_counts, torch.long, device),
+            num_tokens=num_tokens,
+            active_slots=active_slots,
+        )
+
+    slot_ids = torch.repeat_interleave(
+        torch.arange(n_adapters, device=device, dtype=torch.int32),
+        tokens_per_adapter.to(device=device),
+        output_size=total_tokens,
+    )
+    if total_tokens != local_tokens:
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
         slot_ids = slot_ids.narrow(0, tp_rank * local_tokens, local_tokens)
 
     slot_ids = _co_permute_slot_ids(dispatcher, slot_ids, num_local_experts)
+    num_tokens = int(slot_ids.shape[0])
 
-    if isinstance(tokens_per_expert, torch.Tensor):
-        per_expert = tokens_per_expert.to(device=device, dtype=torch.long)
+    expert_range = torch.arange(num_local_experts, device=device, dtype=torch.long)
+    if per_expert_host is not None:
+        if sum(per_expert_host) != num_tokens:
+            raise RuntimeError(
+                f"Dispatched token count mismatch: tokens_per_expert sums to {sum(per_expert_host)} "
+                f"but the co-permuted slot ids cover {num_tokens} tokens."
+            )
+        per_expert = _host_to_device(per_expert_host, torch.long, device)
+        expert_ids = torch.repeat_interleave(expert_range, per_expert, output_size=num_tokens)
     else:
-        per_expert = torch.tensor(list(tokens_per_expert), device=device, dtype=torch.long)
-    expert_ids = torch.repeat_interleave(torch.arange(num_local_experts, device=device, dtype=torch.long), per_expert)
-    if expert_ids.shape[0] != slot_ids.shape[0]:
-        raise RuntimeError(
-            f"Dispatched token count mismatch: tokens_per_expert sums to {expert_ids.shape[0]} "
-            f"but the co-permuted slot ids cover {slot_ids.shape[0]} tokens."
-        )
+        # Device-resident counts: checking their sum requires reading it back.
+        expert_ids = torch.repeat_interleave(expert_range, tokens_per_expert.to(device=device, dtype=torch.long))
+        if expert_ids.shape[0] != num_tokens:
+            raise RuntimeError(
+                f"Dispatched token count mismatch: tokens_per_expert sums to {expert_ids.shape[0]} "
+                f"but the co-permuted slot ids cover {num_tokens} tokens."
+            )
 
     # Slot-major key so a stable sort yields contiguous (slot, expert) groups
     # while preserving the dispatcher's expert order inside each slot.
     keys = slot_ids.long() * num_local_experts + expert_ids
     sort_idx = torch.argsort(keys, stable=True)
     inverse_idx = torch.empty_like(sort_idx)
-    inverse_idx.scatter_(0, sort_idx, torch.arange(sort_idx.shape[0], device=device))
+    inverse_idx.scatter_(0, sort_idx, torch.arange(num_tokens, device=device))
 
-    counts = torch.bincount(keys, minlength=n_adapters * num_local_experts)
+    # scatter_add_ instead of bincount: bincount reads max(keys) back to size its output.
+    counts = torch.zeros(n_adapters * num_local_experts, dtype=torch.long, device=device)
+    counts.scatter_add_(0, keys, torch.ones_like(keys))
     return ExpertSlotRouting(
         sort_idx=sort_idx,
         inverse_idx=inverse_idx,
         group_offsets=counts.cumsum(dim=0, dtype=torch.int32),
         slot_token_counts=counts.view(n_adapters, num_local_experts).sum(dim=1),
-        num_tokens=int(sort_idx.shape[0]),
+        num_tokens=num_tokens,
+        active_slots=active_slots,
     )
 
 
@@ -927,6 +1048,7 @@ def _make_slot_routing_hook(moe_layer: nn.Module, expert_layers: List[MultiLoRAG
             reference.n_adapters,
             reference.num_local_experts,
             hidden_states.device,
+            token_splits=reference.tokens_per_adapter_splits,
         )
         for layer in expert_layers:
             layer.expert_slot_routing = routing

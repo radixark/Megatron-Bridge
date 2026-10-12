@@ -23,6 +23,9 @@ CPU (fake token dispatcher, EP=1, no collectives):
   * the sequence-parallel narrow picks this rank's shard of the micro-batch
   * unsupported dispatch configurations raise instead of silently mis-routing
   * ``install_moe_slot_routing`` is idempotent and skips adapter-free MoE layers
+  * routing built from host-side sizes matches the reference tables; a single
+    adapter slot without EP needs no permutation, and the forward's fast paths
+    (no sort, no alpha == rank scaling) are bit-identical to the general path
 
 Single-GPU integration (needs CUDA + model-parallel init):
   * the grouped forward equals a per-(slot, expert) reference LoRA computation
@@ -253,6 +256,218 @@ def test_non_alltoall_dispatcher_raises():
 
     with pytest.raises(NotImplementedError, match="MoEAlltoAllTokenDispatcher"):
         _co_permute_slot_ids(_AllGatherLike(), torch.zeros(4, dtype=torch.int32), num_local_experts=1)
+
+
+# ======================================================================
+# CPU: routing built from host-side sizes
+# ======================================================================
+
+
+def _topk_dispatch(token_splits, *, num_experts=3, topk=2, seed=3, **dispatcher_kwargs):
+    """Dispatcher state for ``sum(token_splits)`` tokens each routed to ``topk`` experts."""
+    num_tokens = sum(token_splits)
+    generator = torch.Generator().manual_seed(seed)
+    choices = torch.stack([torch.randperm(num_experts, generator=generator)[:topk] for _ in range(num_tokens)])
+    expert_of_row = choices.reshape(-1)
+    token_of_row = torch.arange(num_tokens).repeat_interleave(topk)
+    order = torch.argsort(expert_of_row, stable=True)
+    tokens_per_expert = torch.bincount(expert_of_row, minlength=num_experts)
+    dispatcher = _FakeDispatcher(
+        token_of_row[order],
+        num_local_tokens=num_tokens,
+        num_local_experts=num_experts,
+        tokens_per_expert=tokens_per_expert,
+        **dispatcher_kwargs,
+    )
+    return dispatcher, tokens_per_expert
+
+
+def _reference_tables(dispatcher, tokens_per_expert, token_splits, num_experts):
+    """The (sort_idx, group_offsets, slot_token_counts) the general path computes."""
+    slot_ids = torch.repeat_interleave(
+        torch.arange(len(token_splits), dtype=torch.int32), torch.tensor(token_splits)
+    ).index_select(0, dispatcher.reversed_local_input_permutation_mapping)
+    expert_ids = torch.repeat_interleave(torch.arange(num_experts), tokens_per_expert)
+    order, counts = _reference_routing(slot_ids.tolist(), expert_ids.tolist(), len(token_splits), num_experts)
+    counts = torch.tensor(counts)
+    return (
+        torch.tensor(order),
+        counts.cumsum(dim=0, dtype=torch.int32),
+        counts.view(len(token_splits), num_experts).sum(dim=1),
+    )
+
+
+@pytest.mark.parametrize("token_splits", [(0, 9, 0, 0), (9, 0, 0, 0), (0, 0, 0, 9), (4, 0, 3, 2)])
+@pytest.mark.parametrize("host_counts_as_list", [False, True])
+def test_routing_from_host_sizes_matches_reference(token_splits, host_counts_as_list):
+    dispatcher, tokens_per_expert = _topk_dispatch(token_splits)
+    sort_idx, group_offsets, slot_token_counts = _reference_tables(dispatcher, tokens_per_expert, token_splits, 3)
+
+    routing = _build_expert_slot_routing(
+        dispatcher,
+        tokens_per_expert.tolist() if host_counts_as_list else tokens_per_expert,
+        torch.tensor(token_splits, dtype=torch.int32),
+        n_adapters=4,
+        num_local_experts=3,
+        device=torch.device("cpu"),
+        token_splits=token_splits,
+    )
+
+    active_slots = tuple(slot for slot, count in enumerate(token_splits) if count)
+    assert routing.active_slots == active_slots
+    assert routing.num_tokens == sort_idx.numel()
+    assert torch.equal(routing.group_offsets, group_offsets)
+    assert routing.group_offsets.dtype == torch.int32
+    assert torch.equal(routing.slot_token_counts, slot_token_counts)
+    assert routing.slot_token_counts.dtype == slot_token_counts.dtype
+    if len(active_slots) == 1:
+        # Rows already arrive in (slot, expert) order, so no permutation is built.
+        assert torch.equal(sort_idx, torch.arange(sort_idx.numel()))
+        assert routing.sort_idx is None and routing.inverse_idx is None
+    else:
+        assert torch.equal(routing.sort_idx, sort_idx)
+        assert torch.equal(routing.inverse_idx[sort_idx], torch.arange(sort_idx.numel()))
+
+
+def test_routing_without_host_splits_matches_routing_with_them():
+    dispatcher, tokens_per_expert = _topk_dispatch((4, 0, 3, 2))
+    tokens_per_adapter = torch.tensor((4, 0, 3, 2), dtype=torch.int32)
+    kwargs = dict(n_adapters=4, num_local_experts=3, device=torch.device("cpu"))
+
+    with_splits = _build_expert_slot_routing(
+        dispatcher, tokens_per_expert, tokens_per_adapter, token_splits=(4, 0, 3, 2), **kwargs
+    )
+    without_splits = _build_expert_slot_routing(dispatcher, tokens_per_expert, tokens_per_adapter, **kwargs)
+
+    for field in ("sort_idx", "inverse_idx", "group_offsets", "slot_token_counts"):
+        assert torch.equal(getattr(with_splits, field), getattr(without_splits, field))
+    assert with_splits.num_tokens == without_splits.num_tokens
+    assert with_splits.active_slots == without_splits.active_slots
+
+
+def test_expert_parallel_routing_keeps_the_general_path():
+    """With EP, rows come from other ranks' micro-batches, so the local slots say nothing."""
+    dispatcher, tokens_per_expert = _topk_dispatch((0, 9, 0, 0), ep_size=2)
+    dispatcher.ep_group = None
+    dispatcher.input_splits = dispatcher.output_splits = None
+
+    with patch("megatron.bridge.peft.multi_lora_layers.all_to_all", side_effect=lambda group, tensor, *splits: tensor):
+        routing = _build_expert_slot_routing(
+            dispatcher,
+            tokens_per_expert,
+            torch.tensor((0, 9, 0, 0), dtype=torch.int32),
+            n_adapters=4,
+            num_local_experts=3,
+            device=torch.device("cpu"),
+            token_splits=(0, 9, 0, 0),
+        )
+
+    assert routing.active_slots is None
+    assert routing.sort_idx is not None and routing.inverse_idx is not None
+
+
+def _reference_grouped_mm(x, weights, offsets):
+    """CPU stand-in for ``torch._grouped_mm`` (slot-major groups delimited by ``offsets``)."""
+    ends = offsets.tolist()
+    starts = [0] + ends[:-1]
+    return torch.cat([x[start:end] @ weight for start, end, weight in zip(starts, ends, weights)])
+
+
+class _ZeroBase(nn.Module):
+    def __init__(self, out_features: int) -> None:
+        super().__init__()
+        self.out_features = out_features
+
+    def forward(self, x, *args):
+        return x.new_zeros(x.shape[0], self.out_features)
+
+
+def _bare_expert_layer(alphas, *, num_experts=3, hidden=16, out_features=12, rank=4):
+    """A ``MultiLoRAGroupedExpertLinear`` with plain CPU weights (its ``__init__`` needs TE)."""
+    layer = MultiLoRAGroupedExpertLinear.__new__(MultiLoRAGroupedExpertLinear)
+    nn.Module.__init__(layer)
+    layer.to_wrap = _ZeroBase(out_features)
+    layer._adapter_enabled = True
+    layer.base_linear_name = "decoder.layers.0.mlp.experts.linear_fc1"
+    layer.n_adapters = len(alphas)
+    layer.max_rank = rank
+    generator = torch.Generator().manual_seed(0)
+    layer.adapters = nn.ModuleList()
+    for _ in alphas:
+        adapter = nn.Module()
+        adapter.linear_in, adapter.linear_out = nn.Module(), nn.Module()
+        adapter.linear_in.weight = nn.Parameter(torch.randn(num_experts, rank, hidden, generator=generator))
+        adapter.linear_out.weight = nn.Parameter(torch.randn(num_experts, out_features, rank, generator=generator))
+        layer.adapters.append(adapter)
+    layer.register_buffer("alpha_values", torch.ones(len(alphas)), persistent=False)
+    layer.register_buffer("rank_values", torch.full((len(alphas),), float(rank)), persistent=False)
+    layer._unit_scaling = [False] * len(alphas)
+    for slot, alpha in enumerate(alphas):
+        layer.init_adapter_slot(slot, rank, alpha)
+    return layer
+
+
+@pytest.mark.parametrize(
+    ("token_splits", "alphas"),
+    [
+        ((0, 9, 0, 0), (4.0, 4.0, 1.0, 4.0)),
+        ((0, 9, 0, 0), (4.0, 2.0, 4.0, 4.0)),
+        ((4, 0, 3, 2), (4.0, 4.0, 4.0, 4.0)),
+        ((4, 0, 3, 2), (4.0, 1.0, 8.0, 2.0)),
+    ],
+)
+def test_expert_forward_fast_paths_match_general_path(token_splits, alphas):
+    """Skipping the sort and the alpha == rank scaling is bit-identical, gradients included."""
+    from dataclasses import replace
+
+    dispatcher, tokens_per_expert = _topk_dispatch(token_splits)
+    routing = _build_expert_slot_routing(
+        dispatcher,
+        tokens_per_expert,
+        torch.tensor(token_splits, dtype=torch.int32),
+        n_adapters=4,
+        num_local_experts=3,
+        device=torch.device("cpu"),
+        token_splits=token_splits,
+    )
+    identity = torch.arange(routing.num_tokens)
+    general = replace(
+        routing,
+        sort_idx=identity if routing.sort_idx is None else routing.sort_idx,
+        inverse_idx=identity if routing.inverse_idx is None else routing.inverse_idx,
+        active_slots=None,
+    )
+    layer = _bare_expert_layer(alphas)
+    generator = torch.Generator().manual_seed(1)
+    x = torch.randn(routing.num_tokens, 16, generator=generator, requires_grad=True)
+    grad_out = torch.randn(routing.num_tokens, 12, generator=generator)
+    params = [x, *layer.adapters.parameters()]
+
+    results = []
+    with patch.object(torch, "_grouped_mm", side_effect=_reference_grouped_mm):
+        for expert_slot_routing in (routing, general):
+            layer.expert_slot_routing = expert_slot_routing
+            out, _ = layer(x, tokens_per_expert.tolist())
+            results.append((out, torch.autograd.grad(out, params, grad_out)))
+
+    (out, grads), (expected, expected_grads) = results
+    assert torch.equal(out, expected)
+    for grad, expected_grad in zip(grads, expected_grads, strict=True):
+        assert torch.equal(grad, expected_grad)
+
+
+def test_host_token_count_mismatch_raises():
+    dispatcher, tokens_per_expert = _topk_dispatch((4, 0, 3, 2))
+    with pytest.raises(RuntimeError, match="Dispatched token count mismatch"):
+        _build_expert_slot_routing(
+            dispatcher,
+            (tokens_per_expert + 1).tolist(),
+            torch.tensor((4, 0, 3, 2), dtype=torch.int32),
+            n_adapters=4,
+            num_local_experts=3,
+            device=torch.device("cpu"),
+            token_splits=(4, 0, 3, 2),
+        )
 
 
 # ======================================================================

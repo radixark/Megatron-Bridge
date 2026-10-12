@@ -31,6 +31,8 @@ Mock-level (no distributed):
     silently; grouped MoE expert linears are wrapped with the grouped-expert layer
   * B9: load_adapter raises on a checkpoint/model mismatch in either direction
     (params missing from the checkpoint, or checkpoint tensors no param consumed)
+  * forward fast paths (single-slot GEMM, alpha == rank scaling skip) are
+    bit-identical to the general path, outputs and gradients
 
 Single-GPU integration (needs CUDA + model-parallel init):
   * grouped-GEMM forward smoke: output shape / finiteness / dtype (no fp32 promotion)
@@ -253,6 +255,38 @@ def test_dense_multi_lora_mm_fallback_preserves_mixed_empty_slot_gradients() -> 
     assert torch.count_nonzero(weights.grad[0]) > 0
     assert torch.count_nonzero(weights.grad[1]) == 0
     assert torch.count_nonzero(weights.grad[2]) > 0
+
+
+def _per_slot_mm(x, stacked_weights, *, token_splits, offsets):
+    """The per-slot fallback of ``_dense_multi_lora_mm``, run for every slot."""
+    inputs = x.split(token_splits, dim=0)
+    return torch.cat([F.linear(slot_input, weight) for slot_input, weight in zip(inputs, stacked_weights)])
+
+
+def test_dense_multi_lora_mm_single_slot_matches_per_slot_path() -> None:
+    """One slot with tokens runs a single GEMM that matches the per-slot path bit for bit."""
+    generator = torch.Generator().manual_seed(0)
+    x = torch.randn(5, 8, generator=generator, requires_grad=True)
+    weights = torch.randn(3, 6, 8, generator=generator, requires_grad=True)
+    token_splits = (0, 5, 0)
+    offsets = torch.tensor(token_splits, dtype=torch.int32).cumsum(dim=0)
+
+    with (
+        patch.object(torch, "_grouped_mm", side_effect=AssertionError("grouped MM must not run")),
+        patch.object(torch, "cat", side_effect=AssertionError("single slot must not concatenate")),
+    ):
+        actual = multi_lora_layers_module._dense_multi_lora_mm(x, weights, token_splits=token_splits, offsets=offsets)
+    expected = _per_slot_mm(x, weights, token_splits=token_splits, offsets=offsets)
+
+    assert torch.equal(actual, expected)
+    grad = torch.randn(expected.shape, generator=generator)
+    actual_grads = torch.autograd.grad(actual, (x, weights), grad)
+    expected_grads = torch.autograd.grad(expected, (x, weights), grad)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+        assert torch.equal(actual_grad, expected_grad)
+    # Every slot stays in the graph: the idle slots get an all-zero gradient.
+    assert torch.count_nonzero(actual_grads[1][0]) == 0
+    assert torch.count_nonzero(actual_grads[1][2]) == 0
 
 
 @pytest.mark.skipif(
@@ -526,6 +560,111 @@ class TestMultiLoRALinearSlots:
             entry = sharded_sd[f"decoder.layers.0.linear_proj.adapters.{i}.linear_out.weight"]
             assert entry[0] == "sharded"
             assert entry[1] is layer.adapters[i].linear_out.weight
+
+
+# ======================================================================
+# MultiLoRALinear: forward fast paths match the general path exactly
+# ======================================================================
+
+
+class TestMultiLoRALinearForwardFastPaths:
+    """Single-slot GEMM and alpha == rank scaling skip are bit-identical to the general path."""
+
+    RANK = 4
+
+    @pytest.fixture(autouse=True)
+    def _patch_adapter_deps(self):
+        with (
+            adapter_deps_patch(),
+            patch.object(
+                multi_lora_layers_module, "gather_from_tensor_model_parallel_region", side_effect=lambda t: t
+            ),
+        ):
+            yield
+
+    def _build(self, token_splits, alphas) -> MultiLoRALinear:
+        layer = _build_multi_lora_linear(in_features=16, out_features=12, n_adapters=len(token_splits), dim=self.RANK)
+        generator = torch.Generator().manual_seed(0)
+        with torch.no_grad():
+            for adapter in layer.adapters:
+                adapter.linear_in.weight.copy_(torch.randn(adapter.linear_in.weight.shape, generator=generator))
+                adapter.linear_out.weight.copy_(torch.randn(adapter.linear_out.weight.shape, generator=generator))
+        for slot, alpha in enumerate(alphas):
+            layer.init_adapter_slot(slot, rank=self.RANK, alpha=alpha)
+        set_tokens_per_adapter_slot([layer], torch.tensor(token_splits, dtype=torch.int32))
+        return layer
+
+    @staticmethod
+    def _forward_and_grads(layer, x, grad_out):
+        out, _ = layer(x)
+        params = [x] + [p for adapter in layer.adapters for p in adapter.parameters()]
+        return out, torch.autograd.grad(out, params, grad_out)
+
+    @pytest.mark.parametrize(
+        ("token_splits", "alphas"),
+        [
+            ((0, 7, 0, 0), (4.0, 4.0, 1.0, 4.0)),  # one slot, alpha == rank
+            ((0, 7, 0, 0), (4.0, 2.0, 4.0, 4.0)),  # one slot, alpha != rank
+            ((3, 0, 5, 1), (4.0, 4.0, 4.0, 4.0)),  # several slots, alpha == rank
+            ((3, 0, 5, 1), (4.0, 1.0, 8.0, 2.0)),  # several slots, mixed ratios
+        ],
+    )
+    def test_forward_and_gradients_match_general_path(self, token_splits, alphas) -> None:
+        layer = self._build(token_splits, alphas)
+        generator = torch.Generator().manual_seed(1)
+        x = torch.randn(sum(token_splits), 16, generator=generator, requires_grad=True)
+        grad_out = torch.randn(sum(token_splits), 12, generator=generator)
+
+        out, grads = self._forward_and_grads(layer, x, grad_out)
+        # The general path: per-slot GEMMs for every slot and the scaling multiply always applied.
+        with (
+            patch.object(multi_lora_layers_module, "_dense_multi_lora_mm", side_effect=_per_slot_mm),
+            patch.object(MultiLoRALinear, "_scaling_is_identity", return_value=False),
+        ):
+            expected, expected_grads = self._forward_and_grads(layer, x, grad_out)
+
+        assert torch.equal(out, expected)
+        for grad, expected_grad in zip(grads, expected_grads, strict=True):
+            assert torch.equal(grad, expected_grad)
+
+    @pytest.mark.parametrize(("alphas", "scaled"), [((4.0, 4.0), False), ((4.0, 8.0), True)])
+    def test_scaling_uses_host_output_size_and_is_skipped_at_unit_ratio(self, alphas, scaled) -> None:
+        layer = self._build((2, 3), alphas)
+        calls = []
+        real_repeat_interleave = torch.repeat_interleave
+
+        def recording_repeat_interleave(*args, **kwargs):
+            calls.append(kwargs)
+            return real_repeat_interleave(*args, **kwargs)
+
+        with patch.object(torch, "repeat_interleave", side_effect=recording_repeat_interleave):
+            layer(torch.randn(5, 16))
+
+        assert calls == ([{"output_size": 5}] if scaled else [])
+
+    def test_unit_scaling_follows_slot_lifecycle(self) -> None:
+        layer = _build_multi_lora_linear(n_adapters=3, dim=8)
+        assert layer._unit_scaling == [False, False, False]
+
+        layer.init_adapter_slot(0, rank=8, alpha=8)
+        layer.init_adapter_slot(1, rank=4, alpha=16)
+        assert layer._unit_scaling == [True, False, False]
+        assert layer._scaling_is_identity((0,), torch.float32)
+        assert not layer._scaling_is_identity((0, 1), torch.float32)
+        assert not layer._scaling_is_identity(None, torch.float32)
+        # A multiply by a wider-dtype ratio would promote the output, so it is not skipped.
+        assert not layer._scaling_is_identity((0,), torch.bfloat16)
+
+        layer.clear_adapter_slot(0)
+        assert layer._unit_scaling == [False, False, False]
+
+    def test_unit_scaling_is_evaluated_in_the_buffer_dtype(self) -> None:
+        layer = _build_multi_lora_linear(n_adapters=1, dim=256)
+        layer.to(torch.bfloat16)
+        # 257 is not representable in bf16 and rounds to 256, so the applied ratio is exactly 1.
+        layer.init_adapter_slot(0, rank=256, alpha=257)
+        assert (layer.alpha_values[0] / layer.rank_values[0]).item() == 1.0
+        assert layer._unit_scaling == [True]
 
 
 # ======================================================================
