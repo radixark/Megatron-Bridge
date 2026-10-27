@@ -2334,7 +2334,18 @@ def test_merge_grouped_export_adapter_weights_uses_global_expert_idx(monkeypatch
     torch.testing.assert_close(updated["hf.experts.down_proj"], torch.tensor([[1.0]]))
 
 
-def test_merge_grouped_export_adapter_weights_raises_for_canonical_adapters():
+def _expert_fc1_adapter_weight(adapter_key, linear_in, linear_out):
+    return AdapterWeight(
+        global_base_prefix="decoder.layers.0.mlp.experts.linear_fc1",
+        adapter_key=adapter_key,
+        alpha=1,
+        dim=1,
+        linear_in_weight=MegatronWeightTuple("in", linear_in, vp_stage=0),
+        linear_out_weight=MegatronWeightTuple("out", linear_out, vp_stage=0),
+    )
+
+
+def test_merge_grouped_export_adapter_weights_raises_for_unsupported_adapter_keys():
     bridge = DummyBridge()
 
     task = WeightConversionTask(
@@ -2343,14 +2354,7 @@ def test_merge_grouped_export_adapter_weights_raises_for_canonical_adapters():
         mapping=Mock(),
     )
     converted = {"hf.experts.gate_up_proj": torch.zeros(2, 2)}
-    adapter_weight = AdapterWeight(
-        global_base_prefix="decoder.layers.0.mlp.experts.linear_fc1",
-        adapter_key="adapter_gate",
-        alpha=1,
-        dim=1,
-        linear_in_weight=MegatronWeightTuple("in", torch.eye(2), vp_stage=0),
-        linear_out_weight=MegatronWeightTuple("out", torch.eye(2), vp_stage=0),
-    )
+    adapter_weight = _expert_fc1_adapter_weight("adapter_q", torch.eye(2), torch.eye(2))
 
     with pytest.raises(ValueError, match="Unsupported adapter configuration for grouped export weight merging"):
         bridge._merge_grouped_export_adapter_weights(
@@ -2359,6 +2363,39 @@ def test_merge_grouped_export_adapter_weights_raises_for_canonical_adapters():
             [adapter_weight],
             num_moe_experts=1,
         )
+
+
+def test_merge_grouped_export_adapter_weights_merges_independent_gate_up(monkeypatch):
+    """Canonical gate/up factors each merge into their half of the packed [gate; up] expert weight."""
+    bridge = DummyBridge()
+
+    task = WeightConversionTask(
+        param_name="decoder.layers.0.mlp.experts.linear_fc1.to_wrap.weight0",
+        global_param_name="decoder.layers.0.mlp.experts.linear_fc1.to_wrap.weight0",
+        mapping=Mock(),
+    )
+    monkeypatch.setattr(DummyBridge, "_gather_expert_adapter_weight", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        DummyBridge,
+        "_select_expert_adapter_weight",
+        lambda self, weight, gathered, expert_idx, num_moe_experts: weight,
+    )
+    gate_in, gate_out = torch.tensor([[1.0, 2.0, 3.0]]), torch.tensor([[1.0], [2.0]])
+    up_in, up_out = torch.tensor([[4.0, 5.0, 6.0]]), torch.tensor([[3.0], [4.0]])
+    converted = {"hf.experts.gate_up_proj": torch.zeros(4, 3)}
+
+    updated = bridge._merge_grouped_export_adapter_weights(
+        task,
+        converted,
+        [
+            _expert_fc1_adapter_weight("adapter_gate", gate_in, gate_out),
+            _expert_fc1_adapter_weight("adapter_up", up_in, up_out),
+        ],
+        num_moe_experts=1,
+    )
+
+    expected = torch.cat([gate_out @ gate_in, up_out @ up_in])
+    torch.testing.assert_close(updated["hf.experts.gate_up_proj"], expected)
 
 
 def test_stream_weights_megatron_to_hf_merges_shared_expert_fc1_adapters(monkeypatch):

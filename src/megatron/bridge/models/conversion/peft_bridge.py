@@ -1492,47 +1492,56 @@ class MegatronPeftBridge:
         if not converted_weights_dict or not adapter_weights:
             return converted_weights_dict
 
-        if len(adapter_weights) != 1 or adapter_weights[0].adapter_key is not None:
-            adapter_keys = [adapter_weight.adapter_key for adapter_weight in adapter_weights]
+        adapter_keys = [adapter_weight.adapter_key for adapter_weight in adapter_weights]
+        if adapter_keys != [None] and not (
+            len(set(adapter_keys)) == len(adapter_keys) and set(adapter_keys) <= {"adapter_gate", "adapter_up"}
+        ):
             raise ValueError(
                 "Unsupported adapter configuration for grouped export weight merging "
-                f"for parameter '{task.global_param_name}': expected exactly one "
-                "non-canonical adapter with adapter_key=None, but got "
-                f"{len(adapter_weights)} adapter(s) with adapter keys {adapter_keys}."
+                f"for parameter '{task.global_param_name}': expected one non-canonical adapter with "
+                f"adapter_key=None or independent gate/up adapters, but got adapter keys {adapter_keys}."
             )
 
         from megatron.bridge.utils.common_utils import extract_expert_number_from_param
 
         expert_idx = extract_expert_number_from_param(task.global_param_name)
 
-        adapter_weight = adapter_weights[0]
-        linear_in_weight = adapter_weight.linear_in_weight.weight
-        linear_out_weight = adapter_weight.linear_out_weight.weight
-
-        expert_linear_in_gathered = self._gather_expert_adapter_weight(linear_in_weight)
-        expert_linear_out_gathered = self._gather_expert_adapter_weight(linear_out_weight)
-
-        current_linear_in_weight = self._select_expert_adapter_weight(
-            linear_in_weight,
-            expert_linear_in_gathered,
-            expert_idx,
-            num_moe_experts,
-        )
-        current_linear_out_weight = self._select_expert_adapter_weight(
-            linear_out_weight,
-            expert_linear_out_gathered,
-            expert_idx,
-            num_moe_experts,
-        )
-
-        for hf_name, base_weight in list(converted_weights_dict.items()):
-            converted_weights_dict[hf_name] = self._merge_single_adapter_weight(
-                base_weight,
-                adapter_weight.alpha,
-                adapter_weight.dim,
-                current_linear_in_weight,
-                current_linear_out_weight,
+        for adapter_weight in adapter_weights:
+            linear_in_weight = adapter_weight.linear_in_weight.weight
+            linear_out_weight = adapter_weight.linear_out_weight.weight
+            current_linear_in_weight = self._select_expert_adapter_weight(
+                linear_in_weight,
+                self._gather_expert_adapter_weight(linear_in_weight),
+                expert_idx,
+                num_moe_experts,
             )
+            current_linear_out_weight = self._select_expert_adapter_weight(
+                linear_out_weight,
+                self._gather_expert_adapter_weight(linear_out_weight),
+                expert_idx,
+                num_moe_experts,
+            )
+
+            def merge(base_weight: torch.Tensor) -> torch.Tensor:
+                return self._merge_single_adapter_weight(
+                    base_weight,
+                    adapter_weight.alpha,
+                    adapter_weight.dim,
+                    current_linear_in_weight,
+                    current_linear_out_weight,
+                )
+
+            for hf_name, base_weight in list(converted_weights_dict.items()):
+                if adapter_weight.adapter_key is None:
+                    converted_weights_dict[hf_name] = merge(base_weight)
+                    continue
+                # FusedGatedExpertMapping packs each expert as [gate; up] along the output dim
+                gate, up = base_weight.chunk(2, dim=-2)
+                if adapter_weight.adapter_key == "adapter_gate":
+                    gate = merge(gate)
+                else:
+                    up = merge(up)
+                converted_weights_dict[hf_name] = torch.cat([gate, up], dim=-2)
 
         return converted_weights_dict
 
