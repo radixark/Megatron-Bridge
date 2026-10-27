@@ -258,6 +258,12 @@ def test_combine_projections_matches_hf_qkv_merge(heads, groups, gated) -> None:
     torch.testing.assert_close(actual, expected)
 
 
+def test_projection_sizes_rejects_kv_heads_split_across_tp() -> None:
+    config = SimpleNamespace(num_query_groups=1, kv_channels=8, tensor_model_parallel_size=2)
+    with pytest.raises(AssertionError, match="num_query_groups"):
+        multi_lora_layers_module._projection_sizes(SimpleNamespace(config=config), 32, {"linear_q", "linear_k"})
+
+
 def test_dense_multi_lora_mm_fallback_handles_empty_slots() -> None:
     x = torch.empty(0, 8, requires_grad=True)
     weights = torch.randn(2, 6, 8, requires_grad=True)

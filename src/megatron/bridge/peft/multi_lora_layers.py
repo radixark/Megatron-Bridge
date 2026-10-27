@@ -129,6 +129,11 @@ def _projection_sizes(to_wrap, out_features, targets):
         return {}
     if targets <= {"linear_q", "linear_k", "linear_v"}:
         config = to_wrap.config
+        # TODO: support by gathering the packed QKV shards before splitting heads, as Megatron's attention does
+        assert config.num_query_groups >= config.tensor_model_parallel_size, (
+            f"Independent Q/K/V adapters require num_query_groups ({config.num_query_groups}) >= "
+            f"tensor_model_parallel_size ({config.tensor_model_parallel_size}): each TP shard must hold whole KV heads"
+        )
         kv_size = config.kv_channels * config.num_query_groups
         # Qwen3.5's query projection includes its output gate.
         return {"adapter_q": out_features - 2 * kv_size, "adapter_k": kv_size, "adapter_v": kv_size}
