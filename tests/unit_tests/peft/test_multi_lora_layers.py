@@ -48,6 +48,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from megatron.bridge.models.conversion.param_mapping import merge_qkv_weights
 from megatron.bridge.models.conversion.peft_bridge import MegatronPeftBridge
 from megatron.bridge.peft import multi_lora as multi_lora_mod
 from megatron.bridge.peft import multi_lora_layers as multi_lora_layers_module
@@ -145,8 +146,14 @@ def _build_multi_lora_linear(
 def adapter_deps_patch() -> ExitStack:
     """Patch the layer module's adapter construction dependencies for CPU use."""
     stack = ExitStack()
-    stack.enter_context(patch.object(multi_lora_layers_module, "copy_to_tensor_model_parallel_region", side_effect=lambda x: x))
-    stack.enter_context(patch.object(multi_lora_layers_module, "gather_from_sequence_parallel_region", side_effect=lambda x, **kwargs: x))
+    stack.enter_context(
+        patch.object(multi_lora_layers_module, "copy_to_tensor_model_parallel_region", side_effect=lambda x: x)
+    )
+    stack.enter_context(
+        patch.object(
+            multi_lora_layers_module, "gather_from_sequence_parallel_region", side_effect=lambda x, **kwargs: x
+        )
+    )
     stack.enter_context(patch.object(multi_lora_layers_module, "ParallelLinearAdapter", _FakeParallelLinearAdapter))
     stack.enter_context(patch.object(multi_lora_layers_module, "get_adapter_attributes_from_linear", _fake_get_attrs))
     # ``reset_adapter`` re-inits through the model-parallel RNG tracker, which
@@ -221,6 +228,40 @@ def test_dense_multi_lora_mm_preserves_eligible_grouped_mm_path() -> None:
     torch.testing.assert_close(grouped_args[1], weights.transpose(-2, -1))
     assert grouped_args[2] is offsets
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("heads,groups,gated", [(4, 2, True), (4, 2, False), (2, 2, True)])
+def test_combine_projections_matches_hf_qkv_merge(heads, groups, gated) -> None:
+    """Canonical Q/K/V outputs land where the checkpoint conversion puts the HF projections."""
+    head_size, hidden = 2, 6
+    config = SimpleNamespace(
+        num_attention_heads=heads,
+        num_query_groups=groups,
+        kv_channels=head_size,
+        hidden_size=hidden,
+        attention_output_gate=gated,
+        tensor_model_parallel_size=1,
+    )
+    to_wrap = SimpleNamespace(config=config)
+    q_size = heads * head_size * (2 if gated else 1)
+    sizes = multi_lora_layers_module._projection_sizes(
+        to_wrap, q_size + 2 * groups * head_size, {"linear_q", "linear_k", "linear_v"}
+    )
+    weights = {key: torch.randn(size, hidden) for key, size in sizes.items()}
+    x = torch.randn(3, hidden)
+    expected = F.linear(x, merge_qkv_weights(config, *weights.values()))
+
+    actual = multi_lora_layers_module._combine_projections(
+        {key: F.linear(x, weight) for key, weight in weights.items()}, sizes, to_wrap, expected
+    )
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_projection_sizes_rejects_kv_heads_split_across_tp() -> None:
+    config = SimpleNamespace(num_query_groups=1, kv_channels=8, tensor_model_parallel_size=2)
+    with pytest.raises(AssertionError, match="num_query_groups"):
+        multi_lora_layers_module._projection_sizes(SimpleNamespace(config=config), 32, {"linear_q", "linear_k"})
 
 
 def test_dense_multi_lora_mm_fallback_handles_empty_slots() -> None:
@@ -343,7 +384,7 @@ class TestMultiLoRALinearSlots:
     def test_constructor_forwards_wrapped_module_runtime_config(self) -> None:
         """Adapter construction mirrors the single-LoRA path (LoRA.transform)."""
         base = nn.Linear(16, 32)
-        base.config = object()
+        base.config = SimpleNamespace(sequence_parallel=False)
 
         layer = MultiLoRALinear(to_wrap=base, n_adapters=2, dim=8, alpha=16, full_name="linear_proj")
 
