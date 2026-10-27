@@ -51,7 +51,7 @@ from megatron.core.tensor_parallel.mappings import (
 from megatron.core.transformer.moe.moe_utils import sort_chunks_by_idxs
 
 from megatron.bridge.peft.adapter_wrapper import AdapterWrapper
-from megatron.bridge.peft.canonical_lora import ModuleDict
+from megatron.bridge.peft.canonical_lora import ModuleDict, interleave_qkv
 from megatron.bridge.peft.utils import (
     GroupedExpertLinearAdapter,
     ParallelLinearAdapter,
@@ -142,10 +142,20 @@ def _projection_sizes(to_wrap, out_features, targets):
     return {"adapter_gate": out_features // 2, "adapter_up": out_features // 2}
 
 
+# canonical projection target -> its adapter key within a slot
+PROJECTION_ADAPTER_KEYS = {
+    "linear_q": "adapter_q",
+    "linear_k": "adapter_k",
+    "linear_v": "adapter_v",
+    "linear_fc1_gate": "adapter_gate",
+    "linear_fc1_up": "adapter_up",
+}
+
+
 def _make_slot_adapter(factory, full_name, out_features, sizes, targets):
     if not sizes:
         return factory(out_features=out_features, base_linear_name=full_name)
-    selected = {target.replace("linear_fc1_", "adapter_").replace("linear_", "adapter_") for target in targets}
+    selected = {PROJECTION_ADAPTER_KEYS[target] for target in targets}
     return ModuleDict(
         {
             key: factory(out_features=size, base_linear_name=f"{full_name.rsplit('.', 1)[0]}.{key}")
@@ -155,22 +165,23 @@ def _make_slot_adapter(factory, full_name, out_features, sizes, targets):
     )
 
 
-def _combine_projections(outputs, sizes, to_wrap, reference):
-    # Infer local widths from the base output, including the expert ETP=1 layout.
-    shard_count = sum(sizes.values()) // reference.shape[-1]
-    parts = [
-        outputs[key] if key in outputs else reference.new_zeros(*reference.shape[:-1], size // shard_count)
+def _combine_projections(outputs, sizes, shards, to_wrap, reference):
+    """Pack this rank's projection outputs into the base output layout; untargeted projections add zeros."""
+    parts = {
+        key: outputs[key] if key in outputs else reference.new_zeros(*reference.shape[:-1], size // shards)
         for key, size in sizes.items()
-    ]
-    if "adapter_q" in sizes:
-        head_size = to_wrap.config.kv_channels
-        groups = parts[1].shape[-1] // head_size
-        parts = [part.reshape(*part.shape[:-1], groups, -1) for part in parts]
-        if to_wrap.config.attention_output_gate:
-            # HF interleaves query and gate per head; Megatron packs a group's query heads before its gate heads.
-            parts[0] = parts[0].unflatten(-1, (-1, 2, head_size)).transpose(-3, -2).flatten(-3)
-        return torch.cat(parts, dim=-1).flatten(-2)
-    return torch.cat(parts, dim=-1)
+    }
+    if "adapter_q" in parts:
+        config = to_wrap.config
+        return interleave_qkv(
+            parts["adapter_q"],
+            parts["adapter_k"],
+            parts["adapter_v"],
+            num_query_groups=config.num_query_groups // shards,
+            head_size=config.kv_channels,
+            output_gate=config.attention_output_gate,
+        )
+    return torch.cat(list(parts.values()), dim=-1)
 
 
 class MultiLoRALinear(AdapterWrapper):
@@ -249,6 +260,11 @@ class MultiLoRALinear(AdapterWrapper):
         # isolation, clean checkpoint serialization, and bridge export compatibility.
         # Adapter kwargs mirror the single-LoRA path (LoRA.transform).
         self._projection_sizes = _projection_sizes(to_wrap, attrs.out_features, projection_targets)
+        self._projection_shards = (
+            to_wrap.config.tensor_model_parallel_size
+            if self._projection_sizes and attrs.base_linear_is_parallel
+            else 1
+        )
         factory = partial(
             ParallelLinearAdapter,
             in_features=attrs.in_features,
@@ -344,7 +360,11 @@ class MultiLoRALinear(AdapterWrapper):
                 for key in self.adapters[0]
             }
             out = _combine_projections(
-                outputs, self._projection_sizes, self.to_wrap, linear_output.reshape(-1, linear_output.shape[-1])
+                outputs,
+                self._projection_sizes,
+                self._projection_shards,
+                self.to_wrap,
+                linear_output.reshape(-1, linear_output.shape[-1]),
             )
         else:
             out = self._adapter_forward(x_flat, self.adapters, token_splits, offsets)
@@ -645,6 +665,7 @@ class MultiLoRAGroupedExpertLinear(MultiLoRALinear):
         first_param = next(to_wrap.parameters())
         adapter_cls = SharedOuterGroupedExpertAdapter if experts_shared_outer_loras else GroupedExpertLinearAdapter
         self._projection_sizes = _projection_sizes(to_wrap, attrs.out_features, projection_targets)
+        self._projection_shards = config.expert_tensor_parallel_size if self._projection_sizes else 1
         factory = partial(
             adapter_cls,
             in_features=attrs.in_features,
@@ -733,7 +754,9 @@ class MultiLoRAGroupedExpertLinear(MultiLoRALinear):
                 )
                 for key in self.adapters[0]
             }
-            out = _combine_projections(outputs, self._projection_sizes, self.to_wrap, linear_output)
+            out = _combine_projections(
+                outputs, self._projection_sizes, self._projection_shards, self.to_wrap, linear_output
+            )
         else:
             out = self._expert_adapter_forward(x_sorted, self.adapters, routing, slot_offsets)
 

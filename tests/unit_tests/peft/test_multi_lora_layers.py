@@ -230,9 +230,10 @@ def test_dense_multi_lora_mm_preserves_eligible_grouped_mm_path() -> None:
     torch.testing.assert_close(actual, expected)
 
 
+@pytest.mark.parametrize("tp", [1, 2])
 @pytest.mark.parametrize("heads,groups,gated", [(4, 2, True), (4, 2, False), (2, 2, True)])
-def test_combine_projections_matches_hf_qkv_merge(heads, groups, gated) -> None:
-    """Canonical Q/K/V outputs land where the checkpoint conversion puts the HF projections."""
+def test_combine_projections_matches_hf_qkv_merge(heads, groups, gated, tp) -> None:
+    """Each TP rank's canonical Q/K/V outputs land where the checkpoint conversion puts the HF projections."""
     head_size, hidden = 2, 6
     config = SimpleNamespace(
         num_attention_heads=heads,
@@ -240,7 +241,7 @@ def test_combine_projections_matches_hf_qkv_merge(heads, groups, gated) -> None:
         kv_channels=head_size,
         hidden_size=hidden,
         attention_output_gate=gated,
-        tensor_model_parallel_size=1,
+        tensor_model_parallel_size=tp,
     )
     to_wrap = SimpleNamespace(config=config)
     q_size = heads * head_size * (2 if gated else 1)
@@ -249,13 +250,12 @@ def test_combine_projections_matches_hf_qkv_merge(heads, groups, gated) -> None:
     )
     weights = {key: torch.randn(size, hidden) for key, size in sizes.items()}
     x = torch.randn(3, hidden)
-    expected = F.linear(x, merge_qkv_weights(config, *weights.values()))
+    expected = F.linear(x, merge_qkv_weights(config, *weights.values())).chunk(tp, dim=-1)
 
-    actual = multi_lora_layers_module._combine_projections(
-        {key: F.linear(x, weight) for key, weight in weights.items()}, sizes, to_wrap, expected
-    )
-
-    torch.testing.assert_close(actual, expected)
+    for rank in range(tp):
+        outputs = {key: F.linear(x, weight).chunk(tp, dim=-1)[rank] for key, weight in weights.items()}
+        actual = multi_lora_layers_module._combine_projections(outputs, sizes, tp, to_wrap, expected[rank])
+        torch.testing.assert_close(actual, expected[rank])
 
 
 def test_projection_sizes_rejects_kv_heads_split_across_tp() -> None:

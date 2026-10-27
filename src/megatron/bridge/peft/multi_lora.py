@@ -31,6 +31,7 @@ from megatron.bridge.peft.base import PEFT
 from megatron.bridge.peft.canonical_lora import CanonicalLoRA
 from megatron.bridge.peft.module_matcher import ModuleMatcher
 from megatron.bridge.peft.multi_lora_layers import (
+    PROJECTION_ADAPTER_KEYS,
     MultiLoRAGroupedExpertLinear,
     MultiLoRALinear,
     install_moe_slot_routing,
@@ -115,7 +116,7 @@ class MultiLoRA(PEFT, ModuleMatcher):
         if (ans := self.match(module, name, prefix)) is not None:
             (match, full_name) = ans
             components = self.canonical_mapping.get(match, set())
-            projection_targets = components & {"linear_q", "linear_k", "linear_v", "linear_fc1_gate", "linear_fc1_up"}
+            projection_targets = components & PROJECTION_ADAPTER_KEYS.keys()
 
             if is_expert_linear(full_name):
                 if not is_grouped_expert_linear(full_name):
