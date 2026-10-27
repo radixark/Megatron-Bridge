@@ -256,3 +256,89 @@ def test_row_parallel_multi_lora_output_and_gradients(two_rank_process_group, ba
             torch.testing.assert_close(
                 adapter.linear_out.weight.grad, b.grad[slot].chunk(2, dim=0)[rank], atol=1e-6, rtol=1e-6
             )
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_absorbed_mla_projections_match_fp64_reference(two_rank_process_group, dtype, monkeypatch):
+    """absorb_query / expand_value equal the per-token effective weight W + scale * B_s A_s."""
+    heads, qk, v, k, r, splits = 4, 16, 8, 32, 8, (3, 0, 5)
+    with _model_parallel(tp=2, ep=1):
+        rank = parallel_state.get_tensor_model_parallel_rank()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=k,
+            num_attention_heads=heads,
+            tensor_model_parallel_size=2,
+            params_dtype=dtype,
+            gradient_accumulation_fusion=False,
+        )
+        base = ColumnParallelLinear(
+            k, heads * (qk + v), config=config, init_method=init_method_normal(0.02), bias=False, gather_output=False
+        ).cuda()
+        base.requires_grad_(False)
+        layer = MultiLoRALinear(base, n_adapters=len(splits), dim=r, alpha=2 * r, full_name="linear_kv_up_proj")
+        layer.adapters.to(device="cuda", dtype=dtype)
+        for slot in range(len(splits)):
+            init_adapter_slot([layer], slot, rank=r, alpha=2 * r)
+        set_tokens_per_adapter_slot([layer], torch.tensor(splits, device="cuda", dtype=torch.int32))
+
+        generator = torch.Generator(device="cuda").manual_seed(0)
+
+        def rand(*shape):
+            return torch.randn(*shape, device="cuda", dtype=torch.float64, generator=generator)
+
+        w, a, b = rand(heads * (qk + v), k), rand(len(splits), r, k) / 4, rand(len(splits), heads * (qk + v), r) / 4
+        query, latent = rand(sum(splits), heads, qk), rand(sum(splits), heads, k)
+        query_cotangent, value_cotangent = rand(sum(splits), heads, k), rand(sum(splits), heads, v)
+        with torch.no_grad():
+            base.weight.copy_(w.chunk(2, dim=0)[rank])
+            for slot, adapter in enumerate(layer.adapters):
+                adapter.linear_in.weight.copy_(a[slot].chunk(2, dim=0)[rank])
+                adapter.linear_out.weight.copy_(b[slot].chunk(2, dim=0)[rank])
+
+        a.requires_grad_()
+        b.requires_grad_()
+        ref_query, ref_latent = query.clone().requires_grad_(), latent.clone().requires_grad_()
+        slot_of_token = torch.repeat_interleave(
+            torch.arange(len(splits), device="cuda"), torch.tensor(splits, device="cuda")
+        )
+        effective = (w + 2 * b @ a).view(len(splits), heads, qk + v, k)[slot_of_token]
+        expected_query = torch.einsum("thd,thdk->thk", ref_query, effective[:, :, :qk])
+        expected_value = torch.einsum("thk,thdk->thd", ref_latent, effective[:, :, qk:])
+        ((expected_query * query_cotangent).sum() + (expected_value * value_cotangent).sum()).backward()
+
+        grouped_mm_calls = []
+        if hasattr(torch, "_grouped_mm"):
+            grouped_mm = torch._grouped_mm
+            monkeypatch.setattr(
+                torch, "_grouped_mm", lambda *args, **kw: grouped_mm_calls.append(1) or grouped_mm(*args, **kw)
+            )
+
+        local_heads = slice(rank * heads // 2, (rank + 1) * heads // 2)
+        local_query = query[:, local_heads].to(dtype).requires_grad_()
+        local_latent = latent[:, local_heads].to(dtype).requires_grad_()
+        actual_query = layer.absorb_query(local_query, qk_head_dim=qk, v_head_dim=v)
+        actual_value = layer.expand_value(local_latent, qk_head_dim=qk, v_head_dim=v)
+        (
+            (actual_query * query_cotangent[:, local_heads].to(dtype)).sum()
+            + (actual_value * value_cotangent[:, local_heads].to(dtype)).sum()
+        ).backward()
+
+        def check(actual, expected):
+            if dtype == torch.float32:
+                torch.testing.assert_close(actual.double(), expected, atol=1e-5, rtol=1e-5)
+            else:
+                # bf16 rounding of near-cancelling sums defeats elementwise rtol; a layout error is O(1).
+                assert (actual.double() - expected).norm() <= 1e-2 * expected.norm()
+
+        check(actual_query, expected_query[:, local_heads])
+        check(actual_value, expected_value[:, local_heads])
+        check(local_query.grad, ref_query.grad[:, local_heads])
+        check(local_latent.grad, ref_latent.grad[:, local_heads])
+        for slot, adapter in enumerate(layer.adapters):
+            check(adapter.linear_in.weight.grad, a.grad[slot].chunk(2, dim=0)[rank])
+            check(adapter.linear_out.weight.grad, b.grad[slot].chunk(2, dim=0)[rank])
+        if dtype == torch.bfloat16:
+            # Two grouped GEMMs per method once the empty slot is dropped.
+            assert len(grouped_mm_calls) >= 4, grouped_mm_calls

@@ -116,6 +116,28 @@ def _dense_multi_lora_mm(
     )
 
 
+def _token_grouped_mm(x: torch.Tensor, stacked_weights: torch.Tensor, token_splits: Tuple[int, ...]) -> torch.Tensor:
+    """[t, h, in] -> [t, h, out] with one weight per slot, shared by every head of a token."""
+    num_tokens, num_heads = x.shape[0], x.shape[1]
+    row_splits = tuple(count * num_heads for count in token_splits)
+    offsets = torch.tensor(row_splits, device=x.device).cumsum(0, dtype=torch.int32)
+    out = _dense_multi_lora_mm(
+        x.reshape(num_tokens * num_heads, -1).contiguous(), stacked_weights, token_splits=row_splits, offsets=offsets
+    )
+    return out.view(num_tokens, num_heads, -1)
+
+
+def _head_grouped_mm(x: torch.Tensor, per_head_weights: torch.Tensor, token_splits: Tuple[int, ...]) -> torch.Tensor:
+    """[t, h, in] -> [t, h, out] with one weight per (slot, head); ``per_head_weights`` is [slots, h, out, in]."""
+    num_tokens, num_heads = x.shape[0], x.shape[1]
+    head_major = x.transpose(0, 1).reshape(num_heads * num_tokens, -1).contiguous()
+    weights = per_head_weights.transpose(0, 1).reshape(-1, *per_head_weights.shape[-2:]).contiguous()
+    row_splits = token_splits * num_heads
+    offsets = torch.tensor(row_splits, device=x.device).cumsum(0, dtype=torch.int32)
+    out = _dense_multi_lora_mm(head_major, weights, token_splits=row_splits, offsets=offsets)
+    return out.view(num_heads, num_tokens, -1).transpose(0, 1)
+
+
 class MultiLoRALinear(AdapterWrapper):
     """Megatron parallel linear wrapped with *N* concurrent LoRA adapters.
 
@@ -340,34 +362,63 @@ class MultiLoRALinear(AdapterWrapper):
 
         return self._finish_forward(linear_output + out.reshape(linear_output.shape), bias)
 
-    def forward_absorbed(self, x: torch.Tensor, *, qk_head_dim: int, v_head_dim: int, transpose: bool) -> torch.Tensor:
-        """Apply per-slot K absorption or V expansion to head-sharded MLA activations."""
-        assert self.base_linear_is_parallel and not self.input_is_parallel
-        assert not self.replicate_adapter and not self.use_a2a
-        weight = self.to_wrap.weight.view(-1, qk_head_dim + v_head_dim, self.to_wrap.weight.shape[-1])
-        weight = weight[:, :qk_head_dim] if transpose else weight[:, qk_head_dim:]
-        output = (
-            torch.einsum("...hd,hdk->...hk", x, weight) if transpose else torch.einsum("...hk,hdk->...hd", x, weight)
-        )
+    def absorb_query(self, query: torch.Tensor, *, qk_head_dim: int, v_head_dim: int) -> torch.Tensor:
+        """Absorb the per-slot K up-projection into head-sharded MLA queries: [..., h, qk] -> [..., h, kv_lora_rank]."""
+        weight = self._kv_up_weight(qk_head_dim, v_head_dim)[:, :qk_head_dim]
+        output = torch.einsum("...hd,hdk->...hk", query, weight)
         if not self._adapter_enabled:
             return output
+        slots, splits = self._active_absorbed_slots(query)
+        stacked_A, stacked_B = self._absorbed_adapter_weights(qk_head_dim, v_head_dim, slots)
+        flat = query.reshape(-1, *query.shape[-2:])
+        mid = _head_grouped_mm(flat, stacked_B[:, :, :qk_head_dim].transpose(-2, -1), splits)
+        delta = _token_grouped_mm(mid, stacked_A.transpose(-2, -1), splits)
+        return output + self._scale_absorbed(delta, slots, splits).reshape(output.shape)
+
+    def expand_value(self, latent: torch.Tensor, *, qk_head_dim: int, v_head_dim: int) -> torch.Tensor:
+        """Apply the per-slot V up-projection to head-sharded MLA latents: [..., h, kv_lora_rank] -> [..., h, v]."""
+        weight = self._kv_up_weight(qk_head_dim, v_head_dim)[:, qk_head_dim:]
+        output = torch.einsum("...hk,hdk->...hd", latent, weight)
+        if not self._adapter_enabled:
+            return output
+        slots, splits = self._active_absorbed_slots(latent)
+        stacked_A, stacked_B = self._absorbed_adapter_weights(qk_head_dim, v_head_dim, slots)
+        mid = _token_grouped_mm(latent.reshape(-1, *latent.shape[-2:]), stacked_A, splits)
+        delta = _head_grouped_mm(mid, stacked_B[:, :, qk_head_dim:], splits)
+        return output + self._scale_absorbed(delta, slots, splits).reshape(output.shape)
+
+    def _kv_up_weight(self, qk_head_dim: int, v_head_dim: int) -> torch.Tensor:
+        assert self.base_linear_is_parallel and not self.input_is_parallel
+        assert not self.replicate_adapter and not self.use_a2a
+        return self.to_wrap.weight.view(-1, qk_head_dim + v_head_dim, self.to_wrap.weight.shape[-1])
+
+    def _active_absorbed_slots(self, x: torch.Tensor) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
         splits = self.tokens_per_adapter_splits
         assert splits is not None
-        flat = x.reshape(-1, *x.shape[-2:])
-        assert sum(splits) == flat.shape[0]
-        deltas = []
-        for slot, part in enumerate(flat.split(splits)):
-            adapter = self.adapters[slot]
-            # Each TP head shard contributes to the gradient of the same full A matrix.
-            a = gather_from_sequence_parallel_region(adapter.linear_in.weight, tensor_parallel_output_grad=True)
-            b = adapter.linear_out.weight.view(weight.shape[0], qk_head_dim + v_head_dim, -1)
-            b = b[:, :qk_head_dim] if transpose else b[:, qk_head_dim:]
-            if transpose:
-                delta = torch.einsum("thr,rk->thk", torch.einsum("thd,hdr->thr", part, b), a)
-            else:
-                delta = torch.einsum("thr,hdr->thd", torch.einsum("thk,rk->thr", part, a), b)
-            deltas.append(delta * (self.alpha_values[slot] / self.rank_values[slot]))
-        return output + torch.cat(deltas).reshape(output.shape)
+        assert sum(splits) == x[..., 0, 0].numel()
+        # Empty slots would force the grouped GEMM onto its per-group fallback.
+        active = tuple(slot for slot, count in enumerate(splits) if count > 0)
+        return active, tuple(splits[slot] for slot in active)
+
+    def _absorbed_adapter_weights(
+        self, qk_head_dim: int, v_head_dim: int, slots: Tuple[int, ...]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Full-rank A [slots, r, k] and per-head B [slots, h, qk + v, r] for the active slots."""
+        stacked_A = torch.stack([a.linear_in.weight for a in self.adapters])
+        # A is rank-sharded; each TP head shard contributes to the gradient of the same full A.
+        stacked_A = gather_from_sequence_parallel_region(
+            stacked_A.movedim(1, 0).contiguous(), tensor_parallel_output_grad=True
+        ).movedim(0, 1)
+        stacked_B = torch.stack([a.linear_out.weight for a in self.adapters])
+        stacked_B = stacked_B.view(len(self.adapters), -1, qk_head_dim + v_head_dim, stacked_B.shape[-1])
+        index = torch.tensor(slots, device=stacked_A.device)
+        return stacked_A.index_select(0, index), stacked_B.index_select(0, index)
+
+    def _scale_absorbed(self, delta: torch.Tensor, slots: Tuple[int, ...], splits: Tuple[int, ...]) -> torch.Tensor:
+        index = torch.tensor(slots, device=delta.device)
+        scaling = (self.alpha_values / self.rank_values).index_select(0, index)
+        counts = torch.tensor(splits, device=delta.device)
+        return delta * torch.repeat_interleave(scaling, counts).view(-1, *([1] * (delta.dim() - 1)))
 
     def reset_adapter(self, idx: int) -> None:
         # Re-init through the model-parallel RNG tracker so every DP replica
