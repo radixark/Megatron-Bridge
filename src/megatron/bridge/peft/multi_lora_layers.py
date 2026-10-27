@@ -161,6 +161,9 @@ def _combine_projections(outputs, sizes, to_wrap, reference):
         head_size = to_wrap.config.kv_channels
         groups = parts[1].shape[-1] // head_size
         parts = [part.reshape(*part.shape[:-1], groups, -1) for part in parts]
+        if to_wrap.config.attention_output_gate:
+            # HF interleaves query and gate per head; Megatron packs a group's query heads before its gate heads.
+            parts[0] = parts[0].unflatten(-1, (-1, 2, head_size)).transpose(-3, -2).flatten(-3)
         return torch.cat(parts, dim=-1).flatten(-2)
     return torch.cat(parts, dim=-1)
 

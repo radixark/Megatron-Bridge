@@ -9,6 +9,7 @@ from megatron.core import parallel_state
 from megatron.core.tensor_parallel import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.transformer_config import TransformerConfig
 
+from megatron.bridge.models.conversion.param_mapping import merge_qkv_weights
 from megatron.bridge.peft.multi_lora import CanonicalMultiLoRA, MultiLoRA
 from megatron.bridge.peft.multi_lora_layers import expose_adapter_slot, init_adapter_slot, set_tokens_per_adapter_slot
 from tests.unit_tests.peft.test_multi_lora_seeded_slot_distributed import (
@@ -37,16 +38,17 @@ def _assert_close(actual, expected):
 
 @pytest.mark.usefixtures("two_rank_process_group")
 @pytest.mark.parametrize(
-    "name,targets,widths",
+    "name,targets,widths,output_gate",
     [
-        ("linear_qkv", ["linear_q", "linear_k", "linear_v"], [32, 16, 16]),
-        ("linear_qkv", ["linear_q"], [64, 16, 16]),
-        ("linear_fc1", ["linear_fc1_gate", "linear_fc1_up"], [32, 32]),
+        ("linear_qkv", ["linear_q", "linear_k", "linear_v"], [32, 16, 16], False),
+        ("linear_qkv", ["linear_q", "linear_k", "linear_v"], [64, 16, 16], True),
+        ("linear_qkv", ["linear_q"], [64, 16, 16], True),
+        ("linear_fc1", ["linear_fc1_gate", "linear_fc1_up"], [32, 32], False),
     ],
 )
 @pytest.mark.parametrize("sequence_parallel", [False, True])
 @pytest.mark.parametrize("fused_layernorm", [False, True])
-def test_projection_forward_backward_tp(name, targets, widths, sequence_parallel, fused_layernorm):
+def test_projection_forward_backward_tp(name, targets, widths, output_gate, sequence_parallel, fused_layernorm):
     with _model_parallel(tp=2, ep=1):
         config = TransformerConfig(
             num_layers=1,
@@ -55,6 +57,7 @@ def test_projection_forward_backward_tp(name, targets, widths, sequence_parallel
             num_query_groups=2,
             kv_channels=8,
             gated_linear_unit=True,
+            attention_output_gate=output_gate,
             tensor_model_parallel_size=2,
             sequence_parallel=sequence_parallel,
             params_dtype=torch.float32,
@@ -100,20 +103,18 @@ def test_projection_forward_backward_tp(name, targets, widths, sequence_parallel
         references = []
         leaves = []
         for slot in range(2):
-            parts = []
+            deltas = []
             for key, width in zip(layer._projection_sizes, widths):
                 if key not in layer.adapters[slot]:
-                    parts.append(full_x.new_zeros(4, 1, width))
+                    deltas.append(full_x.new_zeros(width, 32))
                     continue
                 adapter = layer.adapters[slot][key]
                 a, b = _gather(adapter.linear_in.weight), _gather(adapter.linear_out.weight)
                 leaves.append((adapter, a, b))
-                parts.append(F.linear(F.linear(ref_x[slot * 4 : (slot + 1) * 4], a), b) * 2)
-            if name == "linear_qkv":
-                parts = [p.reshape(4, 1, 2, -1) for p in parts]
-                references.append(torch.cat(parts, dim=-1).flatten(-2))
-            else:
-                references.append(torch.cat(parts, dim=-1))
+                deltas.append(b @ a * 2)
+            # HF projections placed by the checkpoint conversion, which export inverts
+            merged = merge_qkv_weights(config, *deltas) if name == "linear_qkv" else torch.cat(deltas)
+            references.append(F.linear(ref_x[slot * 4 : (slot + 1) * 4], merged))
         expected = torch.cat(references)
         if name == "linear_qkv":
             expected_local = expected.chunk(2, dim=-1)[tp_rank]

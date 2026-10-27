@@ -48,6 +48,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from megatron.bridge.models.conversion.param_mapping import merge_qkv_weights
 from megatron.bridge.models.conversion.peft_bridge import MegatronPeftBridge
 from megatron.bridge.peft import multi_lora as multi_lora_mod
 from megatron.bridge.peft import multi_lora_layers as multi_lora_layers_module
@@ -226,6 +227,34 @@ def test_dense_multi_lora_mm_preserves_eligible_grouped_mm_path() -> None:
     assert grouped_args[0] is x
     torch.testing.assert_close(grouped_args[1], weights.transpose(-2, -1))
     assert grouped_args[2] is offsets
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("heads,groups,gated", [(4, 2, True), (4, 2, False), (2, 2, True)])
+def test_combine_projections_matches_hf_qkv_merge(heads, groups, gated) -> None:
+    """Canonical Q/K/V outputs land where the checkpoint conversion puts the HF projections."""
+    head_size, hidden = 2, 6
+    config = SimpleNamespace(
+        num_attention_heads=heads,
+        num_query_groups=groups,
+        kv_channels=head_size,
+        hidden_size=hidden,
+        attention_output_gate=gated,
+        tensor_model_parallel_size=1,
+    )
+    to_wrap = SimpleNamespace(config=config)
+    q_size = heads * head_size * (2 if gated else 1)
+    sizes = multi_lora_layers_module._projection_sizes(
+        to_wrap, q_size + 2 * groups * head_size, {"linear_q", "linear_k", "linear_v"}
+    )
+    weights = {key: torch.randn(size, hidden) for key, size in sizes.items()}
+    x = torch.randn(3, hidden)
+    expected = F.linear(x, merge_qkv_weights(config, *weights.values()))
+
+    actual = multi_lora_layers_module._combine_projections(
+        {key: F.linear(x, weight) for key, weight in weights.items()}, sizes, to_wrap, expected
+    )
+
     torch.testing.assert_close(actual, expected)
 
 
