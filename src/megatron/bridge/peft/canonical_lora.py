@@ -40,10 +40,15 @@ from megatron.bridge.peft.utils import (
 logger = logging.getLogger(__name__)
 
 
-def _should_treat_linear_fc1_as_unfused(full_name: str) -> bool:
-    """Return True when CanonicalLoRA should keep linear_fc1 as a single adapter."""
+def _should_treat_linear_fc1_as_unfused(full_name: str, *, split_experts: bool = False) -> bool:
+    """Return True when canonical LoRA should keep linear_fc1 as a single adapter.
 
-    return full_name.startswith("vision_model.") or full_name.endswith(".mlp.experts.linear_fc1")
+    Vision MLPs always stay fused; ``split_experts`` lets grouped expert gate/up take independent factors.
+    """
+
+    return full_name.startswith("vision_model.") or (
+        not split_experts and full_name.endswith(".mlp.experts.linear_fc1")
+    )
 
 
 class ModuleDict(nn.ModuleDict):
@@ -78,6 +83,32 @@ class ModuleDict(nn.ModuleDict):
                 continue
             sharded_state_dict.update(layer.sharded_state_dict(f"{prefix}{key}.", sharded_offsets, metadata))
         return sharded_state_dict
+
+
+def value_head_size(config) -> int:
+    """V head width; only asymmetric-head models (MiMo-V2-Flash) define ``v_head_dim``."""
+    return getattr(config, "v_head_dim", config.kv_channels)
+
+
+def interleave_qkv(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    num_query_groups: int,
+    head_size: int,
+    output_gate: bool,
+) -> torch.Tensor:
+    """Pack Q/K/V projection outputs into Megatron's ``linear_qkv`` order: per query group, its query heads,
+    then its gate heads when ``output_gate``, then one key and one value head."""
+
+    query = query.unflatten(-1, (num_query_groups, -1))
+    if output_gate:
+        # HF interleaves query and gate per head
+        query = query.unflatten(-1, (-1, 2, head_size)).transpose(-3, -2).flatten(-3)
+    key = key.unflatten(-1, (num_query_groups, -1))
+    value = value.unflatten(-1, (num_query_groups, -1))
+    return torch.cat([query, key, value], dim=-1).flatten(-2)
 
 
 class LoRALinearSplitQKV(AdapterWrapper):
@@ -127,22 +158,14 @@ class LoRALinearSplitQKV(AdapterWrapper):
         if head_num % num_query_groups != 0:
             raise ValueError("num_attention_heads must be divisible by num_query_groups.")
 
-        heads_per_group = head_num // num_query_groups
-
-        leading_shape = query.shape[:-1]
-        query = query.reshape(-1, head_num, head_size)
-        key = key.reshape(-1, num_query_groups, head_size)
-        value = value.reshape(-1, num_query_groups, head_size)
-
-        qkv_chunks = []
-        for i in range(num_query_groups):
-            q_group = query[:, i * heads_per_group : (i + 1) * heads_per_group, :]
-            k_group = key[:, i : i + 1, :]
-            v_group = value[:, i : i + 1, :]
-            qkv_chunks.extend([q_group, k_group, v_group])
-
-        qkv = torch.cat(qkv_chunks, dim=1)
-        return qkv.reshape(*leading_shape, -1)
+        return interleave_qkv(
+            query,
+            key,
+            value,
+            num_query_groups=num_query_groups,
+            head_size=head_size,
+            output_gate=getattr(config, "attention_output_gate", False),
+        )
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         # pylint: disable=C0115,C0116
@@ -421,14 +444,15 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
             logger.info(f"Adding lora to: {full_name} ({canonical_submodules})")
             if name == "linear_qkv":
                 adapter_q, adapter_k, adapter_v = None, None, None
-                kv_out_features = m.config.kv_channels * m.config.num_query_groups
+                k_out_features = m.config.kv_channels * m.config.num_query_groups
+                v_out_features = value_head_size(m.config) * m.config.num_query_groups
                 q_out_features = m.config.kv_channels * m.config.num_attention_heads
                 if "linear_q" in canonical_submodules:
                     adapter_q = adapter_cls(attrs.in_features, q_out_features, **adapter_kwargs)
                 if "linear_k" in canonical_submodules:
-                    adapter_k = adapter_cls(attrs.in_features, kv_out_features, **adapter_kwargs)
+                    adapter_k = adapter_cls(attrs.in_features, k_out_features, **adapter_kwargs)
                 if "linear_v" in canonical_submodules:
-                    adapter_v = adapter_cls(attrs.in_features, kv_out_features, **adapter_kwargs)
+                    adapter_v = adapter_cls(attrs.in_features, v_out_features, **adapter_kwargs)
                 adapters = ModuleDict({"adapter_q": adapter_q, "adapter_k": adapter_k, "adapter_v": adapter_v})
                 return LoRALinearSplitQKV(m, adapters)
 
