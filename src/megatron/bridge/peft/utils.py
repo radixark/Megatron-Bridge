@@ -2651,10 +2651,12 @@ class PackedPerExpertLinear(nn.Module):
         init_method: Optional[Callable] = None,
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
+        pg_collection: ProcessGroupCollection | None = None,
     ):
         super().__init__()
         if not hasattr(torch, "_grouped_mm"):
             raise RuntimeError("PackedPerExpertLinear requires torch._grouped_mm (torch >= 2.9).")
+        self.pg_collection = _get_pg_collection(pg_collection, required_pgs=["ep", "expt_dp"])
         self.num_local_experts = num_local_experts
         self.in_features = in_features
         self.out_features = out_features
@@ -2687,7 +2689,7 @@ class PackedPerExpertLinear(nn.Module):
         key = f"{prefix}weight"
         return {
             key: _make_grouped_expert_sharded_tensor(
-                self.weight.data, key, tp_axis=None, sharded_offsets=sharded_offsets
+                self.weight, key, tp_axis=None, sharded_offsets=sharded_offsets, pg_collection=self.pg_collection
             )
         }
 
@@ -2759,7 +2761,9 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
         model_parallel_config.perform_initialization = True
         self.config = model_parallel_config
 
-        self.pg_collection = _get_pg_collection(pg_collection, model_parallel_config, required_pgs=["ep"])
+        self.pg_collection = _get_pg_collection(
+            pg_collection, model_parallel_config, required_pgs=["ep", "expt_dp", "expt_tp"]
+        )
         self.ep_group = _get_process_group(self.pg_collection, "ep")
 
         # ``input_is_parallel`` selects fc1 (column-parallel base) vs fc2
@@ -2779,6 +2783,7 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
                 gather_output=True,
                 init_method=column_init,
                 is_expert=True,
+                tp_group=self.pg_collection.expt_tp,
             )
             self.linear_out = PackedPerExpertLinear(
                 num_local_experts,
@@ -2787,6 +2792,7 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
                 init_method=row_init,
                 device=params_device,
                 dtype=params_dtype,
+                pg_collection=self.pg_collection,
             )
         else:
             # Per-expert A (intermediate → rank); shared B (rank → hidden).
@@ -2797,6 +2803,7 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
                 init_method=column_init,
                 device=params_device,
                 dtype=params_dtype,
+                pg_collection=self.pg_collection,
             )
             self.linear_out = RowParallelLinear(
                 dim,
@@ -2807,6 +2814,7 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
                 skip_bias_add=True,
                 init_method=row_init,
                 is_expert=True,
+                tp_group=self.pg_collection.expt_tp,
             )
 
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
@@ -2854,6 +2862,11 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
 
         linear_in_sd = self.linear_in.sharded_state_dict(f"{prefix}linear_in.", sharded_offsets, metadata)
         linear_out_sd = self.linear_out.sharded_state_dict(f"{prefix}linear_out.", sharded_offsets, metadata)
+
+        shared_sd = linear_in_sd if self._is_fc1 else linear_out_sd
+        # EP replication survives optimizers that replace the DP replica coordinate.
+        for shard in shared_sd.values():
+            shard.replica_id = (0, get_pg_rank(self.ep_group), get_pg_rank(self.pg_collection.expt_dp))
 
         if self._is_fc1:
             singleton_local_shards = (metadata or {}).get("singleton_local_shards", False)

@@ -305,8 +305,13 @@ def test_install_moe_slot_routing_is_idempotent_and_selective():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU + model-parallel init")
 class TestMultiLoRAGroupedExpertLinearGPU:
-    @pytest.fixture(autouse=True)
-    def _mp(self):
+    @pytest.fixture(
+        autouse=True,
+        params=[(False, False), (True, False), (False, True), (True, True)],
+        ids=["per-expert-fc1", "shared-outer-fc1", "per-expert-fc2", "shared-outer-fc2"],
+    )
+    def _mp(self, request):
+        self.shared_outer, self.is_fc2 = request.param
         import megatron.core.parallel_state as parallel_state
         import torch.distributed as dist
 
@@ -341,8 +346,11 @@ class TestMultiLoRAGroupedExpertLinearGPU:
             pass
 
     def _build_base(self, *, hidden=16, ffn=32, num_local_experts=2, **config_overrides):
-        """A grouped expert linear as TEGroupedMLP builds its ``linear_fc1``."""
-        from megatron.core.extensions.transformer_engine import TEColumnParallelGroupedLinear
+        """A grouped expert linear as TEGroupedMLP builds its FC1 or FC2."""
+        from megatron.core.extensions.transformer_engine import (
+            TEColumnParallelGroupedLinear,
+            TERowParallelGroupedLinear,
+        )
         from megatron.core.transformer.transformer_config import TransformerConfig
 
         from megatron.bridge.peft.utils import init_method_normal
@@ -364,7 +372,8 @@ class TestMultiLoRAGroupedExpertLinearGPU:
             params_dtype=torch.bfloat16,
             **config_overrides,
         )
-        base = TEColumnParallelGroupedLinear(
+        linear_cls = TERowParallelGroupedLinear if self.is_fc2 else TEColumnParallelGroupedLinear
+        base = linear_cls(
             num_gemms=num_local_experts,
             input_size=hidden,
             output_size=ffn,
@@ -384,8 +393,9 @@ class TestMultiLoRAGroupedExpertLinearGPU:
             n_adapters=n_adapters,
             dim=dim,
             alpha=alpha,
-            full_name="decoder.layers.0.mlp.experts.linear_fc1",
+            full_name=f"decoder.layers.0.mlp.experts.linear_fc{2 if self.is_fc2 else 1}",
             num_local_experts=num_local_experts,
+            experts_shared_outer_loras=self.shared_outer,
         )
         layer.adapters.to(device="cuda", dtype=torch.bfloat16)
         return layer, config
@@ -435,8 +445,10 @@ class TestMultiLoRAGroupedExpertLinearGPU:
         for i, (slot, expert) in enumerate(zip(slots, experts)):
             adapter = layer.adapters[slot]
             scale = layer.alpha_values[slot] / layer.rank_values[slot]
-            mid = x[i] @ adapter.linear_in.weight[expert].T
-            expected[i] += (mid @ adapter.linear_out.weight[expert].T) * scale
+            weight_a = adapter.linear_in.weight
+            mid = x[i] @ (weight_a if weight_a.ndim == 2 else weight_a[expert]).T
+            weight_b = adapter.linear_out.weight
+            expected[i] += (mid @ (weight_b if weight_b.ndim == 2 else weight_b[expert]).T) * scale
 
         torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
 
@@ -490,9 +502,9 @@ class TestMultiLoRAGroupedExpertLinearGPU:
         layer.init_adapter_slot(0, rank=3, alpha=6.0)
 
         adapter = layer.adapters[0]
-        assert adapter.linear_in.weight[:, 3:, :].abs().max().item() == 0
+        assert adapter.linear_in.weight[..., 3:, :].abs().max().item() == 0
         assert adapter.linear_out.weight[..., 3:].abs().max().item() == 0
-        assert adapter.linear_in.weight[:, :3, :].abs().min().item() == 1
+        assert adapter.linear_in.weight[..., :3, :].abs().min().item() == 1
         assert adapter.linear_out.weight[..., :3].abs().min().item() == 1
 
     def test_reset_adapter_draws_from_the_expert_rng_stream(self):
