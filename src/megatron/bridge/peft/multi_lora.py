@@ -28,8 +28,10 @@ import torch.nn as nn
 from megatron.core.transformer.moe.router import TopKRouter
 
 from megatron.bridge.peft.base import PEFT
+from megatron.bridge.peft.canonical_lora import CanonicalLoRA, _should_treat_linear_fc1_as_unfused
 from megatron.bridge.peft.module_matcher import ModuleMatcher
 from megatron.bridge.peft.multi_lora_layers import (
+    PROJECTION_ADAPTER_KEYS,
     MultiLoRAGroupedExpertLinear,
     MultiLoRALinear,
     install_moe_slot_routing,
@@ -113,6 +115,10 @@ class MultiLoRA(PEFT, ModuleMatcher):
 
         if (ans := self.match(module, name, prefix)) is not None:
             (match, full_name) = ans
+            components = self.canonical_mapping.get(match, set())
+            if name == "linear_fc1" and _should_treat_linear_fc1_as_unfused(full_name, split_experts=True):
+                components = set()
+            projection_targets = components & PROJECTION_ADAPTER_KEYS.keys()
 
             if is_expert_linear(full_name):
                 if not is_grouped_expert_linear(full_name):
@@ -140,6 +146,7 @@ class MultiLoRA(PEFT, ModuleMatcher):
                     dim=self.dim,
                     alpha=self.alpha,
                     full_name=full_name,
+                    projection_targets=projection_targets,
                     num_local_experts=module.num_gemms,
                     experts_shared_outer_loras=self.experts_shared_outer_loras,
                     column_init_method=self.lora_A_init_method,
@@ -158,6 +165,7 @@ class MultiLoRA(PEFT, ModuleMatcher):
                 dim=self.dim,
                 alpha=self.alpha,
                 full_name=full_name,
+                projection_targets=projection_targets,
                 column_init_method=self.lora_A_init_method,
                 row_init_method=self.lora_B_init_method,
                 dropout=self.dropout,
@@ -171,3 +179,20 @@ class MultiLoRA(PEFT, ModuleMatcher):
         if isinstance(key, tuple):
             return key[1].requires_grad
         return ".adapters." in key or ".weight_A." in key or ".weight_B." in key
+
+
+@dataclass
+class CanonicalMultiLoRA(MultiLoRA, CanonicalLoRA):
+    """Multi-LoRA with independent Q/K/V and gate/up factors in each slot."""
+
+    target_modules: List[str] = field(
+        default_factory=lambda: [
+            "linear_q",
+            "linear_k",
+            "linear_v",
+            "linear_proj",
+            "linear_fc1_gate",
+            "linear_fc1_up",
+            "linear_fc2",
+        ]
+    )
