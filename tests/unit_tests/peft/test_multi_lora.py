@@ -36,7 +36,7 @@ from megatron.core.transformer.module import MegatronModule
 
 from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.bridge.peft import multi_lora as multi_lora_module
-from megatron.bridge.peft.multi_lora import MultiLoRA
+from megatron.bridge.peft.multi_lora import CanonicalMultiLoRA, MultiLoRA
 from megatron.bridge.peft.multi_lora_layers import MultiLoRALinear
 
 
@@ -253,6 +253,21 @@ class TestMultiLoRATransform:
         assert isinstance(transformed.output_projection, nn.Linear)
         assert isinstance(transformed.embedding, nn.Embedding)
         assert isinstance(transformed.layernorm, nn.LayerNorm)
+
+    def test_canonical_keeps_vision_linear_fc1_fused(self) -> None:
+        """Vision MLPs are not gated, so their fc1 keeps one fused adapter, as in CanonicalLoRA."""
+        model = nn.Module()
+        model.vision_model = nn.ModuleDict({"linear_fc1": nn.Linear(32, 64)})
+        model.decoder = nn.ModuleDict({"linear_fc1": nn.Linear(32, 64)})
+        peft = CanonicalMultiLoRA(target_modules=["linear_fc1_gate", "linear_fc1_up"])
+
+        transformed = peft(model, training=True)
+
+        assert transformed.vision_model["linear_fc1"].init_kwargs["projection_targets"] == set()
+        assert transformed.decoder["linear_fc1"].init_kwargs["projection_targets"] == {
+            "linear_fc1_gate",
+            "linear_fc1_up",
+        }
 
     def test_transform_forwards_constructor_arguments(self) -> None:
         model = SimpleModel()
