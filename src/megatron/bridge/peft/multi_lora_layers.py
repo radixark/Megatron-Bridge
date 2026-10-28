@@ -52,7 +52,7 @@ from megatron.core.tensor_parallel.mappings import (
 from megatron.core.transformer.moe.moe_utils import sort_chunks_by_idxs
 
 from megatron.bridge.peft.adapter_wrapper import AdapterWrapper
-from megatron.bridge.peft.canonical_lora import ModuleDict, interleave_qkv
+from megatron.bridge.peft.canonical_lora import ModuleDict, interleave_qkv, value_head_size
 from megatron.bridge.peft.utils import (
     GroupedExpertLinearAdapter,
     ParallelLinearAdapter,
@@ -157,9 +157,10 @@ def _projection_sizes(to_wrap, out_features, targets):
             f"Independent Q/K/V adapters require num_query_groups ({config.num_query_groups}) >= "
             f"tensor_model_parallel_size ({config.tensor_model_parallel_size}): each TP shard must hold whole KV heads"
         )
-        kv_size = config.kv_channels * config.num_query_groups
+        k_size = config.kv_channels * config.num_query_groups
+        v_size = value_head_size(config) * config.num_query_groups
         # Qwen3.5's query projection includes its output gate.
-        return {"adapter_q": out_features - 2 * kv_size, "adapter_k": kv_size, "adapter_v": kv_size}
+        return {"adapter_q": out_features - k_size - v_size, "adapter_k": k_size, "adapter_v": v_size}
     assert targets <= {"linear_fc1_gate", "linear_fc1_up"}, targets
     assert to_wrap.config.gated_linear_unit, "Independent gate/up adapters require a gated MLP"
     return {"adapter_gate": out_features // 2, "adapter_up": out_features // 2}

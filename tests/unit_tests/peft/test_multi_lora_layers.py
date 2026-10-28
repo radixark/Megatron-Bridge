@@ -258,6 +258,46 @@ def test_combine_projections_matches_hf_qkv_merge(heads, groups, gated, tp) -> N
         torch.testing.assert_close(actual, expected[rank])
 
 
+@pytest.mark.parametrize("tp", [1, 2])
+def test_combine_projections_handles_narrower_value_heads(tp) -> None:
+    """MiMo-V2-Flash packs each query group as [q heads, k (192), v (128)]; V must not be sized like K."""
+    heads, groups, qk_head, v_head, hidden = 4, 2, 3, 2, 6
+    config = SimpleNamespace(
+        num_attention_heads=heads,
+        num_query_groups=groups,
+        kv_channels=qk_head,
+        v_head_dim=v_head,
+        attention_output_gate=False,
+        tensor_model_parallel_size=tp,
+    )
+    to_wrap = SimpleNamespace(config=config)
+    sizes = multi_lora_layers_module._projection_sizes(
+        to_wrap, (heads + groups) * qk_head + groups * v_head, {"linear_q", "linear_k", "linear_v"}
+    )
+    assert sizes == {"adapter_q": heads * qk_head, "adapter_k": groups * qk_head, "adapter_v": groups * v_head}
+    weights = {key: torch.randn(size, hidden) for key, size in sizes.items()}
+    # copied from MiMoV2FlashQKVMapping.hf_to_megatron
+    q_per_group = heads // groups * qk_head
+    merged = torch.cat(
+        [
+            part
+            for i in range(groups)
+            for part in (
+                weights["adapter_q"][i * q_per_group : (i + 1) * q_per_group],
+                weights["adapter_k"][i * qk_head : (i + 1) * qk_head],
+                weights["adapter_v"][i * v_head : (i + 1) * v_head],
+            )
+        ]
+    )
+    x = torch.randn(3, hidden)
+    expected = F.linear(x, merged).chunk(tp, dim=-1)
+
+    for rank in range(tp):
+        outputs = {key: F.linear(x, weight).chunk(tp, dim=-1)[rank] for key, weight in weights.items()}
+        actual = multi_lora_layers_module._combine_projections(outputs, sizes, tp, to_wrap, expected[rank])
+        torch.testing.assert_close(actual, expected[rank])
+
+
 def test_projection_sizes_rejects_kv_heads_split_across_tp() -> None:
     config = SimpleNamespace(num_query_groups=1, kv_channels=8, tensor_model_parallel_size=2)
     with pytest.raises(AssertionError, match="num_query_groups"):
