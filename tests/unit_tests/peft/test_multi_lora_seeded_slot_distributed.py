@@ -32,7 +32,9 @@ import megatron.core.parallel_state as parallel_state
 import pytest
 import torch
 import torch.distributed as dist
-from megatron.core.tensor_parallel import ColumnParallelLinear
+import torch.nn.functional as F
+from megatron.core.extensions.transformer_engine import TERowParallelLinear
+from megatron.core.tensor_parallel import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     get_data_parallel_rng_tracker_name,
@@ -42,7 +44,7 @@ from megatron.core.tensor_parallel.random import (
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 from megatron.bridge.peft import multi_lora_layers as multi_lora_layers_module
-from megatron.bridge.peft.multi_lora_layers import MultiLoRALinear, init_adapter_slot
+from megatron.bridge.peft.multi_lora_layers import MultiLoRALinear, init_adapter_slot, set_tokens_per_adapter_slot
 from megatron.bridge.peft.utils import init_method_normal
 
 
@@ -176,3 +178,167 @@ def test_seeded_reseed_keeps_expert_stream_distinct_across_ep(two_rank_process_g
         data_parallel_draws = _all_gather(data_parallel_draw)
         assert not torch.equal(expert_draws[0], expert_draws[1])
         torch.testing.assert_close(data_parallel_draws[1], data_parallel_draws[0], rtol=0, atol=0)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("base_cls", [TERowParallelLinear, RowParallelLinear])
+@pytest.mark.parametrize("sequence_parallel", [False, True])
+@pytest.mark.parametrize("bias", [False, True])
+def test_row_parallel_multi_lora_output_and_gradients(two_rank_process_group, base_cls, sequence_parallel, bias):
+    with _model_parallel(tp=2, ep=1):
+        rank = parallel_state.get_tensor_model_parallel_rank()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=2,
+            tensor_model_parallel_size=2,
+            sequence_parallel=sequence_parallel,
+            params_dtype=torch.float32,
+            gradient_accumulation_fusion=False,
+        )
+        base = base_cls(
+            32,
+            32,
+            config=config,
+            init_method=init_method_normal(0.02),
+            bias=bias,
+            is_expert=False,
+            input_is_parallel=True,
+            skip_bias_add=False,
+        )
+        base.requires_grad_(False)
+        layer = MultiLoRALinear(base, n_adapters=2, dim=8, alpha=8, full_name="linear_proj")
+        for slot in range(2):
+            init_adapter_slot([layer], slot, rank=8, alpha=8)
+        set_tokens_per_adapter_slot([layer], torch.tensor([3, 5], device="cuda", dtype=torch.int32))
+        # Dyadic values isolate collective/layout errors from the TE base GEMM's rounding floor.
+        x = ((torch.arange(8 * 32, device="cuda").reshape(8, 32) % 7 - 3).float() / 8).requires_grad_()
+        w = (torch.arange(32 * 32, device="cuda").reshape(32, 32) % 5 - 2).float() / 16
+        a = ((torch.arange(2 * 8 * 32, device="cuda").reshape(2, 8, 32) % 3 - 1).float() / 32).requires_grad_()
+        b = ((torch.arange(2 * 32 * 8, device="cuda").reshape(2, 32, 8) % 5 - 2).float() / 32).requires_grad_()
+        with torch.no_grad():
+            base.weight.copy_(w.chunk(2, dim=1)[rank])
+            if bias:
+                base.bias.fill_(0.125)
+            for slot, adapter in enumerate(layer.adapters):
+                adapter.linear_in.weight.copy_(a[slot].chunk(2, dim=1)[rank])
+                adapter.linear_out.weight.copy_(b[slot].chunk(2, dim=0)[rank])
+        local_x = x.detach().chunk(2, dim=1)[rank].contiguous().requires_grad_()
+        expected_base = F.linear(x, w) + (0.125 if bias else 0)
+        layer.disable_adapter_layers()
+        actual_base, output_bias = layer(local_x)
+        assert output_bias is None
+        torch.testing.assert_close(
+            actual_base,
+            expected_base.chunk(2, dim=0)[rank] if sequence_parallel else expected_base,
+            atol=1e-6,
+            rtol=1e-6,
+        )
+        layer.enable_adapter_layers()
+        actual, output_bias = layer(local_x)
+        assert output_bias is None
+        expected = expected_base + torch.cat(
+            [F.linear(F.linear(tokens, aa), bb) for tokens, aa, bb in zip(x.split((3, 5)), a, b)]
+        )
+        torch.testing.assert_close(
+            actual,
+            expected.chunk(2, dim=0)[rank] if sequence_parallel else expected,
+            atol=1e-6,
+            rtol=1e-6,
+        )
+        actual.sum().backward()
+        expected.sum().backward()
+        torch.testing.assert_close(local_x.grad, x.grad.chunk(2, dim=1)[rank], atol=1e-6, rtol=1e-6)
+        for slot, adapter in enumerate(layer.adapters):
+            torch.testing.assert_close(
+                adapter.linear_in.weight.grad, a.grad[slot].chunk(2, dim=1)[rank], atol=1e-6, rtol=1e-6
+            )
+            torch.testing.assert_close(
+                adapter.linear_out.weight.grad, b.grad[slot].chunk(2, dim=0)[rank], atol=1e-6, rtol=1e-6
+            )
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_absorbed_mla_projections_match_fp64_reference(two_rank_process_group, dtype, monkeypatch):
+    """absorb_query / expand_value equal the per-token effective weight W + scale * B_s A_s."""
+    heads, qk, v, k, r, splits = 4, 16, 8, 32, 8, (3, 0, 5)
+    with _model_parallel(tp=2, ep=1):
+        rank = parallel_state.get_tensor_model_parallel_rank()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=k,
+            num_attention_heads=heads,
+            tensor_model_parallel_size=2,
+            params_dtype=dtype,
+            gradient_accumulation_fusion=False,
+        )
+        base = ColumnParallelLinear(
+            k, heads * (qk + v), config=config, init_method=init_method_normal(0.02), bias=False, gather_output=False
+        ).cuda()
+        base.requires_grad_(False)
+        layer = MultiLoRALinear(base, n_adapters=len(splits), dim=r, alpha=2 * r, full_name="linear_kv_up_proj")
+        layer.adapters.to(device="cuda", dtype=dtype)
+        for slot in range(len(splits)):
+            init_adapter_slot([layer], slot, rank=r, alpha=2 * r)
+        set_tokens_per_adapter_slot([layer], torch.tensor(splits, device="cuda", dtype=torch.int32))
+
+        generator = torch.Generator(device="cuda").manual_seed(0)
+
+        def rand(*shape):
+            return torch.randn(*shape, device="cuda", dtype=torch.float64, generator=generator)
+
+        w, a, b = rand(heads * (qk + v), k), rand(len(splits), r, k) / 4, rand(len(splits), heads * (qk + v), r) / 4
+        query, latent = rand(sum(splits), heads, qk), rand(sum(splits), heads, k)
+        query_cotangent, value_cotangent = rand(sum(splits), heads, k), rand(sum(splits), heads, v)
+        with torch.no_grad():
+            base.weight.copy_(w.chunk(2, dim=0)[rank])
+            for slot, adapter in enumerate(layer.adapters):
+                adapter.linear_in.weight.copy_(a[slot].chunk(2, dim=0)[rank])
+                adapter.linear_out.weight.copy_(b[slot].chunk(2, dim=0)[rank])
+
+        a.requires_grad_()
+        b.requires_grad_()
+        ref_query, ref_latent = query.clone().requires_grad_(), latent.clone().requires_grad_()
+        slot_of_token = torch.repeat_interleave(
+            torch.arange(len(splits), device="cuda"), torch.tensor(splits, device="cuda")
+        )
+        effective = (w + 2 * b @ a).view(len(splits), heads, qk + v, k)[slot_of_token]
+        expected_query = torch.einsum("thd,thdk->thk", ref_query, effective[:, :, :qk])
+        expected_value = torch.einsum("thk,thdk->thd", ref_latent, effective[:, :, qk:])
+        ((expected_query * query_cotangent).sum() + (expected_value * value_cotangent).sum()).backward()
+
+        grouped_mm_calls = []
+        if hasattr(torch, "_grouped_mm"):
+            grouped_mm = torch._grouped_mm
+            monkeypatch.setattr(
+                torch, "_grouped_mm", lambda *args, **kw: grouped_mm_calls.append(1) or grouped_mm(*args, **kw)
+            )
+
+        local_heads = slice(rank * heads // 2, (rank + 1) * heads // 2)
+        local_query = query[:, local_heads].to(dtype).requires_grad_()
+        local_latent = latent[:, local_heads].to(dtype).requires_grad_()
+        actual_query = layer.absorb_query(local_query, qk_head_dim=qk, v_head_dim=v)
+        actual_value = layer.expand_value(local_latent, qk_head_dim=qk, v_head_dim=v)
+        (
+            (actual_query * query_cotangent[:, local_heads].to(dtype)).sum()
+            + (actual_value * value_cotangent[:, local_heads].to(dtype)).sum()
+        ).backward()
+
+        def check(actual, expected):
+            if dtype == torch.float32:
+                torch.testing.assert_close(actual.double(), expected, atol=1e-5, rtol=1e-5)
+            else:
+                # bf16 rounding of near-cancelling sums defeats elementwise rtol; a layout error is O(1).
+                assert (actual.double() - expected).norm() <= 1e-2 * expected.norm()
+
+        check(actual_query, expected_query[:, local_heads])
+        check(actual_value, expected_value[:, local_heads])
+        check(local_query.grad, ref_query.grad[:, local_heads])
+        check(local_latent.grad, ref_latent.grad[:, local_heads])
+        for slot, adapter in enumerate(layer.adapters):
+            check(adapter.linear_in.weight.grad, a.grad[slot].chunk(2, dim=0)[rank])
+            check(adapter.linear_out.weight.grad, b.grad[slot].chunk(2, dim=0)[rank])
+        if dtype == torch.bfloat16:
+            # Two grouped GEMMs per method once the empty slot is dropped.
+            assert len(grouped_mm_calls) >= 4, grouped_mm_calls
