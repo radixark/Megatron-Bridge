@@ -85,6 +85,11 @@ class ModuleDict(nn.ModuleDict):
         return sharded_state_dict
 
 
+def value_head_size(config) -> int:
+    """V head width; only asymmetric-head models (MiMo-V2-Flash) define ``v_head_dim``."""
+    return getattr(config, "v_head_dim", config.kv_channels)
+
+
 def interleave_qkv(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -101,8 +106,8 @@ def interleave_qkv(
     if output_gate:
         # HF interleaves query and gate per head
         query = query.unflatten(-1, (-1, 2, head_size)).transpose(-3, -2).flatten(-3)
-    key = key.unflatten(-1, (num_query_groups, head_size))
-    value = value.unflatten(-1, (num_query_groups, head_size))
+    key = key.unflatten(-1, (num_query_groups, -1))
+    value = value.unflatten(-1, (num_query_groups, -1))
     return torch.cat([query, key, value], dim=-1).flatten(-2)
 
 
@@ -439,14 +444,15 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
             logger.info(f"Adding lora to: {full_name} ({canonical_submodules})")
             if name == "linear_qkv":
                 adapter_q, adapter_k, adapter_v = None, None, None
-                kv_out_features = m.config.kv_channels * m.config.num_query_groups
+                k_out_features = m.config.kv_channels * m.config.num_query_groups
+                v_out_features = value_head_size(m.config) * m.config.num_query_groups
                 q_out_features = m.config.kv_channels * m.config.num_attention_heads
                 if "linear_q" in canonical_submodules:
                     adapter_q = adapter_cls(attrs.in_features, q_out_features, **adapter_kwargs)
                 if "linear_k" in canonical_submodules:
-                    adapter_k = adapter_cls(attrs.in_features, kv_out_features, **adapter_kwargs)
+                    adapter_k = adapter_cls(attrs.in_features, k_out_features, **adapter_kwargs)
                 if "linear_v" in canonical_submodules:
-                    adapter_v = adapter_cls(attrs.in_features, kv_out_features, **adapter_kwargs)
+                    adapter_v = adapter_cls(attrs.in_features, v_out_features, **adapter_kwargs)
                 adapters = ModuleDict({"adapter_q": adapter_q, "adapter_k": adapter_k, "adapter_v": adapter_v})
                 return LoRALinearSplitQKV(m, adapters)
 
