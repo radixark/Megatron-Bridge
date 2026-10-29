@@ -116,7 +116,7 @@ class MultiLoRA(PEFT, ModuleMatcher):
         if (ans := self.match(module, name, prefix)) is not None:
             (match, full_name) = ans
             components = self.canonical_mapping.get(match, set())
-            if name == "linear_fc1" and _should_treat_linear_fc1_as_unfused(full_name, split_experts=True):
+            if name == "linear_fc1" and _should_treat_linear_fc1_as_unfused(full_name):
                 components = set()
             projection_targets = components & PROJECTION_ADAPTER_KEYS.keys()
 

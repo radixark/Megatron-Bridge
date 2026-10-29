@@ -40,15 +40,10 @@ from megatron.bridge.peft.utils import (
 logger = logging.getLogger(__name__)
 
 
-def _should_treat_linear_fc1_as_unfused(full_name: str, *, split_experts: bool = False) -> bool:
-    """Return True when canonical LoRA should keep linear_fc1 as a single adapter.
+def _should_treat_linear_fc1_as_unfused(full_name: str) -> bool:
+    """Return True when canonical LoRA should keep linear_fc1 as a single adapter: vision MLPs are not gated."""
 
-    Vision MLPs always stay fused; ``split_experts`` lets grouped expert gate/up take independent factors.
-    """
-
-    return full_name.startswith("vision_model.") or (
-        not split_experts and full_name.endswith(".mlp.experts.linear_fc1")
-    )
+    return full_name.startswith("vision_model.")
 
 
 class ModuleDict(nn.ModuleDict):

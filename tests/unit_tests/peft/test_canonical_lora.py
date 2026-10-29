@@ -384,8 +384,8 @@ class TestCanonicalLoRA:
         assert isinstance(transformed_model.vision_model.merger.linear_fc1, LoRALinear)
         assert not isinstance(transformed_model.vision_model.merger.linear_fc1, LoRALinearSplitFC1UpGate)
 
-    def test_canonical_lora_treats_moe_expert_linear_fc1_as_unfused(self):
-        """Grouped expert linear_fc1 should keep a single unfused LoRA adapter."""
+    def test_canonical_lora_splits_moe_expert_linear_fc1(self):
+        """Grouped expert gate/up get independent adapters, as in CanonicalMultiLoRA."""
         model = MoEMegatronStyleModel()
         lora = CanonicalLoRA(target_modules=["linear_fc1_up", "linear_fc1_gate"])
 
@@ -409,8 +409,7 @@ class TestCanonicalLoRA:
 
         layer = transformed_model.language_model.decoder.layers[0]
         assert isinstance(layer.mlp.linear_fc1, LoRALinearSplitFC1UpGate)
-        assert isinstance(layer.mlp.experts.linear_fc1, LoRALinear)
-        assert not isinstance(layer.mlp.experts.linear_fc1, LoRALinearSplitFC1UpGate)
+        assert isinstance(layer.mlp.experts.linear_fc1, LoRALinearSplitFC1UpGate)
         assert isinstance(layer.mlp.shared_experts.linear_fc1, LoRALinearSplitFC1UpGate)
 
     def test_canonical_lora_normalize_moe_lora_reduces_expert_dim(self):
