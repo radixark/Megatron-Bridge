@@ -28,6 +28,7 @@ from megatron.bridge.peft.module_matcher import ModuleMatcher
 from megatron.bridge.peft.utils import (
     GroupedExpertLinearAdapter,
     ParallelLinearAdapter,
+    SharedOuterGroupedExpertAdapter,
     align_expert_dim_for_tp,
     get_adapter_attributes_from_linear,
     get_effective_lora_dim,
@@ -268,6 +269,10 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
             so it is comparable to a dense model. Defaults to False.
         share_expert_adapters (bool): When True, grouped MoE expert linears share one adapter across all local
             experts on the EP rank. Set to False to create one adapter per local expert instead. Defaults to True.
+        experts_shared_outer_loras (bool): When True, grouped MoE expert linears use
+            :class:`SharedOuterGroupedExpertAdapter`: the hidden-side factor (gate and up lora_A, down lora_B) is
+            shared across experts, matching SGLang's ``experts_shared_outer_loras=True``. Takes precedence over
+            ``share_expert_adapters``. Defaults to False.
     """
 
     target_modules: List[str] = field(
@@ -289,6 +294,7 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
     lora_B_init_method: str = "zero"
     normalize_moe_lora: bool = False
     share_expert_adapters: bool = True
+    experts_shared_outer_loras: bool = False
 
     def __post_init__(self) -> None:
         """Eagerly build ``canonical_mapping`` from the initial ``target_modules``.
@@ -399,8 +405,17 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
                 is_expert=is_expert,
                 input_is_parallel=attrs.input_is_parallel,
             )
-            use_per_expert_adapter = is_grouped_expert_linear(full_name) and not self.share_expert_adapters
-            adapter_cls = GroupedExpertLinearAdapter if use_per_expert_adapter else ParallelLinearAdapter
+            is_grouped_expert_name = is_grouped_expert_linear(full_name)
+            use_shared_outer_adapter = self.experts_shared_outer_loras and is_grouped_expert_name
+            use_per_expert_adapter = (
+                is_grouped_expert_name and not self.share_expert_adapters and not use_shared_outer_adapter
+            )
+            if use_shared_outer_adapter:
+                adapter_cls = SharedOuterGroupedExpertAdapter
+            elif use_per_expert_adapter:
+                adapter_cls = GroupedExpertLinearAdapter
+            else:
+                adapter_cls = ParallelLinearAdapter
 
             adapter_kwargs = dict(
                 dim=dim,
@@ -415,7 +430,7 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
                 alpha=self.alpha,
                 base_linear_is_parallel=attrs.base_linear_is_parallel,
             )
-            if use_per_expert_adapter:
+            if use_shared_outer_adapter or use_per_expert_adapter:
                 first_param = next(m.parameters())
                 adapter_kwargs.update(
                     num_local_experts=m.num_gemms,

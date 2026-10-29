@@ -1,6 +1,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from contextlib import nullcontext
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -10,6 +12,7 @@ from megatron.core.tensor_parallel import ColumnParallelLinear
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 from megatron.bridge.models.conversion.param_mapping import merge_qkv_weights
+from megatron.bridge.peft.canonical_lora import CanonicalLoRA, LoRALinearSplitFC1UpGate
 from megatron.bridge.peft.multi_lora import CanonicalMultiLoRA
 from megatron.bridge.peft.multi_lora_layers import expose_adapter_slot, init_adapter_slot, set_tokens_per_adapter_slot
 from tests.unit_tests.peft.test_multi_lora_seeded_slot_distributed import (
@@ -117,47 +120,94 @@ def test_projection_forward_backward_tp(name, targets, widths, output_gate, sequ
             assert all(adapter.alpha / adapter.dim == 2 for adapter in layer.adapter.values())
 
 
+def _expert_fc1_config():
+    return TransformerConfig(
+        num_layers=1,
+        hidden_size=32,
+        num_attention_heads=4,
+        num_moe_experts=4,
+        gated_linear_unit=True,
+        expert_model_parallel_size=2,
+        expert_tensor_parallel_size=1,
+        moe_grouped_gemm=True,
+        moe_token_dispatcher_type="alltoall",
+        moe_permute_fusion=False,
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        gradient_accumulation_fusion=False,
+    )
+
+
+def _expert_fc1(config):
+    from megatron.core.extensions.transformer_engine import TEColumnParallelGroupedLinear
+
+    return (
+        TEColumnParallelGroupedLinear(
+            num_gemms=2,
+            input_size=32,
+            output_size=64,
+            config=config,
+            init_method=torch.nn.init.zeros_,
+            bias=False,
+            skip_bias_add=True,
+            is_expert=True,
+        )
+        .cuda()
+        .requires_grad_(False)
+    )
+
+
+def _assert_expert_projections_exported(layer, adapters, config, *, shared_outer, packed_checkpoint, slot=None):
+    """Each rank's gate/up factors land under their own HF projection names, the shared factor once."""
+    from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
+    from megatron.bridge.models.conversion.param_mapping import FusedGatedExpertMapping
+    from megatron.bridge.models.qwen.qwen3_moe_bridge import Qwen3MoEBridge
+
+    model = torch.nn.Module()
+    model.config = config
+    model.decoder = torch.nn.Module()
+    model.decoder.layers = torch.nn.ModuleList([torch.nn.Module()])
+    model.decoder.layers[0].mlp = torch.nn.Module()
+    model.decoder.layers[0].mlp.experts = torch.nn.Module()
+    model.decoder.layers[0].mlp.experts.linear_fc1 = layer
+    bridge = Qwen3MoEBridge()
+    if packed_checkpoint:
+        bridge.mapping_registry = lambda: MegatronMappingRegistry(
+            FusedGatedExpertMapping(
+                megatron_param="decoder.layers.*.mlp.experts.linear_fc1.weight*",
+                hf_param="model.layers.*.mlp.experts.gate_up_proj",
+            )
+        )
+    with expose_adapter_slot(model, slot) if slot is not None else nullcontext():
+        exported = dict(bridge.stream_adapter_weights_megatron_to_hf([model], cpu=False, show_progress=False))
+    for key, projection in (("adapter_gate", "gate_proj"), ("adapter_up", "up_proj")):
+        adapter = adapters[key]
+        for local_expert in range(2):
+            expert = dist.get_rank() * 2 + local_expert
+            prefix = f"model.layers.0.mlp.experts.{expert}.{projection}"
+            a = (
+                exported[f"model.layers.0.mlp.experts.{projection}.lora_A.weight"][0]
+                if shared_outer
+                else exported[prefix + ".lora_A.weight"]
+            )
+            b = exported[prefix + ".lora_B.weight"]
+            torch.testing.assert_close(
+                a,
+                adapter.linear_in.weight if shared_outer else adapter.linear_in.weight[local_expert],
+                atol=0,
+                rtol=0,
+            )
+            torch.testing.assert_close(b, adapter.linear_out.weight[local_expert], atol=0, rtol=0)
+
+
 @pytest.mark.usefixtures("two_rank_process_group")
 @pytest.mark.parametrize("shared_outer", [False, True])
 @pytest.mark.parametrize("packed_checkpoint", [False, True])
 def test_expert_projections_export(shared_outer, packed_checkpoint):
-    from megatron.core.extensions.transformer_engine import TEColumnParallelGroupedLinear
-
-    from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
-    from megatron.bridge.models.conversion.param_mapping import FusedGatedExpertMapping
-    from megatron.bridge.models.qwen.qwen3_moe_bridge import Qwen3MoEBridge
     from megatron.bridge.peft.multi_lora_layers import ExpertSlotRouting
 
     with _model_parallel(tp=1, ep=2):
-        config = TransformerConfig(
-            num_layers=1,
-            hidden_size=32,
-            num_attention_heads=4,
-            num_moe_experts=4,
-            gated_linear_unit=True,
-            expert_model_parallel_size=2,
-            expert_tensor_parallel_size=1,
-            moe_grouped_gemm=True,
-            moe_token_dispatcher_type="alltoall",
-            moe_permute_fusion=False,
-            params_dtype=torch.bfloat16,
-            bf16=True,
-            gradient_accumulation_fusion=False,
-        )
-        base = (
-            TEColumnParallelGroupedLinear(
-                num_gemms=2,
-                input_size=32,
-                output_size=64,
-                config=config,
-                init_method=torch.nn.init.zeros_,
-                bias=False,
-                skip_bias_add=True,
-                is_expert=True,
-            )
-            .cuda()
-            .requires_grad_(False)
-        )
+        config = _expert_fc1_config()
         transform = CanonicalMultiLoRA(
             target_modules=["linear_fc1_gate", "linear_fc1_up"],
             n_adapters=3,
@@ -165,7 +215,7 @@ def test_expert_projections_export(shared_outer, packed_checkpoint):
             experts_shared_outer_loras=shared_outer,
             lora_B_init_method="normal",
         )
-        layer = transform.transform(base, name="linear_fc1", prefix="decoder.layers.0.mlp.experts")
+        layer = transform.transform(_expert_fc1(config), name="linear_fc1", prefix="decoder.layers.0.mlp.experts")
         for slot, rank in enumerate((8, 4, 8)):
             init_adapter_slot(layer, slot, rank=rank, alpha=rank, seed=20 + slot)
         indices = torch.arange(16, device="cuda")
@@ -191,38 +241,48 @@ def test_expert_projections_export(shared_outer, packed_checkpoint):
         assert all(p.grad is not None and p.grad.count_nonzero() == 0 for p in layer.adapters[2].parameters())
         assert all(p.grad is not None and p.grad.isfinite().all() for p in layer.adapters.parameters())
 
-        model = torch.nn.Module()
-        model.config = config
-        model.decoder = torch.nn.Module()
-        model.decoder.layers = torch.nn.ModuleList([torch.nn.Module()])
-        model.decoder.layers[0].mlp = torch.nn.Module()
-        model.decoder.layers[0].mlp.experts = torch.nn.Module()
-        model.decoder.layers[0].mlp.experts.linear_fc1 = layer
-        bridge = Qwen3MoEBridge()
-        if packed_checkpoint:
-            bridge.mapping_registry = lambda: MegatronMappingRegistry(
-                FusedGatedExpertMapping(
-                    megatron_param="decoder.layers.*.mlp.experts.linear_fc1.weight*",
-                    hf_param="model.layers.*.mlp.experts.gate_up_proj",
-                )
-            )
-        with expose_adapter_slot(model, 0):
-            exported = dict(bridge.stream_adapter_weights_megatron_to_hf([model], cpu=False, show_progress=False))
-        for key, projection in (("adapter_gate", "gate_proj"), ("adapter_up", "up_proj")):
-            adapter = layer.adapters[0][key]
-            for local_expert in range(2):
-                expert = dist.get_rank() * 2 + local_expert
-                prefix = f"model.layers.0.mlp.experts.{expert}.{projection}"
-                a = (
-                    exported[f"model.layers.0.mlp.experts.{projection}.lora_A.weight"][0]
-                    if shared_outer
-                    else exported[prefix + ".lora_A.weight"]
-                )
-                b = exported[prefix + ".lora_B.weight"]
-                torch.testing.assert_close(
-                    a,
-                    adapter.linear_in.weight if shared_outer else adapter.linear_in.weight[local_expert],
-                    atol=0,
-                    rtol=0,
-                )
-                torch.testing.assert_close(b, adapter.linear_out.weight[local_expert], atol=0, rtol=0)
+        _assert_expert_projections_exported(
+            layer,
+            layer.adapters[0],
+            config,
+            shared_outer=shared_outer,
+            packed_checkpoint=packed_checkpoint,
+            slot=0,
+        )
+
+
+@pytest.mark.usefixtures("two_rank_process_group")
+@pytest.mark.parametrize("shared_outer", [False, True])
+@pytest.mark.parametrize("packed_checkpoint", [False, True])
+def test_single_adapter_expert_projections_export(shared_outer, packed_checkpoint):
+    with _model_parallel(tp=1, ep=2):
+        config = _expert_fc1_config()
+        transform = CanonicalLoRA(
+            target_modules=["linear_fc1_gate", "linear_fc1_up"],
+            dim=8,
+            alpha=8,
+            share_expert_adapters=False,
+            experts_shared_outer_loras=shared_outer,
+            lora_B_init_method="normal",
+        )
+        layer = transform.transform(_expert_fc1(config), name="linear_fc1", prefix="decoder.layers.0.mlp.experts")
+        assert isinstance(layer, LoRALinearSplitFC1UpGate)
+        adapters = layer.adapter
+        x = torch.randn(16, 32, device="cuda", dtype=torch.bfloat16)
+        actual, _ = layer(x, [8, 8])
+        expected = []
+        for row in range(16):
+            parts = []
+            for key in ("adapter_gate", "adapter_up"):
+                adapter = adapters[key]
+                a = adapter.linear_in.weight if shared_outer else adapter.linear_in.weight[row // 8]
+                b = adapter.linear_out.weight[row // 8]
+                parts.append(F.linear(F.linear(x[row], a), b))
+            expected.append(torch.cat(parts))
+        torch.testing.assert_close(actual, torch.stack(expected), atol=0.03125, rtol=0.02)
+        actual.float().square().mean().backward()
+        assert all(p.grad is not None and p.grad.count_nonzero() > 0 for p in adapters.parameters())
+
+        _assert_expert_projections_exported(
+            layer, adapters, config, shared_outer=shared_outer, packed_checkpoint=packed_checkpoint
+        )
