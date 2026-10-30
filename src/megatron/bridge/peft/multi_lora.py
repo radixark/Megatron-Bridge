@@ -28,7 +28,7 @@ import torch.nn as nn
 from megatron.core.transformer.moe.router import TopKRouter
 
 from megatron.bridge.peft.base import PEFT
-from megatron.bridge.peft.canonical_lora import CanonicalLoRA, _should_treat_linear_fc1_as_unfused
+from megatron.bridge.peft.canonical_lora import CanonicalLoRA
 from megatron.bridge.peft.module_matcher import ModuleMatcher
 from megatron.bridge.peft.multi_lora_layers import (
     PROJECTION_ADAPTER_KEYS,
@@ -116,7 +116,7 @@ class MultiLoRA(PEFT, ModuleMatcher):
         if (ans := self.match(module, name, prefix)) is not None:
             (match, full_name) = ans
             components = self.canonical_mapping.get(match, set())
-            if name == "linear_fc1" and _should_treat_linear_fc1_as_unfused(full_name):
+            if name == "linear_fc1" and components and not module.config.gated_linear_unit:
                 components = set()
             projection_targets = components & PROJECTION_ADAPTER_KEYS.keys()
 

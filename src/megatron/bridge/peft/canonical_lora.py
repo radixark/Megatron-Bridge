@@ -41,12 +41,6 @@ from megatron.bridge.peft.utils import (
 logger = logging.getLogger(__name__)
 
 
-def _should_treat_linear_fc1_as_unfused(full_name: str) -> bool:
-    """Return True when canonical LoRA should keep linear_fc1 as a single adapter: vision MLPs are not gated."""
-
-    return full_name.startswith("vision_model.")
-
-
 class ModuleDict(nn.ModuleDict):
     """
     nn.ModuleDict with a sharded_state_dict implementation for checkpointing
@@ -445,8 +439,8 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
                     replicate_adapter=attrs.replicate_adapter,
                 )
 
-            if name == "linear_fc1" and _should_treat_linear_fc1_as_unfused(full_name):
-                logger.info(f"Adding lora to: {full_name} (treating unsupported canonical linear_fc1 as unfused)")
+            if name == "linear_fc1" and not m.config.gated_linear_unit:
+                logger.info(f"Adding lora to: {full_name} (non-gated linear_fc1 has no gate/up to split)")
                 adapter = adapter_cls(attrs.in_features, attrs.out_features, **adapter_kwargs)
                 return LoRALinear(m, adapter)
 
@@ -469,9 +463,13 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
             if name == "linear_fc1":
                 adapter_up, adapter_gate = None, None
                 if "linear_fc1_up" in canonical_submodules:
-                    adapter_up = adapter_cls(attrs.in_features, attrs.out_features // 2, **adapter_kwargs)
+                    adapter_up = adapter_cls(
+                        attrs.in_features, attrs.out_features // 2, **adapter_kwargs
+                    )
                 if "linear_fc1_gate" in canonical_submodules:
-                    adapter_gate = adapter_cls(attrs.in_features, attrs.out_features // 2, **adapter_kwargs)
+                    adapter_gate = adapter_cls(
+                        attrs.in_features, attrs.out_features // 2, **adapter_kwargs
+                    )
                 adapters = ModuleDict({"adapter_up": adapter_up, "adapter_gate": adapter_gate})
                 return LoRALinearSplitFC1UpGate(m, adapters)
 

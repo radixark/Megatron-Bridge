@@ -25,6 +25,7 @@ export seam) is exercised in ``test_multi_lora_layers.py``.
 
 import datetime
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import megatron.core.parallel_state as parallel_state
@@ -43,6 +44,12 @@ from megatron.bridge.peft.multi_lora_layers import MultiLoRALinear
 # ======================================================================
 # Test doubles
 # ======================================================================
+
+
+def _fc1(*, gated_linear_unit: bool) -> nn.Linear:
+    fc1 = nn.Linear(32, 64)
+    fc1.config = SimpleNamespace(gated_linear_unit=gated_linear_unit)
+    return fc1
 
 
 class FakeMultiLoRALinear(nn.Module):
@@ -254,17 +261,17 @@ class TestMultiLoRATransform:
         assert isinstance(transformed.embedding, nn.Embedding)
         assert isinstance(transformed.layernorm, nn.LayerNorm)
 
-    def test_canonical_keeps_vision_linear_fc1_fused(self) -> None:
-        """Vision MLPs are not gated, so their fc1 keeps one fused adapter, as in CanonicalLoRA."""
+    def test_canonical_keeps_non_gated_linear_fc1_fused(self) -> None:
+        """A non-gated fc1 has no gate/up to split, so it keeps one fused adapter, as in CanonicalLoRA."""
         model = nn.Module()
-        model.vision_model = nn.ModuleDict({"linear_fc1": nn.Linear(32, 64)})
-        model.decoder = nn.ModuleDict({"linear_fc1": nn.Linear(32, 64)})
+        model.squared_relu_mlp = nn.ModuleDict({"linear_fc1": _fc1(gated_linear_unit=False)})
+        model.swiglu_mlp = nn.ModuleDict({"linear_fc1": _fc1(gated_linear_unit=True)})
         peft = CanonicalMultiLoRA(target_modules=["linear_fc1_gate", "linear_fc1_up"])
 
         transformed = peft(model, training=True)
 
-        assert transformed.vision_model["linear_fc1"].init_kwargs["projection_targets"] == set()
-        assert transformed.decoder["linear_fc1"].init_kwargs["projection_targets"] == {
+        assert transformed.squared_relu_mlp["linear_fc1"].init_kwargs["projection_targets"] == set()
+        assert transformed.swiglu_mlp["linear_fc1"].init_kwargs["projection_targets"] == {
             "linear_fc1_gate",
             "linear_fc1_up",
         }
