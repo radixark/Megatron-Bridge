@@ -292,6 +292,7 @@ The following table lists specific submodules within transformer architectures t
 | `linear_fc1_up` | Up projection in MLP |
 | `linear_fc1_gate` | Gate projection in MLP |
 | `linear_fc2` | Second MLP layer |
+| `in_proj_q`, `in_proj_k`, `in_proj_v`, `in_proj_z`, `in_proj_b`, `in_proj_a` | Components of the GDN input projection `in_proj`, each with its own `lora_A` (targeting `in_proj` keeps one fused adapter; the two cannot be mixed) |
 
 ```{note}
 Canonical LoRA does not support `linear_qkv` or `linear_fc1` targets. Use the individual component targets (`linear_q`, `linear_k`, `linear_v` for QKV and `linear_fc1_up`, `linear_fc1_gate` for FC1) instead.
