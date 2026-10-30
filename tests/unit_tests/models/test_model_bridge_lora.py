@@ -662,6 +662,37 @@ def test_merge_canonical_adapter_w1_w3():
     )
 
 
+def test_merge_canonical_adapter_resolves_every_ep_ranks_expert():
+    """EP gathers one expert per rank into the dict, while the mapping names only this rank's expert."""
+    bridge = DummyBridge()
+    converted = {
+        f"model.layers.0.mlp.experts.{expert}.{projection}.weight": torch.zeros(2, 2)
+        for expert in (0, 8)
+        for projection in ("gate_proj", "up_proj")
+    }
+    adapter_up = AdapterWeight(
+        global_base_prefix="decoder.layers.0.mlp.experts.local_experts.0.linear_fc1",
+        adapter_key="adapter_up",
+        alpha=1,
+        dim=1,
+        linear_in_weight=MegatronWeightTuple("in_up", torch.tensor([[1.0, 2.0]]), vp_stage=0),
+        linear_out_weight=MegatronWeightTuple("out_up", torch.ones(2, 1), vp_stage=0),
+    )
+
+    updated = bridge._merge_lora_adapter_weights(
+        [SimpleNamespace(config=SimpleNamespace(num_moe_experts=16))],
+        converted,
+        [adapter_up],
+        {"gate": "model.layers.0.mlp.experts.0.gate_proj.weight", "up": "model.layers.0.mlp.experts.0.up_proj.weight"},
+    )
+
+    for expert in (0, 8):
+        torch.testing.assert_close(updated[f"model.layers.0.mlp.experts.{expert}.gate_proj.weight"], torch.zeros(2, 2))
+        torch.testing.assert_close(
+            updated[f"model.layers.0.mlp.experts.{expert}.up_proj.weight"], torch.tensor([[1.0, 2.0]] * 2)
+        )
+
+
 def test_merge_single_canonical_adapter_preserves_unselected_projection():
     bridge = DummyBridge()
     converted = {

@@ -1615,12 +1615,14 @@ class MegatronPeftBridge:
                     adapter_weight.linear_out_weight.weight,
                 )
 
+        # converted_weights_dict holds every EP rank's expert, the mapping names this rank's
         adapter_key_by_hf_name = {
-            _hf_param_for_canonical_adapter(base_hf_param, adapter_key): adapter_key
+            self._strip_hf_expert_index(name): adapter_key
             for adapter_key in CANONICAL_ADAPTER_ROLES
+            if (name := _hf_param_for_canonical_adapter(base_hf_param, adapter_key)) is not None
         }
         for hf_name, base_weight in converted_weights_dict.items():
-            target_adapter_key = adapter_key_by_hf_name.get(hf_name)
+            target_adapter_key = adapter_key_by_hf_name.get(self._strip_hf_expert_index(hf_name))
             if target_adapter_key is None:
                 raise ValueError(f"Adapter name mapping not found for {hf_name}")
             target_adapter = adapter_lookup.get(target_adapter_key)
