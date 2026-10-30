@@ -1004,6 +1004,8 @@ def mark_expert_parallel_replicated(weight: torch.Tensor, *, ep_group: object | 
     """
 
     setattr(weight, _EXPERT_PARALLEL_REPLICATED_ATTR, True)
+    # Megatron's grad norm skips params marked shared, so only EP rank 0 counts the replica
+    weight.shared = ep_group is not None and get_pg_rank(ep_group) != 0
     if ep_group is None or _process_group_size(ep_group) <= 1 or not weight.requires_grad:
         return
 

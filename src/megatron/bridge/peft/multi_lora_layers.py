@@ -791,13 +791,6 @@ class MultiLoRAGroupedExpertLinear(MultiLoRALinear):
             ]
         )
 
-        if experts_shared_outer_loras:
-            for slot in self.adapters:
-                for adapter in _adapter_leaves(slot):
-                    shared = adapter.linear_out.weight if self.input_is_parallel else adapter.linear_in.weight
-                    # Megatron excludes replicas marked shared from gradient norms.
-                    shared.shared = parallel_state.get_expert_model_parallel_rank() != 0
-
         self.tokens_per_adapter: Optional[torch.Tensor] = None
         # Written by set_tokens_per_adapter_slot alongside tokens_per_adapter;
         # unused here (the slot-routing hook owns the expert-side SP narrow).

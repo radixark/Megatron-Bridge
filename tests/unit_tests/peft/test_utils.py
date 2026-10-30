@@ -1521,11 +1521,20 @@ class TestExpertParallelReplicatedGradSync:
         weight = nn.Parameter(torch.ones(2, 2))
         mark_expert_parallel_replicated(weight, ep_group=None)
         assert weight.expert_parallel_replicated is True
+        assert weight.shared is False
         assert not hasattr(weight, "_expert_parallel_grad_hook")
 
         with patch("torch.distributed.all_reduce") as mock_all_reduce:
             weight.sum().backward()
         mock_all_reduce.assert_not_called()
+
+    @pytest.mark.parametrize("ep_rank,shared", [(0, False), (1, True)])
+    def test_mark_counts_one_replica_in_the_grad_norm(self, ep_rank, shared):
+        """Megatron's grad norm skips params marked shared; otherwise each EP replica adds its norm again."""
+        weight = nn.Parameter(torch.ones(2, 2))
+        with patch("megatron.bridge.peft.utils.get_pg_rank", return_value=ep_rank):
+            mark_expert_parallel_replicated(weight, ep_group=MockProcessGroup(size=2))
+        assert weight.shared is shared
 
     def test_allreduce_coalesces_main_grads_per_dtype(self):
         ep_group = MockProcessGroup(size=2)
