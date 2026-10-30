@@ -317,7 +317,7 @@ class TestLoRA:
         with (
             patch("megatron.bridge.peft.lora.get_adapter_attributes_from_linear", side_effect=mock_get_attrs),
             patch("megatron.bridge.peft.lora.ParallelLinearAdapter") as mock_parallel_adapter,
-            patch("megatron.bridge.peft.lora.GroupedExpertLinearAdapter") as mock_grouped_adapter,
+            patch("megatron.bridge.peft.utils.GroupedExpertLinearAdapter") as mock_grouped_adapter,
         ):
             mock_parallel_adapter.return_value = nn.Identity()
             transformed_model = lora(model, training=True)
@@ -767,7 +767,7 @@ class TestLoRANormalizeMoE:
 
         with (
             patch("megatron.bridge.peft.lora.get_adapter_attributes_from_linear", side_effect=mock_get_attrs),
-            patch("megatron.bridge.peft.lora.GroupedExpertLinearAdapter") as mock_adapter,
+            patch("megatron.bridge.peft.utils.GroupedExpertLinearAdapter") as mock_adapter,
         ):
             mock_adapter.return_value = nn.Identity()
             lora(model, training=True)

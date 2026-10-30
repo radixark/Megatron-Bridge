@@ -714,6 +714,26 @@ def is_grouped_expert_linear(fqn: str) -> bool:
     return is_expert_linear(fqn) and ".local_experts." not in fqn
 
 
+def select_grouped_expert_adapter(
+    module: nn.Module, full_name: str, *, share_expert_adapters: bool, experts_shared_outer_loras: bool
+) -> Optional[Tuple[type, dict]]:
+    """Return the grouped-expert adapter class and its extra kwargs, or None when ``module`` takes a
+    :class:`ParallelLinearAdapter`. Shared-outer takes precedence over ``share_expert_adapters``."""
+
+    if not is_grouped_expert_linear(full_name):
+        return None
+    if experts_shared_outer_loras:
+        adapter_cls = SharedOuterGroupedExpertAdapter
+    elif not share_expert_adapters:
+        adapter_cls = GroupedExpertLinearAdapter
+    else:
+        return None
+    first_param = next(module.parameters())
+    return adapter_cls, dict(
+        num_local_experts=module.num_gemms, params_device=first_param.device, params_dtype=first_param.dtype
+    )
+
+
 def get_effective_lora_dim(module: nn.Module, *, dim: int, normalize_moe_lora: bool, is_expert: bool) -> int:
     """Return the LoRA rank to use, reduced for expert layers when ``normalize_moe_lora`` is enabled."""
 
