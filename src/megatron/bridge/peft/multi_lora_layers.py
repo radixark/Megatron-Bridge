@@ -54,12 +54,11 @@ from megatron.core.transformer.moe.moe_utils import sort_chunks_by_idxs
 from megatron.bridge.peft.adapter_wrapper import AdapterWrapper
 from megatron.bridge.peft.canonical_lora import ModuleDict, interleave_qkv, value_head_size
 from megatron.bridge.peft.utils import (
-    GroupedExpertLinearAdapter,
     ParallelLinearAdapter,
-    SharedOuterGroupedExpertAdapter,
     TERowParallelLinear,
     _broadcast_shared_expert_weights,
     get_adapter_attributes_from_linear,
+    select_grouped_expert_adapter,
 )
 
 
@@ -761,15 +760,15 @@ class MultiLoRAGroupedExpertLinear(MultiLoRALinear):
         self.use_a2a = False
         self._gather_output = False
 
-        first_param = next(to_wrap.parameters())
-        adapter_cls = SharedOuterGroupedExpertAdapter if experts_shared_outer_loras else GroupedExpertLinearAdapter
+        adapter_cls, grouped_kwargs = select_grouped_expert_adapter(
+            to_wrap, full_name, share_expert_adapters=False, experts_shared_outer_loras=experts_shared_outer_loras
+        )
         self._projection_sizes = _projection_sizes(to_wrap, attrs.out_features, projection_targets)
         self._projection_shards = config.expert_tensor_parallel_size if self._projection_sizes else 1
         factory = partial(
             adapter_cls,
             in_features=attrs.in_features,
             dim=dim,
-            num_local_experts=num_local_experts,
             activation="identity",
             column_init_method=column_init_method,
             row_init_method=row_init_method,
@@ -779,8 +778,7 @@ class MultiLoRAGroupedExpertLinear(MultiLoRALinear):
             model_parallel_config=config,
             alpha=alpha,
             base_linear_is_parallel=attrs.base_linear_is_parallel,
-            params_device=first_param.device,
-            params_dtype=first_param.dtype,
+            **grouped_kwargs,
         )
         self.adapters = nn.ModuleList(
             [
@@ -806,6 +804,7 @@ class MultiLoRAGroupedExpertLinear(MultiLoRALinear):
         # (including recompute replays), so it is never stale when read; the None
         # here only guards a forward that runs before install_moe_slot_routing.
         self.expert_slot_routing: Optional[ExpertSlotRouting] = None
+        first_param = next(to_wrap.parameters())
         device = first_param.device
         dtype = first_param.dtype
         self.register_buffer("alpha_values", torch.ones(n_adapters, dtype=dtype, device=device), persistent=False)
