@@ -115,6 +115,7 @@ def _fake_get_attrs(module: nn.Module, *args, **kwargs) -> AdapterAttributes:
     """Return adapter attributes for a plain ``nn.Linear`` ``to_wrap``."""
     module.config = getattr(module, "config", SimpleNamespace())
     module.config.sequence_parallel = False
+    vars(module.config).setdefault("gated_linear_unit", True)
     return AdapterAttributes(
         input_is_parallel=getattr(module, "_test_input_is_parallel", False),
         in_features=module.in_features,

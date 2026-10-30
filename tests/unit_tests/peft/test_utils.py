@@ -942,7 +942,12 @@ class TestParallelLinearAdapter:
         mock_config.gated_linear_unit = True
 
         adapter = ParallelLinearAdapter(
-            in_features=20, out_features=10, dim=16, base_linear_name="linear_fc1", model_parallel_config=mock_config
+            in_features=20,
+            out_features=10,
+            dim=16,
+            base_linear_name="linear_fc1",
+            model_parallel_config=mock_config,
+            fused_gate_up=True,
         )
 
         result = adapter.sharded_state_dict(prefix="adapter.")
@@ -954,7 +959,7 @@ class TestParallelLinearAdapter:
     @patch("megatron.bridge.peft.utils.apply_swiglu_sharded_factory")
     @patch("megatron.bridge.peft.utils.ColumnParallelLinear")
     @patch("megatron.bridge.peft.utils.RowParallelLinear")
-    def test_parallel_linear_adapter_sharded_state_dict_gate_up_half_skips_swiglu(
+    def test_parallel_linear_adapter_sharded_state_dict_unfused_fc1_skips_swiglu(
         self, mock_row_linear, mock_col_linear, mock_swiglu_factory, mock_config
     ):
         """A gate or up half holds one projection, so re-splitting it as fused [gate; up] would permute rows."""
@@ -971,7 +976,6 @@ class TestParallelLinearAdapter:
             dim=16,
             base_linear_name="linear_fc1",
             model_parallel_config=mock_config,
-            gate_up_half=True,
         )
 
         result = adapter.sharded_state_dict(prefix="adapter.")
@@ -1245,6 +1249,7 @@ class TestParallelLinearAdapter:
             base_linear_name="decoder.layers.0.mlp.experts.linear_fc1",
             is_expert=True,
             model_parallel_config=mock_config,
+            fused_gate_up=True,
         )
         result = adapter.sharded_state_dict(prefix="adapter.")
 
@@ -2692,6 +2697,7 @@ class TestGroupedExpertLinearAdapter:
             activation="identity",
             input_is_parallel=False,
             model_parallel_config=config,
+            fused_gate_up=True,
         )
 
         result = adapter.sharded_state_dict("adapter.")
@@ -2729,6 +2735,7 @@ class TestGroupedExpertLinearAdapter:
             activation="identity",
             input_is_parallel=False,
             model_parallel_config=config,
+            fused_gate_up=True,
         )
 
         expert = torch.arange(2).reshape(2, 1, 1) * 1000

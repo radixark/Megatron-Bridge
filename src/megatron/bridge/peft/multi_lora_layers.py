@@ -176,18 +176,13 @@ PROJECTION_ADAPTER_KEYS = {
 }
 
 
-def _make_slot_adapter(factory, full_name, out_features, sizes, targets):
+def _make_slot_adapter(factory, to_wrap, full_name, out_features, sizes, targets):
     if not sizes:
-        return factory(out_features=out_features, base_linear_name=full_name)
+        fused_gate_up = full_name.endswith("linear_fc1") and to_wrap.config.gated_linear_unit
+        return factory(out_features=out_features, base_linear_name=full_name, fused_gate_up=fused_gate_up)
     selected = {PROJECTION_ADAPTER_KEYS[target] for target in targets}
     return ModuleDict(
-        {
-            key: factory(
-                out_features=size, base_linear_name=full_name, gate_up_half=key in ("adapter_gate", "adapter_up")
-            )
-            for key, size in sizes.items()
-            if key in selected
-        }
+        {key: factory(out_features=size, base_linear_name=full_name) for key, size in sizes.items() if key in selected}
     )
 
 
@@ -311,7 +306,9 @@ class MultiLoRALinear(AdapterWrapper):
         )
         self.adapters = nn.ModuleList(
             [
-                _make_slot_adapter(factory, full_name, attrs.out_features, self._projection_sizes, projection_targets)
+                _make_slot_adapter(
+                    factory, to_wrap, full_name, attrs.out_features, self._projection_sizes, projection_targets
+                )
                 for _ in range(n_adapters)
             ]
         )
@@ -787,7 +784,9 @@ class MultiLoRAGroupedExpertLinear(MultiLoRALinear):
         )
         self.adapters = nn.ModuleList(
             [
-                _make_slot_adapter(factory, full_name, attrs.out_features, self._projection_sizes, projection_targets)
+                _make_slot_adapter(
+                    factory, to_wrap, full_name, attrs.out_features, self._projection_sizes, projection_targets
+                )
                 for _ in range(n_adapters)
             ]
         )

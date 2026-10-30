@@ -452,13 +452,9 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
             if name == "linear_fc1":
                 adapter_up, adapter_gate = None, None
                 if "linear_fc1_up" in canonical_submodules:
-                    adapter_up = adapter_cls(
-                        attrs.in_features, attrs.out_features // 2, gate_up_half=True, **adapter_kwargs
-                    )
+                    adapter_up = adapter_cls(attrs.in_features, attrs.out_features // 2, **adapter_kwargs)
                 if "linear_fc1_gate" in canonical_submodules:
-                    adapter_gate = adapter_cls(
-                        attrs.in_features, attrs.out_features // 2, gate_up_half=True, **adapter_kwargs
-                    )
+                    adapter_gate = adapter_cls(attrs.in_features, attrs.out_features // 2, **adapter_kwargs)
                 adapters = ModuleDict({"adapter_up": adapter_up, "adapter_gate": adapter_gate})
                 return LoRALinearSplitFC1UpGate(m, adapters)
 

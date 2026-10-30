@@ -228,6 +228,7 @@ class LoRA(PEFT, ModuleMatcher):
                 model_parallel_config=module.config,
                 alpha=self.alpha,
                 base_linear_is_parallel=attrs.base_linear_is_parallel,
+                fused_gate_up=name == "linear_fc1" and module.config.gated_linear_unit,
             )
             if grouped_expert_adapter is not None:
                 adapter_cls, grouped_kwargs = grouped_expert_adapter

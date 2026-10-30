@@ -421,7 +421,6 @@ class TestCanonicalLoRA:
         assert isinstance(layer.mlp.linear_fc1, LoRALinearSplitFC1UpGate)
         assert isinstance(layer.mlp.experts.linear_fc1, LoRALinearSplitFC1UpGate)
         assert isinstance(layer.mlp.shared_experts.linear_fc1, LoRALinearSplitFC1UpGate)
-        assert all(call.kwargs["gate_up_half"] for call in mock_adapter.call_args_list)
 
     def test_canonical_lora_keeps_non_gated_linear_fc1_fused(self):
         """A non-gated MLP (Nemotron-H's squared-ReLU experts) has only up_proj, so no fc1 gets split."""

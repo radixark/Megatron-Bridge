@@ -94,7 +94,7 @@ class NestedModel(nn.Module):
 class MockMegatronLinear(nn.Module):
     """Mock Megatron linear layer that's not nn.Linear to trigger parallel adapter path."""
 
-    def __init__(self, in_features, out_features, moe_router_topk=None):
+    def __init__(self, in_features, out_features, moe_router_topk=None, gated_linear_unit=True):
         """Initialize with given dimensions and optional moe_router_topk on the mock config."""
         super().__init__()
         self.linear = nn.Linear(in_features, out_features)
@@ -105,6 +105,7 @@ class MockMegatronLinear(nn.Module):
             def __init__(self):
                 self.sequence_parallel = False
                 self.moe_router_topk = moe_router_topk
+                self.gated_linear_unit = gated_linear_unit
                 self.expert_tensor_parallel_size = 1
                 self.expert_model_parallel_size = 1
                 self.params_dtype = torch.float32
@@ -297,6 +298,39 @@ class TestLoRA:
             assert isinstance(layer["attention"]["linear_proj"], LoRALinear)
             assert isinstance(layer["mlp"]["linear_fc1"], LoRALinear)
             assert isinstance(layer["mlp"]["linear_fc2"], LoRALinear)
+
+    def test_lora_marks_only_gated_linear_fc1_as_fused_gate_up(self):
+        """Only a gated fc1's adapter output is the fused [gate; up] its checkpoint splits as SwiGLU."""
+        model = MoEModel()
+        model.decoder.layers[0].mlp.shared_experts.linear_fc1.config.gated_linear_unit = False
+
+        def mock_get_attrs(module, is_expert=False, sequence_parallel_input_regather=False):
+            return AdapterAttributes(
+                input_is_parallel=False,
+                in_features=module.in_features,
+                out_features=module.out_features,
+                disable_tensor_parallel_comm=False,
+                disable_sequence_parallel_comm=True,
+                base_linear_is_parallel=True,
+            )
+
+        with (
+            patch("megatron.bridge.peft.lora.get_adapter_attributes_from_linear", side_effect=mock_get_attrs),
+            patch("megatron.bridge.peft.lora.ParallelLinearAdapter") as mock_adapter,
+        ):
+            mock_adapter.return_value = nn.Identity()
+            LoRA(target_modules=["linear_fc1", "linear_fc2"])(model, training=True)
+
+        fused_gate_up = {
+            call.kwargs["base_linear_name"]: call.kwargs["fused_gate_up"] for call in mock_adapter.call_args_list
+        }
+        assert fused_gate_up == {
+            "decoder.layers.0.mlp.linear_fc1": True,
+            "decoder.layers.0.mlp.linear_fc2": False,
+            "decoder.layers.0.mlp.experts.linear_fc1": True,
+            "decoder.layers.0.mlp.experts.linear_fc2": False,
+            "decoder.layers.0.mlp.shared_experts.linear_fc1": False,
+        }
 
     def test_lora_grouped_expert_transform_uses_shared_adapter_by_default(self):
         """Grouped expert linears should keep the cheaper shared adapter path by default."""
