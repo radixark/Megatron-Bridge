@@ -2055,8 +2055,8 @@ def test_merge_canonical_gdn_in_proj_components():
     prefix = "model.layers.0.linear_attn"
     converted = {f"{prefix}.{key}.weight": torch.zeros(rows, 3) for key, rows in zip(GDN_IN_PROJ_KEYS, (8, 4, 2, 2))}
 
-    def adapter(key, rows):
-        torch.manual_seed(rows)
+    def adapter(key, rows, seed):
+        torch.manual_seed(seed)
         return AdapterWeight(
             global_base_prefix="decoder.layers.0.self_attention.in_proj",
             adapter_key=key,
@@ -2066,7 +2066,11 @@ def test_merge_canonical_gdn_in_proj_components():
             linear_out_weight=MegatronWeightTuple("out", torch.randn(rows, 1), vp_stage=0),
         )
 
-    k, v, a = adapter("adapter_in_proj_k", 2), adapter("adapter_in_proj_v", 4), adapter("adapter_in_proj_a", 2)
+    k, v, a = (
+        adapter("adapter_in_proj_k", 2, seed=0),
+        adapter("adapter_in_proj_v", 4, seed=1),
+        adapter("adapter_in_proj_a", 2, seed=2),
+    )
     updated = bridge._merge_lora_adapter_weights(
         [SimpleNamespace(config=config)], converted, [k, v, a], {"qkv": None, "z": None, "b": None, "a": None}
     )
