@@ -335,3 +335,142 @@ def test_single_adapter_non_gated_expert_fc1_skips_swiglu_checkpoint_split():
                 metadata={"dp_cp_group": parallel_state.get_data_parallel_group(with_context_parallel=True)},
             )
         grouped_swiglu_split.assert_not_called()
+
+
+def _assert_gdn_components_exported(layer, adapters, config, slot=None):
+    """Every targeted component exports this layer's gathered factors under its own HF component name."""
+    from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
+    from megatron.bridge.models.conversion.param_mapping import GDNLinearMappingSeparate
+    from megatron.bridge.models.qwen.qwen3_moe_bridge import Qwen3MoEBridge
+
+    model = torch.nn.Module()
+    model.config = config
+    model.decoder = torch.nn.Module()
+    model.decoder.layers = torch.nn.ModuleList([torch.nn.Module()])
+    model.decoder.layers[0].self_attention = torch.nn.Module()
+    model.decoder.layers[0].self_attention.in_proj = layer
+    bridge = Qwen3MoEBridge()
+    bridge.mapping_registry = lambda: MegatronMappingRegistry(
+        GDNLinearMappingSeparate(
+            megatron_param="decoder.layers.*.self_attention.in_proj.weight",
+            qkv="model.layers.*.linear_attn.in_proj_qkv.weight",
+            z="model.layers.*.linear_attn.in_proj_z.weight",
+            b="model.layers.*.linear_attn.in_proj_b.weight",
+            a="model.layers.*.linear_attn.in_proj_a.weight",
+        )
+    )
+    with expose_adapter_slot(model, slot) if slot is not None else nullcontext():
+        exported = dict(bridge.stream_adapter_weights_megatron_to_hf([model], cpu=False, show_progress=False))
+    expected = {}
+    for key, adapter in adapters.items():
+        if adapter is None:
+            continue
+        prefix = "model.layers.0.linear_attn." + key.removeprefix("adapter_")
+        expected[prefix + ".lora_A.weight"] = _gather(adapter.linear_in.weight).detach()
+        expected[prefix + ".lora_B.weight"] = _gather(adapter.linear_out.weight).detach()
+    assert exported.keys() == expected.keys()
+    for name, tensor in expected.items():
+        torch.testing.assert_close(exported[name], tensor, atol=0, rtol=0)
+
+
+@pytest.mark.usefixtures("two_rank_process_group")
+@pytest.mark.parametrize("multi", [False, True])
+@pytest.mark.parametrize(
+    "targets",
+    [
+        ["in_proj_q", "in_proj_k", "in_proj_v", "in_proj_z", "in_proj_b", "in_proj_a"],
+        ["in_proj_k", "in_proj_z", "in_proj_a"],
+    ],
+)
+@pytest.mark.parametrize("sequence_parallel", [False, True])
+def test_gdn_in_proj_components_tp(multi, targets, sequence_parallel):
+    from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
+
+    from megatron.bridge.models.conversion.param_mapping import (
+        _fuse_gdn_separate_to_grouped,
+        merge_gdn_linear_weights,
+    )
+    from megatron.bridge.peft.canonical_lora import LoRALinearSplitGDNInProj, gdn_in_proj_sizes
+
+    with _model_parallel(tp=2, ep=1):
+        # q/k: 2 key heads x 4, v/z: 4 value heads x 4, b/a: 4
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            linear_key_head_dim=4,
+            linear_num_key_heads=2,
+            linear_value_head_dim=4,
+            linear_num_value_heads=4,
+            tensor_model_parallel_size=2,
+            sequence_parallel=sequence_parallel,
+            params_dtype=torch.float32,
+            gradient_accumulation_fusion=False,
+        )
+        sizes = gdn_in_proj_sizes(config)
+        base = TELayerNormColumnParallelLinear(
+            32,
+            sum(sizes.values()),
+            config=config,
+            init_method=torch.nn.init.zeros_,
+            bias=False,
+            skip_bias_add=True,
+            tp_comm_buffer_name="fc1",
+            gather_output=False,
+            is_expert=False,
+        )
+        base = base.cuda().requires_grad_(False)
+        kwargs = dict(target_modules=targets, dim=8, alpha=16, lora_B_init_method="normal")
+        transform = CanonicalMultiLoRA(n_adapters=3, **kwargs) if multi else CanonicalLoRA(**kwargs)
+        layer = transform.transform(base, name="in_proj", prefix="decoder.layers.0.self_attention")
+        if multi:
+            for slot, rank in enumerate((8, 4, 8)):
+                init_adapter_slot(layer, slot, rank=rank, alpha=rank * 2, seed=10 + slot)
+            set_tokens_per_adapter_slot(layer, torch.tensor([4, 4, 0], device="cuda"))
+            slot_adapters = [layer.adapters[slot] for slot in range(2)]
+        else:
+            assert isinstance(layer, LoRALinearSplitGDNInProj)
+            slot_adapters = [layer.adapter, layer.adapter]
+        torch.manual_seed(100)
+        full_x = torch.randn(8, 1, 32, device="cuda", requires_grad=True)
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        x = (full_x.detach().chunk(2)[tp_rank] if sequence_parallel else full_x.detach()).clone().requires_grad_()
+        actual, _ = layer(x)
+        ref_x = F.layer_norm(full_x, (32,), eps=config.layernorm_epsilon)
+        references = []
+        # adapter -> its gathered (lora_A, lora_B); single-adapter LoRA serves both token halves with one adapter
+        leaves = {}
+        for slot, adapters in enumerate(slot_adapters):
+            deltas = {}
+            for target, width in sizes.items():
+                adapter = adapters[f"adapter_{target}"] if f"adapter_{target}" in adapters else None
+                if adapter is None:
+                    deltas[target] = full_x.new_zeros(width, 32)
+                    continue
+                if adapter not in leaves:
+                    leaves[adapter] = (_gather(adapter.linear_in.weight), _gather(adapter.linear_out.weight))
+                a, b = leaves[adapter]
+                deltas[target] = b @ a * 2
+            # HF projections packed by the checkpoint conversion, which export inverts
+            qkv = torch.cat([deltas["in_proj_q"], deltas["in_proj_k"], deltas["in_proj_v"]])
+            qkvz, ba = _fuse_gdn_separate_to_grouped(
+                config, qkv, deltas["in_proj_z"], deltas["in_proj_b"], deltas["in_proj_a"]
+            )
+            merged = merge_gdn_linear_weights(config, qkvz, ba, tp_size=2)
+            references.append(F.linear(ref_x[slot * 4 : (slot + 1) * 4], merged))
+        expected = torch.cat(references)
+        _assert_close(actual, expected.chunk(2, dim=-1)[tp_rank])
+        actual.square().sum().backward()
+        expected.square().sum().backward()
+        for adapter, (a, b) in leaves.items():
+            _assert_close(adapter.linear_in.weight.grad, a.grad.chunk(2)[tp_rank])
+            _assert_close(adapter.linear_out.weight.grad, b.grad.chunk(2)[tp_rank])
+        # Single-adapter LoRA under SP takes TE's gathered LN output, whose grad TE drops, for every
+        # wrapper (fused LoRA included); MultiLoRA owns that gather.
+        if multi or not sequence_parallel:
+            expected_dx = full_x.grad.chunk(2)[tp_rank] if sequence_parallel else full_x.grad
+            _assert_close(x.grad, expected_dx)
+        if multi:
+            assert all(p.grad is not None and p.grad.count_nonzero() == 0 for p in layer.adapters[2].parameters())
+
+        _assert_gdn_components_exported(layer, slot_adapters[0], config, slot=0 if multi else None)

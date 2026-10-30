@@ -25,7 +25,13 @@ import torch.nn as nn
 from megatron.core.transformer.module import MegatronModule
 
 from megatron.bridge.models.gpt_provider import GPTModelProvider
-from megatron.bridge.peft.canonical_lora import CanonicalLoRA, LoRALinearSplitFC1UpGate, LoRALinearSplitQKV, ModuleDict
+from megatron.bridge.peft.canonical_lora import (
+    CanonicalLoRA,
+    LoRALinearSplitFC1UpGate,
+    LoRALinearSplitGDNInProj,
+    LoRALinearSplitQKV,
+    ModuleDict,
+)
 from megatron.bridge.peft.lora_layers import LoRALinear
 from megatron.bridge.peft.utils import AdapterAttributes, GroupedExpertLinearAdapter
 
@@ -148,6 +154,51 @@ class GroupedExpertMegatronStyleModel(nn.Module):
         grouped_linear = MockMegatronLinear(2048, 512)
         grouped_linear.num_gemms = 2
         layer.mlp.experts.linear_fc2 = grouped_linear
+
+
+def _gdn_in_proj():
+    """GDN in_proj with 2 key heads x 4 dims and 4 value heads x 2 dims: q/k/v/z = 8, b/a = 4."""
+    in_proj = MockMegatronLinear(16, 40)
+    in_proj.config.linear_key_head_dim = 4
+    in_proj.config.linear_num_key_heads = 2
+    in_proj.config.linear_value_head_dim = 2
+    in_proj.config.linear_num_value_heads = 4
+    in_proj.config.tensor_model_parallel_size = 1
+    return in_proj
+
+
+class GDNMegatronStyleModel(nn.Module):
+    """Model with a GDN layer's fused input projection."""
+
+    def __init__(self):
+        super().__init__()
+        self.decoder = nn.Module()
+        self.decoder.layers = nn.ModuleList([nn.Module()])
+        self.decoder.layers[0].self_attention = nn.Module()
+        self.decoder.layers[0].self_attention.in_proj = _gdn_in_proj()
+
+
+def _apply_with_linear_adapters(lora, model):
+    """Apply ``lora`` with each parallel adapter replaced by an nn.Linear of the requested shape."""
+
+    def attrs(module, is_expert=False):
+        return AdapterAttributes(
+            input_is_parallel=False,
+            in_features=module.in_features,
+            out_features=module.out_features,
+            disable_tensor_parallel_comm=False,
+            disable_sequence_parallel_comm=True,
+            base_linear_is_parallel=True,
+        )
+
+    with (
+        patch("megatron.bridge.peft.canonical_lora.get_adapter_attributes_from_linear", side_effect=attrs),
+        patch(
+            "megatron.bridge.peft.canonical_lora.ParallelLinearAdapter",
+            side_effect=lambda in_features, out_features, **kwargs: nn.Linear(in_features, out_features),
+        ),
+    ):
+        return lora(model, training=True)
 
 
 class NestedModel(nn.Module):
@@ -460,6 +511,30 @@ class TestCanonicalLoRA:
         mlp = transformed_model.language_model.decoder.layers[0].mlp
         for fc1 in (mlp.linear_fc1, mlp.experts.linear_fc1, mlp.shared_experts.linear_fc1):
             assert isinstance(fc1, MockMegatronLinear)
+
+    def test_canonical_lora_splits_gdn_in_proj(self):
+        """Each targeted GDN in_proj component gets its own adapter sized to that component."""
+        lora = CanonicalLoRA(target_modules=["in_proj_q", "in_proj_v", "in_proj_a"], dim=2)
+        assert lora.canonical_mapping["in_proj"] == {"in_proj_q", "in_proj_v", "in_proj_a"}
+
+        transformed_model = _apply_with_linear_adapters(lora, GDNMegatronStyleModel())
+
+        in_proj = transformed_model.decoder.layers[0].self_attention.in_proj
+        assert isinstance(in_proj, LoRALinearSplitGDNInProj)
+        widths = {key: None if adapter is None else adapter.out_features for key, adapter in in_proj.adapter.items()}
+        assert widths == {
+            "adapter_in_proj_q": 8,
+            "adapter_in_proj_k": None,
+            "adapter_in_proj_v": 8,
+            "adapter_in_proj_z": None,
+            "adapter_in_proj_b": None,
+            "adapter_in_proj_a": 4,
+        }
+
+    def test_canonical_lora_rejects_fused_and_split_gdn_in_proj(self):
+        lora = CanonicalLoRA(target_modules=["in_proj", "in_proj_q"])
+        with pytest.raises(AssertionError, match="cannot mix fused 'in_proj'"):
+            _apply_with_linear_adapters(lora, GDNMegatronStyleModel())
 
     def test_canonical_lora_normalize_moe_lora_reduces_expert_dim(self):
         """Expert linear_fc1 should get reduced dim when normalize_moe_lora is enabled."""
@@ -1129,6 +1204,39 @@ class TestCanonicalLoRAHelperClasses:
 
             assert output.shape == (2, 10, 2048)
             assert bias is None
+
+    def test_lora_linear_split_gdn_in_proj_forward(self):
+        """Component outputs land in Megatron's [q, k, v, z, b, a] order; untargeted components add zero."""
+        base_layer = _gdn_in_proj()
+        adapters = ModuleDict(
+            {
+                "adapter_in_proj_q": None,
+                "adapter_in_proj_k": nn.Linear(16, 8, bias=False),
+                "adapter_in_proj_v": None,
+                "adapter_in_proj_z": nn.Linear(16, 8, bias=False),
+                "adapter_in_proj_b": None,
+                "adapter_in_proj_a": nn.Linear(16, 4, bias=False),
+            }
+        )
+        wrapper = LoRALinearSplitGDNInProj(base_layer, adapters)
+
+        x = torch.randn(3, 16)
+        with patch.object(wrapper, "base_linear_forward", side_effect=lambda x: (base_layer(x)[0], None, x)):
+            output, _ = wrapper(x)
+
+        zeros = x.new_zeros(3, 8)
+        delta = torch.cat(
+            [
+                zeros,
+                adapters["adapter_in_proj_k"](x),
+                zeros,
+                adapters["adapter_in_proj_z"](x),
+                x.new_zeros(3, 4),
+                adapters["adapter_in_proj_a"](x),
+            ],
+            dim=-1,
+        )
+        torch.testing.assert_close(output, base_layer(x)[0] + delta)
 
 
 class TestCanonicalLoRAMegatronIntegration:

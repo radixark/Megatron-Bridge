@@ -78,6 +78,18 @@ def value_head_size(config) -> int:
     return getattr(config, "v_head_dim", config.kv_channels)
 
 
+# GDN ``in_proj`` components, in Megatron's per-TP-rank packing order
+GDN_IN_PROJ_TARGETS = ("in_proj_q", "in_proj_k", "in_proj_v", "in_proj_z", "in_proj_b", "in_proj_a")
+
+
+def gdn_in_proj_sizes(config) -> dict[str, int]:
+    """Global output width of each GDN ``in_proj`` component; each is TP-sharded on its own."""
+    qk_dim = config.linear_key_head_dim * config.linear_num_key_heads
+    v_dim = config.linear_value_head_dim * config.linear_num_value_heads
+    num_v_heads = config.linear_num_value_heads
+    return dict(zip(GDN_IN_PROJ_TARGETS, (qk_dim, qk_dim, v_dim, v_dim, num_v_heads, num_v_heads)))
+
+
 def interleave_qkv(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -225,6 +237,28 @@ class LoRALinearSplitFC1UpGate(AdapterWrapper):
         return linear_output + adapter_output, bias
 
 
+class LoRALinearSplitGDNInProj(AdapterWrapper):
+    """An adapter wrapper for GDN `in_proj` where q, k, v, z, b, a are separate adapters.
+
+    Megatron packs each TP rank's shard of every component contiguously, so the local adapter
+    outputs concatenate in ``GDN_IN_PROJ_TARGETS`` order.
+    """
+
+    def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # pylint: disable=C0115,C0116
+        linear_output, bias, layernorm_output = self.base_linear_forward(x, *args, **kwargs)
+        if not self._adapter_enabled:
+            return linear_output, bias
+        config = self.to_wrap.config
+        outputs = [
+            self.adapter_forward(self.adapter[f"adapter_{component}"], layernorm_output, *args, **kwargs)
+            if self.adapter[f"adapter_{component}"] is not None
+            else linear_output.new_zeros(*linear_output.shape[:-1], size // config.tensor_model_parallel_size)
+            for component, size in gdn_in_proj_sizes(config).items()
+        ]
+        return linear_output + torch.cat(outputs, dim=-1), bias
+
+
 @dataclass
 class CanonicalLoRA(PEFT, ModuleMatcher):
     """
@@ -243,6 +277,9 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
                 - 'linear_fc1_up', 'linear_fc1_gate': Apply LoRA to the Up proj and Gate proj layers.
                         These two together constitute the first fully-connected layer in MLP in LoRA.
                 - 'linear_fc2': Apply LoRA to the second fully-connected layer in MLP.
+                - 'in_proj_q', 'in_proj_k', 'in_proj_v', 'in_proj_z', 'in_proj_b', 'in_proj_a': Apply LoRA to the
+                        components of the GDN input projection ``in_proj`` separately, each with its own lora_A.
+                        Targeting 'in_proj' instead keeps one fused adapter.
             Target modules can also contain wildcards. For example, you can specify
                 target_modules=['*.layers.0.*.linear_q', '*.layers.1.*.linear_q'] to add LoRA to only linear_q
                 on the first two layers.
@@ -355,6 +392,9 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
             elif target.endswith("linear_fc1_gate"):
                 canonical_target = target.replace("linear_fc1_gate", "linear_fc1")
                 canonical_component = "linear_fc1_gate"
+            elif target.endswith(GDN_IN_PROJ_TARGETS):
+                canonical_component = next(c for c in GDN_IN_PROJ_TARGETS if target.endswith(c))
+                canonical_target = target.removesuffix(canonical_component) + "in_proj"
 
             self.register_target_alias(target, canonical_target)
             self.canonical_mapping[canonical_target].add(canonical_component)
@@ -373,7 +413,9 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
         """
 
         # Skip already transformed modules
-        if isinstance(m, (LoRALinear, LoRALinearSplitQKV, LoRALinearSplitFC1UpGate, LoRATopKRouter)):
+        if isinstance(
+            m, (LoRALinear, LoRALinearSplitQKV, LoRALinearSplitFC1UpGate, LoRALinearSplitGDNInProj, LoRATopKRouter)
+        ):
             return m
 
         if (ans := self.match(m, name, prefix)) is not None:
@@ -462,6 +504,21 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
                     adapter_gate = adapter_cls(attrs.in_features, attrs.out_features // 2, **adapter_kwargs)
                 adapters = ModuleDict({"adapter_up": adapter_up, "adapter_gate": adapter_gate})
                 return LoRALinearSplitFC1UpGate(m, adapters)
+
+            gdn_components = canonical_submodules & set(GDN_IN_PROJ_TARGETS)
+            if gdn_components:
+                assert canonical_submodules == gdn_components, (
+                    f"{full_name}: cannot mix fused 'in_proj' with its components {sorted(gdn_components)}"
+                )
+                adapters = ModuleDict(
+                    {
+                        f"adapter_{component}": adapter_cls(attrs.in_features, size, **adapter_kwargs)
+                        if component in gdn_components
+                        else None
+                        for component, size in gdn_in_proj_sizes(m.config).items()
+                    }
+                )
+                return LoRALinearSplitGDNInProj(m, adapters)
 
             adapter = adapter_cls(attrs.in_features, attrs.out_features, **adapter_kwargs)
             logger.info(f"Adding lora to: {full_name}")
