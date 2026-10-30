@@ -191,7 +191,7 @@ class LoRALinearSplitQKV(AdapterWrapper):
 
         if key is None and value is None:
             kv_size = (linear_output.size(-1) - query.size(-1)) // 2
-            key = value = layernorm_output.new_zeros(*layernorm_output.shape[:-1], kv_size)
+            key = value = linear_output.new_zeros(*linear_output.shape[:-1], kv_size)
         elif key is None:
             key = torch.zeros_like(value)
         elif value is None:
@@ -199,7 +199,7 @@ class LoRALinearSplitQKV(AdapterWrapper):
 
         if query is None:
             query_size = linear_output.size(-1) - 2 * key.size(-1)
-            query = layernorm_output.new_zeros(*layernorm_output.shape[:-1], query_size)
+            query = linear_output.new_zeros(*linear_output.shape[:-1], query_size)
 
         adapter_output = self._interleave_qkv(query, key, value)
 

@@ -125,10 +125,10 @@ def test_projection_forward_backward_tp(name, targets, widths, output_gate, sequ
 
 
 @pytest.mark.usefixtures("two_rank_process_group")
-@pytest.mark.parametrize("canonical", [False, True])
+@pytest.mark.parametrize("variant", ["fused", "canonical", "canonical_first_only"])
 @pytest.mark.parametrize("name", ["linear_qkv", "linear_fc1"])
 @pytest.mark.parametrize("sequence_parallel", [False, True])
-def test_single_adapter_layernorm_input_grad_tp(canonical, name, sequence_parallel):
+def test_single_adapter_layernorm_input_grad_tp(variant, name, sequence_parallel):
     from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
 
     with _model_parallel(tp=2, ep=1):
@@ -158,20 +158,29 @@ def test_single_adapter_layernorm_input_grad_tp(canonical, name, sequence_parall
         )
         base = base.cuda().requires_grad_(False)
         kwargs = dict(dim=8, alpha=16, lora_B_init_method="normal")
+        canonical = variant != "fused"
+        keys, widths = (("q", "k", "v"), (32, 16, 16)) if is_qkv else (("gate", "up"), (32, 32))
         if canonical:
-            targets = ["linear_q", "linear_k", "linear_v"] if is_qkv else ["linear_fc1_gate", "linear_fc1_up"]
+            # untargeted projections are zero-filled by the wrapper
+            targeted = keys[:1] if variant == "canonical_first_only" else keys
+            targets = [f"linear_{key}" if is_qkv else f"linear_fc1_{key}" for key in targeted]
             transform = CanonicalLoRA(target_modules=targets, **kwargs)
         else:
             transform = LoRA(target_modules=[name], **kwargs)
         layer = transform.transform(base, name=name, prefix="decoder.layers.0.self_attention")
         if canonical:
-            adapters = [layer.adapter[f"adapter_{key}"] for key in (("q", "k", "v") if is_qkv else ("gate", "up"))]
+            adapters = [layer.adapter[f"adapter_{key}"] for key in keys]
         else:
             adapters = [layer.adapter]
-        leaves = [
-            (adapter, _gather(adapter.linear_in.weight), _gather(adapter.linear_out.weight)) for adapter in adapters
+        factors = {
+            adapter: (_gather(adapter.linear_in.weight), _gather(adapter.linear_out.weight))
+            for adapter in adapters
+            if adapter is not None
+        }
+        deltas = [
+            factors[adapter][1] @ factors[adapter][0] * 2 if adapter is not None else torch.zeros(width, 32).cuda()
+            for adapter, width in zip(adapters, widths)
         ]
-        deltas = [b @ a * 2 for _, a, b in leaves]
         if canonical and is_qkv:
             merged = merge_qkv_weights(config, *deltas)
         elif canonical:
@@ -188,7 +197,7 @@ def test_single_adapter_layernorm_input_grad_tp(canonical, name, sequence_parall
         _assert_close(actual, expected.chunk(2, dim=-1)[tp_rank])
         actual.square().sum().backward()
         expected.square().sum().backward()
-        for adapter, a, b in leaves:
+        for adapter, (a, b) in factors.items():
             _assert_close(adapter.linear_in.weight.grad, a.grad.chunk(2)[tp_rank])
             _assert_close(adapter.linear_out.weight.grad, b.grad.chunk(2)[tp_rank])
         # the base weight is zero, so the whole input gradient flows through the adapter
