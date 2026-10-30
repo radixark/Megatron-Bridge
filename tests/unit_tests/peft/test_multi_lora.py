@@ -276,6 +276,16 @@ class TestMultiLoRATransform:
             "linear_fc1_up",
         }
 
+    def test_canonical_skips_gate_only_target_on_non_gated_linear_fc1(self) -> None:
+        """A non-gated fc1 is the up projection alone, so targeting only gate leaves it unadapted."""
+        model = nn.Module()
+        model.squared_relu_mlp = nn.ModuleDict({"linear_fc1": _fc1(gated_linear_unit=False)})
+        peft = CanonicalMultiLoRA(target_modules=["linear_fc1_gate"])
+
+        transformed = peft(model, training=True)
+
+        assert isinstance(transformed.squared_relu_mlp["linear_fc1"], nn.Linear)
+
     def test_transform_forwards_constructor_arguments(self) -> None:
         model = SimpleModel()
         peft = MultiLoRA(

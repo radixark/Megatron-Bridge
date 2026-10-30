@@ -117,6 +117,9 @@ class MultiLoRA(PEFT, ModuleMatcher):
             (match, full_name) = ans
             components = self.canonical_mapping.get(match, set())
             if name == "linear_fc1" and components and not module.config.gated_linear_unit:
+                # a non-gated fc1 is the up projection alone
+                if "linear_fc1_up" not in components:
+                    return module
                 components = set()
             projection_targets = components & PROJECTION_ADAPTER_KEYS.keys()
 

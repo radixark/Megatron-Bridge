@@ -384,6 +384,12 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
                 )
                 return LoRALinear(m, adapter)
 
+            canonical_submodules = self.canonical_mapping[match]
+            non_gated_fc1 = name == "linear_fc1" and not m.config.gated_linear_unit
+            # a non-gated fc1 is the up projection alone
+            if non_gated_fc1 and "linear_fc1_up" not in canonical_submodules:
+                return m
+
             is_expert = is_expert_linear(full_name)
             attrs = get_adapter_attributes_from_linear(m, is_expert=is_expert)
 
@@ -428,12 +434,11 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
                     replicate_adapter=attrs.replicate_adapter,
                 )
 
-            if name == "linear_fc1" and not m.config.gated_linear_unit:
+            if non_gated_fc1:
                 logger.info(f"Adding lora to: {full_name} (non-gated linear_fc1 has no gate/up to split)")
                 adapter = adapter_cls(attrs.in_features, attrs.out_features, **adapter_kwargs)
                 return LoRALinear(m, adapter)
 
-            canonical_submodules = self.canonical_mapping[match]
             logger.info(f"Adding lora to: {full_name} ({canonical_submodules})")
             if name == "linear_qkv":
                 adapter_q, adapter_k, adapter_v = None, None, None

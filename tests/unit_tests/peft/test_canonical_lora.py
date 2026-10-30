@@ -450,6 +450,17 @@ class TestCanonicalLoRA:
             assert type(fc1) is LoRALinear
         assert all(call.args[1] == 2048 for call in mock_adapter.call_args_list)
 
+    def test_canonical_lora_skips_gate_only_target_on_non_gated_linear_fc1(self):
+        """A non-gated fc1 is the up projection alone, so targeting only gate leaves it unadapted."""
+        model = MoEMegatronStyleModel(gated_linear_unit=False)
+        lora = CanonicalLoRA(target_modules=["linear_fc1_gate"])
+
+        transformed_model = lora(model, training=True)
+
+        mlp = transformed_model.language_model.decoder.layers[0].mlp
+        for fc1 in (mlp.linear_fc1, mlp.experts.linear_fc1, mlp.shared_experts.linear_fc1):
+            assert isinstance(fc1, MockMegatronLinear)
+
     def test_canonical_lora_normalize_moe_lora_reduces_expert_dim(self):
         """Expert linear_fc1 should get reduced dim when normalize_moe_lora is enabled."""
         model = MoEMegatronStyleModel(moe_router_topk=2)
