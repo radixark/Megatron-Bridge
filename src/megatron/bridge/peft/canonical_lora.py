@@ -399,6 +399,12 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
             self.register_target_alias(target, canonical_target)
             self.canonical_mapping[canonical_target].add(canonical_component)
 
+        for canonical_target, components in self.canonical_mapping.items():
+            if components & set(GDN_IN_PROJ_TARGETS):
+                assert components <= set(GDN_IN_PROJ_TARGETS), (
+                    f"{canonical_target}: cannot mix fused 'in_proj' with its components {sorted(components)}"
+                )
+
     def transform(self, m: nn.Module, name: Optional[str] = None, prefix: Optional[str] = None) -> nn.Module:
         """
         Applies LoRA to a specific module within the model architecture.
@@ -505,15 +511,11 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
                 adapters = ModuleDict({"adapter_up": adapter_up, "adapter_gate": adapter_gate})
                 return LoRALinearSplitFC1UpGate(m, adapters)
 
-            gdn_components = canonical_submodules & set(GDN_IN_PROJ_TARGETS)
-            if gdn_components:
-                assert canonical_submodules == gdn_components, (
-                    f"{full_name}: cannot mix fused 'in_proj' with its components {sorted(gdn_components)}"
-                )
+            if canonical_submodules & set(GDN_IN_PROJ_TARGETS):
                 adapters = ModuleDict(
                     {
                         f"adapter_{component}": adapter_cls(attrs.in_features, size, **adapter_kwargs)
-                        if component in gdn_components
+                        if component in canonical_submodules
                         else None
                         for component, size in gdn_in_proj_sizes(m.config).items()
                     }

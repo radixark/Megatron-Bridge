@@ -33,6 +33,7 @@ from megatron.bridge.peft.canonical_lora import (
     ModuleDict,
 )
 from megatron.bridge.peft.lora_layers import LoRALinear
+from megatron.bridge.peft.multi_lora import CanonicalMultiLoRA
 from megatron.bridge.peft.utils import AdapterAttributes, GroupedExpertLinearAdapter
 
 
@@ -531,10 +532,10 @@ class TestCanonicalLoRA:
             "adapter_in_proj_a": 4,
         }
 
-    def test_canonical_lora_rejects_fused_and_split_gdn_in_proj(self):
-        lora = CanonicalLoRA(target_modules=["in_proj", "in_proj_q"])
+    @pytest.mark.parametrize("lora_cls", [CanonicalLoRA, CanonicalMultiLoRA])
+    def test_canonical_lora_rejects_fused_and_split_gdn_in_proj(self, lora_cls):
         with pytest.raises(AssertionError, match="cannot mix fused 'in_proj'"):
-            _apply_with_linear_adapters(lora, GDNMegatronStyleModel())
+            lora_cls(target_modules=["in_proj", "in_proj_q"])
 
     def test_canonical_lora_normalize_moe_lora_reduces_expert_dim(self):
         """Expert linear_fc1 should get reduced dim when normalize_moe_lora is enabled."""
