@@ -14,6 +14,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 
 from megatron.bridge.models.conversion.param_mapping import merge_qkv_weights
 from megatron.bridge.peft.canonical_lora import CanonicalLoRA, LoRALinearSplitFC1UpGate
+from megatron.bridge.peft.lora_layers import LoRALinear
 from megatron.bridge.peft.multi_lora import CanonicalMultiLoRA
 from megatron.bridge.peft.multi_lora_layers import expose_adapter_slot, init_adapter_slot, set_tokens_per_adapter_slot
 from megatron.bridge.peft.utils import ParallelLinearAdapter, _apply_grouped_expert_swiglu_sharded_factory
@@ -312,3 +313,25 @@ def test_single_adapter_expert_projections_export(layout, packed_checkpoint):
             layer, adapters, config, layout=layout, packed_checkpoint=packed_checkpoint
         )
         _assert_gate_up_checkpoint_not_swiglu_split(adapters)
+
+
+@pytest.mark.usefixtures("two_rank_process_group")
+def test_single_adapter_non_gated_expert_fc1_skips_swiglu_checkpoint_split():
+    """A non-gated fc1 holds one projection, so its full-width shared-outer adapter must not be split as SwiGLU."""
+    with _model_parallel(tp=1, ep=2):
+        config = _expert_fc1_config()
+        config.gated_linear_unit = False
+        transform = CanonicalLoRA(
+            target_modules=["linear_fc1_gate", "linear_fc1_up"], dim=8, alpha=8, experts_shared_outer_loras=True
+        )
+        layer = transform.transform(_expert_fc1(config), name="linear_fc1", prefix="decoder.layers.0.mlp.experts")
+        assert type(layer) is LoRALinear
+        with patch(
+            "megatron.bridge.peft.utils._apply_grouped_expert_swiglu_sharded_factory",
+            wraps=_apply_grouped_expert_swiglu_sharded_factory,
+        ) as grouped_swiglu_split:
+            layer.adapter.sharded_state_dict(
+                prefix="adapter.",
+                metadata={"dp_cp_group": parallel_state.get_data_parallel_group(with_context_parallel=True)},
+            )
+        grouped_swiglu_split.assert_not_called()
