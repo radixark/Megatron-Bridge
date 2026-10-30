@@ -26,29 +26,17 @@ from megatron.bridge.peft.base import PEFT
 from megatron.bridge.peft.lora_layers import LinearAdapter, LoRALinear, LoRATopKRouter
 from megatron.bridge.peft.module_matcher import ModuleMatcher
 from megatron.bridge.peft.utils import (
-    GroupedExpertLinearAdapter,
     ParallelLinearAdapter,
     align_expert_dim_for_tp,
     get_adapter_attributes_from_linear,
     get_effective_lora_dim,
     is_expert_linear,
-    is_grouped_expert_linear,
     is_modelopt_linear,
+    select_grouped_expert_adapter,
 )
 
 
 logger = logging.getLogger(__name__)
-
-
-def _should_treat_linear_fc1_as_unfused(full_name: str, *, split_experts: bool = False) -> bool:
-    """Return True when canonical LoRA should keep linear_fc1 as a single adapter.
-
-    Vision MLPs always stay fused; ``split_experts`` lets grouped expert gate/up take independent factors.
-    """
-
-    return full_name.startswith("vision_model.") or (
-        not split_experts and full_name.endswith(".mlp.experts.linear_fc1")
-    )
 
 
 class ModuleDict(nn.ModuleDict):
@@ -273,6 +261,10 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
             so it is comparable to a dense model. Defaults to False.
         share_expert_adapters (bool): When True, grouped MoE expert linears share one adapter across all local
             experts on the EP rank. Set to False to create one adapter per local expert instead. Defaults to True.
+        experts_shared_outer_loras (bool): When True, grouped MoE expert linears use
+            :class:`SharedOuterGroupedExpertAdapter`: the hidden-side factor (gate and up lora_A, down lora_B) is
+            shared across experts, matching SGLang's ``experts_shared_outer_loras=True``. Takes precedence over
+            ``share_expert_adapters``. Defaults to False.
     """
 
     target_modules: List[str] = field(
@@ -294,6 +286,7 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
     lora_B_init_method: str = "zero"
     normalize_moe_lora: bool = False
     share_expert_adapters: bool = True
+    experts_shared_outer_loras: bool = False
 
     def __post_init__(self) -> None:
         """Eagerly build ``canonical_mapping`` from the initial ``target_modules``.
@@ -391,6 +384,12 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
                 )
                 return LoRALinear(m, adapter)
 
+            canonical_submodules = self.canonical_mapping[match]
+            non_gated_fc1 = name == "linear_fc1" and not m.config.gated_linear_unit
+            # a non-gated fc1 is the up projection alone
+            if non_gated_fc1 and "linear_fc1_up" not in canonical_submodules:
+                return m
+
             is_expert = is_expert_linear(full_name)
             attrs = get_adapter_attributes_from_linear(m, is_expert=is_expert)
 
@@ -404,9 +403,12 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
                 is_expert=is_expert,
                 input_is_parallel=attrs.input_is_parallel,
             )
-            use_per_expert_adapter = is_grouped_expert_linear(full_name) and not self.share_expert_adapters
-            adapter_cls = GroupedExpertLinearAdapter if use_per_expert_adapter else ParallelLinearAdapter
-
+            grouped_expert_adapter = select_grouped_expert_adapter(
+                m,
+                full_name,
+                share_expert_adapters=self.share_expert_adapters,
+                experts_shared_outer_loras=self.experts_shared_outer_loras,
+            )
             adapter_kwargs = dict(
                 dim=dim,
                 base_linear_name=full_name,
@@ -420,14 +422,11 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
                 alpha=self.alpha,
                 base_linear_is_parallel=attrs.base_linear_is_parallel,
             )
-            if use_per_expert_adapter:
-                first_param = next(m.parameters())
-                adapter_kwargs.update(
-                    num_local_experts=m.num_gemms,
-                    params_device=first_param.device,
-                    params_dtype=first_param.dtype,
-                )
+            if grouped_expert_adapter is not None:
+                adapter_cls, grouped_kwargs = grouped_expert_adapter
+                adapter_kwargs.update(grouped_kwargs)
             else:
+                adapter_cls = ParallelLinearAdapter
                 adapter_kwargs.update(
                     is_expert=is_expert,
                     disable_tensor_parallel_comm=attrs.disable_tensor_parallel_comm,
@@ -435,12 +434,11 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
                     replicate_adapter=attrs.replicate_adapter,
                 )
 
-            if name == "linear_fc1" and _should_treat_linear_fc1_as_unfused(full_name):
-                logger.info(f"Adding lora to: {full_name} (treating unsupported canonical linear_fc1 as unfused)")
+            if non_gated_fc1:
+                logger.info(f"Adding lora to: {full_name} (non-gated linear_fc1 has no gate/up to split)")
                 adapter = adapter_cls(attrs.in_features, attrs.out_features, **adapter_kwargs)
                 return LoRALinear(m, adapter)
 
-            canonical_submodules = self.canonical_mapping[match]
             logger.info(f"Adding lora to: {full_name} ({canonical_submodules})")
             if name == "linear_qkv":
                 adapter_q, adapter_k, adapter_v = None, None, None

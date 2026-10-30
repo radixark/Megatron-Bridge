@@ -19,6 +19,10 @@ import pytest
 import torch
 
 from megatron.bridge.models.exaone.exaone45.modelling_exaone45.model import Exaone45Model
+from megatron.bridge.models.exaone.exaone45.modelling_exaone45.utils import (
+    Exaone45VisionPatchMerger,
+    PatchMergerSubmodules,
+)
 from megatron.bridge.models.exaone.exaone45.modelling_exaone45.vision_model import Exaone45VisionModel
 
 
@@ -87,3 +91,34 @@ def test_language_freeze_can_leave_mtp_trainable():
 
     assert not any(param.requires_grad for param in model.language_model.dense.parameters())
     assert all(param.requires_grad for param in model.language_model.mtp.parameters())
+
+
+def test_patch_merger_linears_are_not_gated():
+    """The merger MLP is plain GELU, so canonical LoRA must not split its fc1 into gate/up."""
+    linear_configs = []
+
+    class _Linear(torch.nn.Module):
+        def __init__(self, *args, config, **kwargs):
+            super().__init__()
+            linear_configs.append(config)
+
+    class _Norm(torch.nn.Module):
+        def __init__(self, config, hidden_size, eps):
+            super().__init__()
+
+    config = SimpleNamespace(
+        hidden_size=4,
+        spatial_merge_size=2,
+        layernorm_epsilon=1e-6,
+        gated_linear_unit=True,
+        init_method=None,
+        output_layer_init_method=None,
+        add_bias_linear=False,
+        out_hidden_size=8,
+    )
+    Exaone45VisionPatchMerger(
+        config, PatchMergerSubmodules(patch_norm=_Norm, linear_fc1=_Linear, linear_fc2=_Linear), tp_group=Mock()
+    )
+
+    assert [c.gated_linear_unit for c in linear_configs] == [False, False]
+    assert config.gated_linear_unit

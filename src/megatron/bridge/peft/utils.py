@@ -714,6 +714,26 @@ def is_grouped_expert_linear(fqn: str) -> bool:
     return is_expert_linear(fqn) and ".local_experts." not in fqn
 
 
+def select_grouped_expert_adapter(
+    module: nn.Module, full_name: str, *, share_expert_adapters: bool, experts_shared_outer_loras: bool
+) -> Optional[Tuple[type, dict]]:
+    """Return the grouped-expert adapter class and its extra kwargs, or None when ``module`` takes a
+    :class:`ParallelLinearAdapter`. Shared-outer takes precedence over ``share_expert_adapters``."""
+
+    if not is_grouped_expert_linear(full_name):
+        return None
+    if experts_shared_outer_loras:
+        adapter_cls = SharedOuterGroupedExpertAdapter
+    elif not share_expert_adapters:
+        adapter_cls = GroupedExpertLinearAdapter
+    else:
+        return None
+    first_param = next(module.parameters())
+    return adapter_cls, dict(
+        num_local_experts=module.num_gemms, params_device=first_param.device, params_dtype=first_param.dtype
+    )
+
+
 def get_effective_lora_dim(module: nn.Module, *, dim: int, normalize_moe_lora: bool, is_expert: bool) -> int:
     """Return the LoRA rank to use, reduced for expert layers when ``normalize_moe_lora`` is enabled."""
 
@@ -984,6 +1004,8 @@ def mark_expert_parallel_replicated(weight: torch.Tensor, *, ep_group: object | 
     """
 
     setattr(weight, _EXPERT_PARALLEL_REPLICATED_ATTR, True)
+    # Megatron's grad norm skips params marked shared, so only EP rank 0 counts the replica
+    weight.shared = ep_group is not None and get_pg_rank(ep_group) != 0
     if ep_group is None or _process_group_size(ep_group) <= 1 or not weight.requires_grad:
         return
 
@@ -1168,6 +1190,7 @@ class ParallelLinearAdapter(nn.Module):
         replicate_adapter: bool = False,
         pg_collection: ProcessGroupCollection | None = None,
         sequence_parallel_input_regather: bool = False,
+        fused_gate_up: bool = False,
     ) -> None:
         """Initialize the ParallelLinearAdapter.
 
@@ -1190,9 +1213,12 @@ class ParallelLinearAdapter(nn.Module):
             disable_sequence_parallel_comm: Disable sequence parallel communication.
             replicate_adapter: Duplicate both low-rank matrices across TP ranks.
             sequence_parallel_input_regather: Re-gather eligible LoRA-A sequence-parallel inputs in backward.
+            fused_gate_up: The output is a gated ``linear_fc1``'s fused [gate; up], which checkpoints split as
+                SwiGLU.
         """
         super().__init__()
         self.base_linear_name = base_linear_name
+        self.fused_gate_up = fused_gate_up
         self.activation = self._get_activation_fn(activation)
         self.dim = dim
         self.alpha = alpha if alpha is not None else self.dim
@@ -1756,7 +1782,7 @@ class ParallelLinearAdapter(nn.Module):
         # Non-grouped expert adapters already sit under .local_experts.* and keep
         # their existing expert-DP replica metadata instead.
         use_expert_axis = self._uses_grouped_expert_sharding() and not self.use_legacy_shared_expert_adapter_checkpoint
-        split_swiglu = "linear_fc1" in self.base_linear_name and getattr(self.config, "gated_linear_unit", False)
+        split_swiglu = self.fused_gate_up
         linear_in_sd = self.linear_in.sharded_state_dict(f"{prefix}linear_in.", sharded_offsets, metadata)
         linear_out_sd = self.linear_out.sharded_state_dict(f"{prefix}linear_out.", sharded_offsets, metadata)
 
@@ -2034,12 +2060,14 @@ class GroupedExpertLinearAdapter(nn.Module):
         params_device: Optional[torch.device] = None,
         params_dtype: Optional[torch.dtype] = None,
         pg_collection: ProcessGroupCollection | None = None,
+        fused_gate_up: bool = False,
     ) -> None:
         """Initialize grouped-expert LoRA weights for one adapter per local expert."""
 
         super().__init__()
 
         self.base_linear_name = base_linear_name
+        self.fused_gate_up = fused_gate_up
         self.activation = ParallelLinearAdapter._get_activation_fn(self, activation)
         self.dim = dim
         self.alpha = alpha if alpha is not None else self.dim
@@ -2615,7 +2643,7 @@ class GroupedExpertLinearAdapter(nn.Module):
             )
         }
 
-        if "linear_fc1" in self.base_linear_name and getattr(self.config, "gated_linear_unit", False):
+        if self.fused_gate_up:
             singleton_local_shards = (metadata or {}).get("singleton_local_shards", False)
             linear_out_key = f"{prefix}linear_out.weight"
             linear_out_sd[linear_out_key] = _apply_grouped_expert_swiglu_sharded_factory(
@@ -2740,11 +2768,13 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
         params_device: Optional[torch.device] = None,
         params_dtype: Optional[torch.dtype] = None,
         pg_collection: ProcessGroupCollection | None = None,
+        fused_gate_up: bool = False,
     ) -> None:
         """Initialize shared-outer LoRA weights with one shared and one per-expert side."""
 
         super().__init__()
         self.base_linear_name = base_linear_name
+        self.fused_gate_up = fused_gate_up
         self.activation = ParallelLinearAdapter._get_activation_fn(self, activation)
         self.dim = dim
         self.alpha = alpha if alpha is not None else self.dim
@@ -2868,7 +2898,7 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
         for shard in shared_sd.values():
             shard.replica_id = (0, get_pg_rank(self.ep_group), get_pg_rank(self.pg_collection.expt_dp))
 
-        if self._is_fc1 and self.base_linear_name.endswith("linear_fc1"):
+        if self.fused_gate_up:
             singleton_local_shards = (metadata or {}).get("singleton_local_shards", False)
             linear_out_key = f"{prefix}linear_out.weight"
             linear_out_sd[linear_out_key] = _apply_grouped_expert_swiglu_sharded_factory(

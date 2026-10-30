@@ -31,6 +31,7 @@ from megatron.bridge.models.conversion.model_bridge import (
 from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
     ColumnParallelMapping,
+    GatedMLPMapping,
     RowParallelMapping,
     _fuse_gdn_separate_to_grouped,
     merge_gdn_linear_weights,
@@ -173,6 +174,7 @@ def test_merge_lora_adapter_weights_merges(monkeypatch):
         [Mock(config=SimpleNamespace(num_moe_experts=0))],
         converted,
         [adapter_weight],
+        next(iter(converted)),
     )
     expected = base_weight + torch.eye(4)
     torch.testing.assert_close(updated["hf.weight"], expected)
@@ -193,6 +195,7 @@ def test_merge_lora_adapter_weights_empty_returns_empty():
         [SimpleNamespace(config=SimpleNamespace(num_moe_experts=0))],
         {},
         [adapter_weight],
+        "decoder.layers.0.mlp.linear_fc1.weight",
     )
     assert updated == {}
 
@@ -237,6 +240,7 @@ def test_merge_lora_adapter_weights_fused_fc1(monkeypatch):
         [Mock(config=SimpleNamespace(num_moe_experts=0))],
         converted,
         [adapter_weight],
+        next(iter(converted)),
     )
     torch.testing.assert_close(updated["decoder.layers.0.mlp.gate_proj.weight"], torch.eye(4))
     torch.testing.assert_close(updated["decoder.layers.0.mlp.up_proj.weight"], 2 * torch.eye(4))
@@ -273,6 +277,7 @@ def test_merge_lora_adapter_weights_fused_fc1_tp_aware(monkeypatch):
         [Mock(config=SimpleNamespace(num_moe_experts=0))],
         converted,
         [adapter_weight],
+        next(iter(converted)),
     )
     expected_gate = torch.cat([gate0, gate1], dim=0)
     expected_up = torch.cat([up0, up1], dim=0)
@@ -299,6 +304,7 @@ def test_merge_lora_adapter_weights_non_expert_uses_regular_tp(monkeypatch):
         [SimpleNamespace(config=SimpleNamespace(num_moe_experts=0))],
         converted,
         [adapter_weight],
+        next(iter(converted)),
     )
 
     expected = linear_out_full @ linear_in_full
@@ -336,6 +342,7 @@ def test_merge_lora_adapter_weights_fused_fc1_minimax_w13(monkeypatch):
         [Mock(config=SimpleNamespace(num_moe_experts=1))],
         converted,
         [adapter_weight],
+        next(iter(converted)),
     )
     torch.testing.assert_close(updated["model.layers.0.block_sparse_moe.experts.0.w1.weight"], torch.eye(4))
     torch.testing.assert_close(updated["model.layers.0.block_sparse_moe.experts.0.w3.weight"], 2 * torch.eye(4))
@@ -372,7 +379,7 @@ def test_merge_lora_adapter_weights_qkv_split(monkeypatch):
         linear_out_weight=MegatronWeightTuple("out", linear_out, vp_stage=0),
     )
 
-    updated = bridge._merge_lora_adapter_weights(megatron_model, converted, [adapter_weight])
+    updated = bridge._merge_lora_adapter_weights(megatron_model, converted, [adapter_weight], next(iter(converted)))
     torch.testing.assert_close(updated["q_proj.weight"], q_weight)
     torch.testing.assert_close(updated["k_proj.weight"], k_weight)
     torch.testing.assert_close(updated["v_proj.weight"], v_weight)
@@ -401,6 +408,7 @@ def test_merge_lora_adapter_weights_grouped_expert_missing_expert_idx(monkeypatc
         [SimpleNamespace(config=SimpleNamespace(num_moe_experts=2))],
         converted,
         [adapter_weight],
+        next(iter(converted)),
     )
 
     torch.testing.assert_close(updated["model.layers.0.mlp.experts.down_proj.weight"], 2 * torch.eye(2))
@@ -429,6 +437,7 @@ def test_merge_lora_adapter_weights_grouped_expert_gate_up_proj_unfused(monkeypa
         [SimpleNamespace(config=SimpleNamespace(num_moe_experts=2))],
         converted,
         [adapter_weight],
+        next(iter(converted)),
     )
 
     torch.testing.assert_close(updated["model.language_model.layers.0.mlp.experts.gate_up_proj"], 2 * torch.eye(2))
@@ -467,6 +476,7 @@ def test_merge_lora_adapter_weights_grouped_expert_per_expert_tensors(monkeypatc
         [SimpleNamespace(config=SimpleNamespace(num_moe_experts=2))],
         converted,
         [adapter_weight],
+        next(iter(converted)),
     )
 
     torch.testing.assert_close(updated["model.layers.0.mlp.experts.0.down_proj.weight"], torch.eye(2))
@@ -511,6 +521,7 @@ def test_merge_lora_adapter_weights_grouped_expert_fused_fc1_uses_expert_tp(monk
         [SimpleNamespace(config=SimpleNamespace(num_moe_experts=2))],
         converted,
         [adapter_weight],
+        next(iter(converted)),
     )
 
     expected_gate = gate_local @ linear_in_full
@@ -579,6 +590,7 @@ def test_merge_canonical_adapter_from_weights(monkeypatch):
         megatron_model,
         converted,
         [adapter_q, adapter_k, adapter_v],
+        dict(zip("qkv", converted)),
     )
     torch.testing.assert_close(updated["decoder.layers.0.self_attn.q_proj.weight"], torch.ones(2, 2))
     torch.testing.assert_close(updated["decoder.layers.0.self_attn.k_proj.weight"], 2 * torch.ones(1, 2))
@@ -613,11 +625,72 @@ def test_merge_partial_canonical_adapter_preserves_unselected_projection():
         [SimpleNamespace(config=SimpleNamespace(num_moe_experts=0))],
         converted,
         [adapter_q, adapter_k],
+        dict(zip("qkv", converted)),
     )
 
     torch.testing.assert_close(updated["model.layers.0.self_attn.q_proj.weight"], torch.tensor([[1.0, 2.0]] * 2))
     torch.testing.assert_close(updated["model.layers.0.self_attn.k_proj.weight"], torch.tensor([[2.0, 4.0]]))
     torch.testing.assert_close(updated["model.layers.0.self_attn.v_proj.weight"], torch.full((1, 2), 9.0))
+
+
+def test_merge_canonical_adapter_w1_w3():
+    """Canonical merge finds gate/up by the mapping's role when HF names them w1/w3."""
+    bridge = DummyBridge()
+    converted = {
+        "model.layers.0.block_sparse_moe.experts.0.w1.weight": torch.full((2, 2), 7.0),
+        "model.layers.0.block_sparse_moe.experts.0.w3.weight": torch.zeros(2, 2),
+    }
+    adapter_up = AdapterWeight(
+        global_base_prefix="decoder.layers.0.mlp.experts.local_experts.0.linear_fc1",
+        adapter_key="adapter_up",
+        alpha=1,
+        dim=1,
+        linear_in_weight=MegatronWeightTuple("in_up", torch.tensor([[1.0, 2.0]]), vp_stage=0),
+        linear_out_weight=MegatronWeightTuple("out_up", torch.ones(2, 1), vp_stage=0),
+    )
+
+    updated = bridge._merge_lora_adapter_weights(
+        [SimpleNamespace(config=SimpleNamespace(num_moe_experts=1))],
+        converted,
+        [adapter_up],
+        dict(zip(("gate", "up"), converted)),
+    )
+
+    torch.testing.assert_close(updated["model.layers.0.block_sparse_moe.experts.0.w1.weight"], torch.full((2, 2), 7.0))
+    torch.testing.assert_close(
+        updated["model.layers.0.block_sparse_moe.experts.0.w3.weight"], torch.tensor([[1.0, 2.0]] * 2)
+    )
+
+
+def test_merge_canonical_adapter_resolves_every_ep_ranks_expert():
+    """EP gathers one expert per rank into the dict, while the mapping names only this rank's expert."""
+    bridge = DummyBridge()
+    converted = {
+        f"model.layers.0.mlp.experts.{expert}.{projection}.weight": torch.zeros(2, 2)
+        for expert in (0, 8)
+        for projection in ("gate_proj", "up_proj")
+    }
+    adapter_up = AdapterWeight(
+        global_base_prefix="decoder.layers.0.mlp.experts.local_experts.0.linear_fc1",
+        adapter_key="adapter_up",
+        alpha=1,
+        dim=1,
+        linear_in_weight=MegatronWeightTuple("in_up", torch.tensor([[1.0, 2.0]]), vp_stage=0),
+        linear_out_weight=MegatronWeightTuple("out_up", torch.ones(2, 1), vp_stage=0),
+    )
+
+    updated = bridge._merge_lora_adapter_weights(
+        [SimpleNamespace(config=SimpleNamespace(num_moe_experts=16))],
+        converted,
+        [adapter_up],
+        {"gate": "model.layers.0.mlp.experts.0.gate_proj.weight", "up": "model.layers.0.mlp.experts.0.up_proj.weight"},
+    )
+
+    for expert in (0, 8):
+        torch.testing.assert_close(updated[f"model.layers.0.mlp.experts.{expert}.gate_proj.weight"], torch.zeros(2, 2))
+        torch.testing.assert_close(
+            updated[f"model.layers.0.mlp.experts.{expert}.up_proj.weight"], torch.tensor([[1.0, 2.0]] * 2)
+        )
 
 
 def test_merge_single_canonical_adapter_preserves_unselected_projection():
@@ -639,6 +712,7 @@ def test_merge_single_canonical_adapter_preserves_unselected_projection():
         [SimpleNamespace(config=SimpleNamespace(num_moe_experts=0))],
         converted,
         [adapter_up],
+        dict(zip(("gate", "up"), converted)),
     )
 
     torch.testing.assert_close(updated["model.layers.0.mlp.gate_proj.weight"], torch.full((2, 2), 7.0))
@@ -856,6 +930,28 @@ def test_resolve_hf_adapter_param_name_without_weight_suffix():
         None,
     )
     assert name == "model.layers.0.mlp.experts.gate_up_proj.lora_A.weight"
+
+
+def test_canonical_adapters_resolve_w1_w3_by_role():
+    """MiniMax/Kimi/DeepSeek-V4 name expert gate/up w1/w3; the mapping's role, not an HF suffix, picks each."""
+    bridge = DummyBridge()
+    registry = MegatronMappingRegistry(
+        GatedMLPMapping(
+            megatron_param="decoder.layers.*.mlp.experts.local_experts.*.linear_fc1.weight",
+            gate="model.layers.*.block_sparse_moe.experts.*.w1.weight",
+            up="model.layers.*.block_sparse_moe.experts.*.w3.weight",
+        )
+    )
+    prefix = "decoder.layers.0.mlp.experts.local_experts.2.linear_fc1"
+    for adapter_key, projection in (("adapter_gate", "w1"), ("adapter_up", "w3")):
+        hf_base = f"model.layers.0.block_sparse_moe.experts.2.{projection}"
+        assert (
+            bridge._resolve_hf_adapter_param_name(registry, prefix, ".linear_out.weight", ".weight", adapter_key)
+            == f"{hf_base}.lora_B.weight"
+        )
+        assert bridge._get_base_hf_param_names_for_adapter(registry, prefix, adapter_key, ".weight") == [
+            f"{hf_base}.weight"
+        ]
 
 
 def test_build_adapter_conversion_tasks(monkeypatch):
@@ -1925,7 +2021,7 @@ def test_merge_lora_adapter_weights_gdn_in_proj_split(monkeypatch):
         lambda: 1,
     )
 
-    updated = bridge._merge_lora_adapter_weights(megatron_model, converted, [adapter_weight])
+    updated = bridge._merge_lora_adapter_weights(megatron_model, converted, [adapter_weight], next(iter(converted)))
 
     torch.testing.assert_close(
         updated["model.layers.0.linear_attn.in_proj_qkv.weight"],
@@ -2402,6 +2498,11 @@ def test_stream_weights_megatron_to_hf_merges_shared_expert_fc1_adapters(monkeyp
     bridge = DummyBridge()
 
     class SharedExpertFc1Mapping:
+        hf_param = {
+            "gate": "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight",
+            "up": "model.language_model.layers.0.mlp.shared_expert.up_proj.weight",
+        }
+
         def megatron_to_hf(self, weight, module):
             return {
                 "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight": torch.zeros(2, 2),
@@ -2486,6 +2587,8 @@ def test_stream_weights_megatron_to_hf_merges_shared_expert_fc2_adapters(monkeyp
     bridge = DummyBridge()
 
     class SharedExpertFc2Mapping:
+        hf_param = "model.language_model.layers.0.mlp.shared_expert.down_proj.weight"
+
         def megatron_to_hf(self, weight, module):
             return {"model.language_model.layers.0.mlp.shared_expert.down_proj.weight": torch.zeros(2, 2)}
 
@@ -2565,6 +2668,8 @@ def test_stream_weights_megatron_to_hf_merges_router_adapters(monkeypatch):
     bridge = DummyBridge()
 
     class RouterMapping:
+        hf_param = "model.language_model.layers.0.mlp.gate.weight"
+
         def megatron_to_hf(self, weight, module):
             return {"model.language_model.layers.0.mlp.gate.weight": torch.zeros(2, 3)}
 
@@ -2656,6 +2761,8 @@ def test_stream_weights_megatron_to_hf_merges_lora_before_quantization(monkeypat
     base_weight = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
 
     class QuantizingMapping:
+        hf_param = "model.layers.0.mlp.fc1.weight"
+
         def megatron_to_hf(self, weight, module):
             return {"model.layers.0.mlp.fc1.weight": base_weight.clone()}
 

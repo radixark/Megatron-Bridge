@@ -90,6 +90,14 @@ ADAPTER_NAME_MAP = {
     ".up_proj.weight": "adapter_up",
 }
 ADAPTER_KEY_TO_SUFFIX = {value: key for key, value in ADAPTER_NAME_MAP.items()}
+# CanonicalLoRA adapter key -> the role key of its projection in a multi-tensor mapping's ``hf_param``
+CANONICAL_ADAPTER_ROLES = {
+    "adapter_q": "q",
+    "adapter_k": "k",
+    "adapter_v": "v",
+    "adapter_gate": "gate",
+    "adapter_up": "up",
+}
 
 # Map Megatron adapter suffixes to HuggingFace LoRA parameter suffixes
 MEGATRON_TO_HF_LORA_SUFFIX = {
@@ -137,6 +145,14 @@ def _canonical_packed_expert_name(hf_name, adapter_key, base_suffix=".weight"):
     return prefix + ADAPTER_KEY_TO_SUFFIX[adapter_key]
 
 
+def _hf_param_for_canonical_adapter(hf_param, adapter_key: Optional[str]) -> Optional[str]:
+    """HF name of the projection a canonical adapter covers, by role: HF names vary (gate_proj vs w1)."""
+
+    if not isinstance(hf_param, dict):
+        return None
+    return hf_param.get(CANONICAL_ADAPTER_ROLES.get(adapter_key))
+
+
 def _select_hf_base_param_name(base_mapping, adapter_key: Optional[str], expected_suffix: str) -> Optional[str]:
     """Return the HF base parameter name associated with this adapter."""
 
@@ -146,12 +162,9 @@ def _select_hf_base_param_name(base_mapping, adapter_key: Optional[str], expecte
         return hf_param if hf_param.endswith(expected_suffix) or expected_suffix == ".weight" else None
 
     if isinstance(hf_param, dict):
-        if adapter_key:
-            target_suffix = ADAPTER_KEY_TO_SUFFIX.get(adapter_key)
-            if target_suffix:
-                for value in hf_param.values():
-                    if value.endswith(target_suffix):
-                        return value
+        projection_name = _hf_param_for_canonical_adapter(hf_param, adapter_key)
+        if projection_name is not None:
+            return projection_name
 
         # For fused qkv/gate_up case, we just need a placeholder here
         value = next(iter(hf_param.values()))
@@ -243,14 +256,10 @@ class MegatronPeftBridge:
         if isinstance(hf_param, str):
             return [_canonical_packed_expert_name(hf_param, adapter_key, base_suffix)]
 
-        values = list(hf_param.values())
-        if adapter_key:
-            adapter_suffix = ADAPTER_KEY_TO_SUFFIX.get(adapter_key)
-            if adapter_suffix:
-                filtered = [value for value in values if value.endswith(adapter_suffix)]
-                if filtered:
-                    return filtered
-        return values
+        projection_name = _hf_param_for_canonical_adapter(hf_param, adapter_key)
+        if projection_name is not None:
+            return [projection_name]
+        return list(hf_param.values())
 
     def _make_lora_param_name(self, base_name: str, megatron_adapter_suffix: str) -> Optional[str]:
         """Translate a base HF weight name into its LoRA-specific counterpart."""
@@ -1347,15 +1356,21 @@ class MegatronPeftBridge:
         megatron_model: List[MegatronModel],
         converted_weights_dict: Dict[str, torch.Tensor],
         adapter_weights: List[AdapterWeight],
+        base_hf_param: Union[str, Dict[str, str]],
     ) -> Dict[str, torch.Tensor]:
-        """Merge LoRA adapter weights back into the base tensor for HF export."""
+        """Merge LoRA adapter weights back into the base tensor for HF export.
+
+        ``base_hf_param`` is the resolved ``hf_param`` of the base weight's mapping.
+        """
 
         if not converted_weights_dict:
             # Nothing to merge on this rank (e.g., non-owning PP rank or filtered mapping).
             return converted_weights_dict
 
-        if all(w.adapter_key in ADAPTER_NAME_MAP.values() for w in adapter_weights):
-            return self._merge_canonical_adapter_from_weights(megatron_model, converted_weights_dict, adapter_weights)
+        if all(w.adapter_key in CANONICAL_ADAPTER_ROLES for w in adapter_weights):
+            return self._merge_canonical_adapter_from_weights(
+                megatron_model, converted_weights_dict, adapter_weights, base_hf_param
+            )
 
         assert len(adapter_weights) == 1, "Expected a single adapter weight for standard LoRA merging"
 
@@ -1580,6 +1595,7 @@ class MegatronPeftBridge:
         megatron_model: List[MegatronModel],
         converted_weights_dict: Dict[str, torch.Tensor],
         adapter_weights: List[AdapterWeight],
+        base_hf_param: Union[str, Dict[str, str]],
     ) -> Dict[str, torch.Tensor]:
         """Merge CanonicalLoRA adapters using pre-materialized adapter weights."""
 
@@ -1599,17 +1615,17 @@ class MegatronPeftBridge:
                     adapter_weight.linear_out_weight.weight,
                 )
 
+        # converted_weights_dict holds every EP rank's expert, the mapping names this rank's
+        adapter_key_by_hf_name = {
+            self._strip_hf_expert_index(name): adapter_key
+            for adapter_key in CANONICAL_ADAPTER_ROLES
+            if (name := _hf_param_for_canonical_adapter(base_hf_param, adapter_key)) is not None
+        }
         for hf_name, base_weight in converted_weights_dict.items():
-            target_adapter = None
-            target_adapter_key = None
-            for suffix, adapter_key in ADAPTER_NAME_MAP.items():
-                if hf_name.endswith(suffix):
-                    target_adapter = adapter_lookup.get(adapter_key)
-                    target_adapter_key = adapter_key
-                    break
-
+            target_adapter_key = adapter_key_by_hf_name.get(self._strip_hf_expert_index(hf_name))
             if target_adapter_key is None:
                 raise ValueError(f"Adapter name mapping not found for {hf_name}")
+            target_adapter = adapter_lookup.get(target_adapter_key)
             if target_adapter is None:
                 continue
 

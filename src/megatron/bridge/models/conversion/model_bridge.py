@@ -1836,6 +1836,7 @@ class MegatronModelBridge(
                     megatron_model,
                     converted_weights_dict,
                     adapter_weights,
+                    task.mapping.hf_param,
                 )
 
             converted_weights_dict = self.maybe_modify_converted_hf_weight(

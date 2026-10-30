@@ -942,7 +942,12 @@ class TestParallelLinearAdapter:
         mock_config.gated_linear_unit = True
 
         adapter = ParallelLinearAdapter(
-            in_features=20, out_features=10, dim=16, base_linear_name="linear_fc1", model_parallel_config=mock_config
+            in_features=20,
+            out_features=10,
+            dim=16,
+            base_linear_name="linear_fc1",
+            model_parallel_config=mock_config,
+            fused_gate_up=True,
         )
 
         result = adapter.sharded_state_dict(prefix="adapter.")
@@ -950,6 +955,33 @@ class TestParallelLinearAdapter:
         # Should call swiglu factory for fc1 weights
         mock_swiglu_factory.assert_called()
         assert result["adapter.linear_out.weight"] == "swiglu_processed_tensor"
+
+    @patch("megatron.bridge.peft.utils.apply_swiglu_sharded_factory")
+    @patch("megatron.bridge.peft.utils.ColumnParallelLinear")
+    @patch("megatron.bridge.peft.utils.RowParallelLinear")
+    def test_parallel_linear_adapter_sharded_state_dict_unfused_fc1_skips_swiglu(
+        self, mock_row_linear, mock_col_linear, mock_swiglu_factory, mock_config
+    ):
+        """A gate or up half holds one projection, so re-splitting it as fused [gate; up] would permute rows."""
+        mock_linear_in = Mock()
+        mock_linear_out = Mock()
+        mock_linear_in.sharded_state_dict.return_value = {"linear_in.weight": "tensor1"}
+        mock_linear_out.sharded_state_dict.return_value = {"adapter.linear_out.weight": "tensor2"}
+        mock_col_linear.side_effect = [mock_linear_in, mock_linear_out]
+        mock_config.gated_linear_unit = True
+
+        adapter = ParallelLinearAdapter(
+            in_features=20,
+            out_features=10,
+            dim=16,
+            base_linear_name="linear_fc1",
+            model_parallel_config=mock_config,
+        )
+
+        result = adapter.sharded_state_dict(prefix="adapter.")
+
+        mock_swiglu_factory.assert_not_called()
+        assert result["adapter.linear_out.weight"] == "tensor2"
 
     @patch("megatron.bridge.peft.utils.ColumnParallelLinear")
     @patch("megatron.bridge.peft.utils.RowParallelLinear")
@@ -1217,6 +1249,7 @@ class TestParallelLinearAdapter:
             base_linear_name="decoder.layers.0.mlp.experts.linear_fc1",
             is_expert=True,
             model_parallel_config=mock_config,
+            fused_gate_up=True,
         )
         result = adapter.sharded_state_dict(prefix="adapter.")
 
@@ -1488,11 +1521,20 @@ class TestExpertParallelReplicatedGradSync:
         weight = nn.Parameter(torch.ones(2, 2))
         mark_expert_parallel_replicated(weight, ep_group=None)
         assert weight.expert_parallel_replicated is True
+        assert weight.shared is False
         assert not hasattr(weight, "_expert_parallel_grad_hook")
 
         with patch("torch.distributed.all_reduce") as mock_all_reduce:
             weight.sum().backward()
         mock_all_reduce.assert_not_called()
+
+    @pytest.mark.parametrize("ep_rank,shared", [(0, False), (1, True)])
+    def test_mark_counts_one_replica_in_the_grad_norm(self, ep_rank, shared):
+        """Megatron's grad norm skips params marked shared; otherwise each EP replica adds its norm again."""
+        weight = nn.Parameter(torch.ones(2, 2))
+        with patch("megatron.bridge.peft.utils.get_pg_rank", return_value=ep_rank):
+            mark_expert_parallel_replicated(weight, ep_group=MockProcessGroup(size=2))
+        assert weight.shared is shared
 
     def test_allreduce_coalesces_main_grads_per_dtype(self):
         ep_group = MockProcessGroup(size=2)
@@ -2664,6 +2706,7 @@ class TestGroupedExpertLinearAdapter:
             activation="identity",
             input_is_parallel=False,
             model_parallel_config=config,
+            fused_gate_up=True,
         )
 
         result = adapter.sharded_state_dict("adapter.")
@@ -2701,6 +2744,7 @@ class TestGroupedExpertLinearAdapter:
             activation="identity",
             input_is_parallel=False,
             model_parallel_config=config,
+            fused_gate_up=True,
         )
 
         expert = torch.arange(2).reshape(2, 1, 1) * 1000

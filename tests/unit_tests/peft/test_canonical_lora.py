@@ -52,7 +52,15 @@ class SimpleModel(nn.Module):
 class MockMegatronLinear(nn.Module):
     """Mock Megatron linear layer that's not nn.Linear to trigger parallel adapter path."""
 
-    def __init__(self, in_features, out_features, kv_channels=None, num_query_groups=None, moe_router_topk=None):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        kv_channels=None,
+        num_query_groups=None,
+        moe_router_topk=None,
+        gated_linear_unit=True,
+    ):
         super().__init__()
         self.linear = nn.Linear(in_features, out_features)
         self.in_features = in_features
@@ -65,6 +73,7 @@ class MockMegatronLinear(nn.Module):
                 self.num_attention_heads = self.num_query_groups
                 self.sequence_parallel = False
                 self.moe_router_topk = moe_router_topk
+                self.gated_linear_unit = gated_linear_unit
                 self.expert_tensor_parallel_size = 1
                 self.expert_model_parallel_size = 1
                 self.params_dtype = torch.float32
@@ -102,13 +111,13 @@ class VisionLanguageMegatronStyleModel(nn.Module):
 
         self.vision_model = nn.Module()
         self.vision_model.merger = nn.Module()
-        self.vision_model.merger.linear_fc1 = MockMegatronLinear(512, 512)
+        self.vision_model.merger.linear_fc1 = MockMegatronLinear(512, 512, gated_linear_unit=False)
 
 
 class MoEMegatronStyleModel(nn.Module):
     """Model with dense, expert, and shared-expert linear_fc1 modules."""
 
-    def __init__(self, moe_router_topk=None):
+    def __init__(self, moe_router_topk=None, gated_linear_unit=True):
         super().__init__()
         self.language_model = nn.Module()
         self.language_model.decoder = nn.Module()
@@ -116,11 +125,12 @@ class MoEMegatronStyleModel(nn.Module):
 
         layer = self.language_model.decoder.layers[0]
         layer.mlp = nn.Module()
-        layer.mlp.linear_fc1 = MockMegatronLinear(512, 2048, moe_router_topk=moe_router_topk)
+        fc1_kwargs = dict(moe_router_topk=moe_router_topk, gated_linear_unit=gated_linear_unit)
+        layer.mlp.linear_fc1 = MockMegatronLinear(512, 2048, **fc1_kwargs)
         layer.mlp.experts = nn.Module()
-        layer.mlp.experts.linear_fc1 = MockMegatronLinear(512, 2048, moe_router_topk=moe_router_topk)
+        layer.mlp.experts.linear_fc1 = MockMegatronLinear(512, 2048, **fc1_kwargs)
         layer.mlp.shared_experts = nn.Module()
-        layer.mlp.shared_experts.linear_fc1 = MockMegatronLinear(512, 2048, moe_router_topk=moe_router_topk)
+        layer.mlp.shared_experts.linear_fc1 = MockMegatronLinear(512, 2048, **fc1_kwargs)
 
 
 class GroupedExpertMegatronStyleModel(nn.Module):
@@ -384,8 +394,8 @@ class TestCanonicalLoRA:
         assert isinstance(transformed_model.vision_model.merger.linear_fc1, LoRALinear)
         assert not isinstance(transformed_model.vision_model.merger.linear_fc1, LoRALinearSplitFC1UpGate)
 
-    def test_canonical_lora_treats_moe_expert_linear_fc1_as_unfused(self):
-        """Grouped expert linear_fc1 should keep a single unfused LoRA adapter."""
+    def test_canonical_lora_splits_moe_expert_linear_fc1(self):
+        """Grouped expert gate/up get independent adapters, as in CanonicalMultiLoRA."""
         model = MoEMegatronStyleModel()
         lora = CanonicalLoRA(target_modules=["linear_fc1_up", "linear_fc1_gate"])
 
@@ -409,9 +419,47 @@ class TestCanonicalLoRA:
 
         layer = transformed_model.language_model.decoder.layers[0]
         assert isinstance(layer.mlp.linear_fc1, LoRALinearSplitFC1UpGate)
-        assert isinstance(layer.mlp.experts.linear_fc1, LoRALinear)
-        assert not isinstance(layer.mlp.experts.linear_fc1, LoRALinearSplitFC1UpGate)
+        assert isinstance(layer.mlp.experts.linear_fc1, LoRALinearSplitFC1UpGate)
         assert isinstance(layer.mlp.shared_experts.linear_fc1, LoRALinearSplitFC1UpGate)
+
+    def test_canonical_lora_keeps_non_gated_linear_fc1_fused(self):
+        """A non-gated MLP (Nemotron-H's squared-ReLU experts) has only up_proj, so no fc1 gets split."""
+        model = MoEMegatronStyleModel(gated_linear_unit=False)
+        lora = CanonicalLoRA(target_modules=["linear_fc1_up", "linear_fc1_gate"])
+
+        def mock_get_attrs(module, is_expert=False):
+            return AdapterAttributes(
+                input_is_parallel=False,
+                in_features=module.in_features,
+                out_features=module.out_features,
+                disable_tensor_parallel_comm=False,
+                disable_sequence_parallel_comm=True,
+                base_linear_is_parallel=True,
+            )
+
+        with patch(
+            "megatron.bridge.peft.canonical_lora.get_adapter_attributes_from_linear", side_effect=mock_get_attrs
+        ):
+            with patch("megatron.bridge.peft.canonical_lora.ParallelLinearAdapter") as mock_adapter:
+                mock_adapter.return_value = nn.Linear(1, 1)
+
+                transformed_model = lora(model, training=True)
+
+        mlp = transformed_model.language_model.decoder.layers[0].mlp
+        for fc1 in (mlp.linear_fc1, mlp.experts.linear_fc1, mlp.shared_experts.linear_fc1):
+            assert type(fc1) is LoRALinear
+        assert all(call.args[1] == 2048 for call in mock_adapter.call_args_list)
+
+    def test_canonical_lora_skips_gate_only_target_on_non_gated_linear_fc1(self):
+        """A non-gated fc1 is the up projection alone, so targeting only gate leaves it unadapted."""
+        model = MoEMegatronStyleModel(gated_linear_unit=False)
+        lora = CanonicalLoRA(target_modules=["linear_fc1_gate"])
+
+        transformed_model = lora(model, training=True)
+
+        mlp = transformed_model.language_model.decoder.layers[0].mlp
+        for fc1 in (mlp.linear_fc1, mlp.experts.linear_fc1, mlp.shared_experts.linear_fc1):
+            assert isinstance(fc1, MockMegatronLinear)
 
     def test_canonical_lora_normalize_moe_lora_reduces_expert_dim(self):
         """Expert linear_fc1 should get reduced dim when normalize_moe_lora is enabled."""
