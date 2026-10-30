@@ -951,6 +951,34 @@ class TestParallelLinearAdapter:
         mock_swiglu_factory.assert_called()
         assert result["adapter.linear_out.weight"] == "swiglu_processed_tensor"
 
+    @patch("megatron.bridge.peft.utils.apply_swiglu_sharded_factory")
+    @patch("megatron.bridge.peft.utils.ColumnParallelLinear")
+    @patch("megatron.bridge.peft.utils.RowParallelLinear")
+    def test_parallel_linear_adapter_sharded_state_dict_gate_up_half_skips_swiglu(
+        self, mock_row_linear, mock_col_linear, mock_swiglu_factory, mock_config
+    ):
+        """A gate or up half holds one projection, so re-splitting it as fused [gate; up] would permute rows."""
+        mock_linear_in = Mock()
+        mock_linear_out = Mock()
+        mock_linear_in.sharded_state_dict.return_value = {"linear_in.weight": "tensor1"}
+        mock_linear_out.sharded_state_dict.return_value = {"adapter.linear_out.weight": "tensor2"}
+        mock_col_linear.side_effect = [mock_linear_in, mock_linear_out]
+        mock_config.gated_linear_unit = True
+
+        adapter = ParallelLinearAdapter(
+            in_features=20,
+            out_features=10,
+            dim=16,
+            base_linear_name="linear_fc1",
+            model_parallel_config=mock_config,
+            gate_up_half=True,
+        )
+
+        result = adapter.sharded_state_dict(prefix="adapter.")
+
+        mock_swiglu_factory.assert_not_called()
+        assert result["adapter.linear_out.weight"] == "tensor2"
+
     @patch("megatron.bridge.peft.utils.ColumnParallelLinear")
     @patch("megatron.bridge.peft.utils.RowParallelLinear")
     def test_parallel_linear_adapter_grouped_expert_sharded_state_dict_uses_expert_axis(

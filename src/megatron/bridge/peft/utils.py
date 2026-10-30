@@ -1168,6 +1168,7 @@ class ParallelLinearAdapter(nn.Module):
         replicate_adapter: bool = False,
         pg_collection: ProcessGroupCollection | None = None,
         sequence_parallel_input_regather: bool = False,
+        gate_up_half: bool = False,
     ) -> None:
         """Initialize the ParallelLinearAdapter.
 
@@ -1190,9 +1191,12 @@ class ParallelLinearAdapter(nn.Module):
             disable_sequence_parallel_comm: Disable sequence parallel communication.
             replicate_adapter: Duplicate both low-rank matrices across TP ranks.
             sequence_parallel_input_regather: Re-gather eligible LoRA-A sequence-parallel inputs in backward.
+            gate_up_half: The adapter covers only the gate or the up half of a gated ``linear_fc1``, so its output
+                is not the fused SwiGLU layout.
         """
         super().__init__()
         self.base_linear_name = base_linear_name
+        self.gate_up_half = gate_up_half
         self.activation = self._get_activation_fn(activation)
         self.dim = dim
         self.alpha = alpha if alpha is not None else self.dim
@@ -1756,7 +1760,11 @@ class ParallelLinearAdapter(nn.Module):
         # Non-grouped expert adapters already sit under .local_experts.* and keep
         # their existing expert-DP replica metadata instead.
         use_expert_axis = self._uses_grouped_expert_sharding() and not self.use_legacy_shared_expert_adapter_checkpoint
-        split_swiglu = "linear_fc1" in self.base_linear_name and getattr(self.config, "gated_linear_unit", False)
+        split_swiglu = (
+            "linear_fc1" in self.base_linear_name
+            and not self.gate_up_half
+            and getattr(self.config, "gated_linear_unit", False)
+        )
         linear_in_sd = self.linear_in.sharded_state_dict(f"{prefix}linear_in.", sharded_offsets, metadata)
         linear_out_sd = self.linear_out.sharded_state_dict(f"{prefix}linear_out.", sharded_offsets, metadata)
 
@@ -2034,12 +2042,14 @@ class GroupedExpertLinearAdapter(nn.Module):
         params_device: Optional[torch.device] = None,
         params_dtype: Optional[torch.dtype] = None,
         pg_collection: ProcessGroupCollection | None = None,
+        gate_up_half: bool = False,
     ) -> None:
         """Initialize grouped-expert LoRA weights for one adapter per local expert."""
 
         super().__init__()
 
         self.base_linear_name = base_linear_name
+        self.gate_up_half = gate_up_half
         self.activation = ParallelLinearAdapter._get_activation_fn(self, activation)
         self.dim = dim
         self.alpha = alpha if alpha is not None else self.dim
@@ -2615,7 +2625,11 @@ class GroupedExpertLinearAdapter(nn.Module):
             )
         }
 
-        if "linear_fc1" in self.base_linear_name and getattr(self.config, "gated_linear_unit", False):
+        if (
+            "linear_fc1" in self.base_linear_name
+            and not self.gate_up_half
+            and getattr(self.config, "gated_linear_unit", False)
+        ):
             singleton_local_shards = (metadata or {}).get("singleton_local_shards", False)
             linear_out_key = f"{prefix}linear_out.weight"
             linear_out_sd[linear_out_key] = _apply_grouped_expert_swiglu_sharded_factory(
@@ -2740,11 +2754,13 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
         params_device: Optional[torch.device] = None,
         params_dtype: Optional[torch.dtype] = None,
         pg_collection: ProcessGroupCollection | None = None,
+        gate_up_half: bool = False,
     ) -> None:
         """Initialize shared-outer LoRA weights with one shared and one per-expert side."""
 
         super().__init__()
         self.base_linear_name = base_linear_name
+        self.gate_up_half = gate_up_half
         self.activation = ParallelLinearAdapter._get_activation_fn(self, activation)
         self.dim = dim
         self.alpha = alpha if alpha is not None else self.dim
@@ -2868,7 +2884,7 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
         for shard in shared_sd.values():
             shard.replica_id = (0, get_pg_rank(self.ep_group), get_pg_rank(self.pg_collection.expt_dp))
 
-        if self._is_fc1 and self.base_linear_name.endswith("linear_fc1"):
+        if self._is_fc1 and self.base_linear_name.endswith("linear_fc1") and not self.gate_up_half:
             singleton_local_shards = (metadata or {}).get("singleton_local_shards", False)
             linear_out_key = f"{prefix}linear_out.weight"
             linear_out_sd[linear_out_key] = _apply_grouped_expert_swiglu_sharded_factory(

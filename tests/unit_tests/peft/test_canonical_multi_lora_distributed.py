@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from contextlib import nullcontext
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -15,6 +16,7 @@ from megatron.bridge.models.conversion.param_mapping import merge_qkv_weights
 from megatron.bridge.peft.canonical_lora import CanonicalLoRA, LoRALinearSplitFC1UpGate
 from megatron.bridge.peft.multi_lora import CanonicalMultiLoRA
 from megatron.bridge.peft.multi_lora_layers import expose_adapter_slot, init_adapter_slot, set_tokens_per_adapter_slot
+from megatron.bridge.peft.utils import _apply_grouped_expert_swiglu_sharded_factory
 from tests.unit_tests.peft.test_multi_lora_seeded_slot_distributed import (
     _model_parallel,
     two_rank_process_group,  # noqa: F401
@@ -200,6 +202,18 @@ def _assert_expert_projections_exported(layer, adapters, config, *, shared_outer
             torch.testing.assert_close(b, adapter.linear_out.weight[local_expert], atol=0, rtol=0)
 
 
+def _assert_gate_up_checkpoint_not_swiglu_split(adapters):
+    """Each half holds one projection; splitting it again as fused [gate; up] permutes rows when ETP changes."""
+    with patch(
+        "megatron.bridge.peft.utils._apply_grouped_expert_swiglu_sharded_factory",
+        wraps=_apply_grouped_expert_swiglu_sharded_factory,
+    ) as swiglu_split:
+        metadata = {"dp_cp_group": parallel_state.get_data_parallel_group(with_context_parallel=True)}
+        for key in ("adapter_gate", "adapter_up"):
+            adapters[key].sharded_state_dict(prefix=f"{key}.", metadata=metadata)
+    swiglu_split.assert_not_called()
+
+
 @pytest.mark.usefixtures("two_rank_process_group")
 @pytest.mark.parametrize("shared_outer", [False, True])
 @pytest.mark.parametrize("packed_checkpoint", [False, True])
@@ -249,6 +263,7 @@ def test_expert_projections_export(shared_outer, packed_checkpoint):
             packed_checkpoint=packed_checkpoint,
             slot=0,
         )
+        _assert_gate_up_checkpoint_not_swiglu_split(layer.adapters[0])
 
 
 @pytest.mark.usefixtures("two_rank_process_group")
@@ -286,3 +301,4 @@ def test_single_adapter_expert_projections_export(shared_outer, packed_checkpoin
         _assert_expert_projections_exported(
             layer, adapters, config, shared_outer=shared_outer, packed_checkpoint=packed_checkpoint
         )
+        _assert_gate_up_checkpoint_not_swiglu_split(adapters)

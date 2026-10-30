@@ -182,7 +182,9 @@ def _make_slot_adapter(factory, full_name, out_features, sizes, targets):
     selected = {PROJECTION_ADAPTER_KEYS[target] for target in targets}
     return ModuleDict(
         {
-            key: factory(out_features=size, base_linear_name=f"{full_name.rsplit('.', 1)[0]}.{key}")
+            key: factory(
+                out_features=size, base_linear_name=full_name, gate_up_half=key in ("adapter_gate", "adapter_up")
+            )
             for key, size in sizes.items()
             if key in selected
         }
