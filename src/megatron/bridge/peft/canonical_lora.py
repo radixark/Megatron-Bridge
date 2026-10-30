@@ -162,7 +162,8 @@ class LoRALinearSplitQKV(AdapterWrapper):
             query,
             key,
             value,
-            num_query_groups=num_query_groups,
+            # adapter outputs are tensor-parallel shards holding this rank's query groups
+            num_query_groups=key.size(-1) // head_size,
             head_size=head_size,
             output_gate=getattr(config, "attention_output_gate", False),
         )
