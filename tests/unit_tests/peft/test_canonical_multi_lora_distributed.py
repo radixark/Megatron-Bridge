@@ -16,7 +16,7 @@ from megatron.bridge.models.conversion.param_mapping import merge_qkv_weights
 from megatron.bridge.peft.canonical_lora import CanonicalLoRA, LoRALinearSplitFC1UpGate
 from megatron.bridge.peft.multi_lora import CanonicalMultiLoRA
 from megatron.bridge.peft.multi_lora_layers import expose_adapter_slot, init_adapter_slot, set_tokens_per_adapter_slot
-from megatron.bridge.peft.utils import _apply_grouped_expert_swiglu_sharded_factory
+from megatron.bridge.peft.utils import ParallelLinearAdapter, _apply_grouped_expert_swiglu_sharded_factory
 from tests.unit_tests.peft.test_multi_lora_seeded_slot_distributed import (
     _model_parallel,
     two_rank_process_group,  # noqa: F401
@@ -159,7 +159,14 @@ def _expert_fc1(config):
     )
 
 
-def _assert_expert_projections_exported(layer, adapters, config, *, shared_outer, packed_checkpoint, slot=None):
+def _expert_factors(adapter, layout, local_expert):
+    """This rank's (lora_A, lora_B) for one local expert: `shared` adapters are 2D, `shared_outer` shares only A."""
+    a = adapter.linear_in.weight if layout != "per_expert" else adapter.linear_in.weight[local_expert]
+    b = adapter.linear_out.weight if layout == "shared" else adapter.linear_out.weight[local_expert]
+    return a, b
+
+
+def _assert_expert_projections_exported(layer, adapters, config, *, layout, packed_checkpoint, slot=None):
     """Each rank's gate/up factors land under their own HF projection names, the shared factor once."""
     from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
     from megatron.bridge.models.conversion.param_mapping import FusedGatedExpertMapping
@@ -189,29 +196,34 @@ def _assert_expert_projections_exported(layer, adapters, config, *, shared_outer
             prefix = f"model.layers.0.mlp.experts.{expert}.{projection}"
             a = (
                 exported[f"model.layers.0.mlp.experts.{projection}.lora_A.weight"][0]
-                if shared_outer
+                if layout == "shared_outer"
                 else exported[prefix + ".lora_A.weight"]
             )
             b = exported[prefix + ".lora_B.weight"]
-            torch.testing.assert_close(
-                a,
-                adapter.linear_in.weight if shared_outer else adapter.linear_in.weight[local_expert],
-                atol=0,
-                rtol=0,
-            )
-            torch.testing.assert_close(b, adapter.linear_out.weight[local_expert], atol=0, rtol=0)
+            expected_a, expected_b = _expert_factors(adapter, layout, local_expert)
+            torch.testing.assert_close(a, expected_a, atol=0, rtol=0)
+            torch.testing.assert_close(b, expected_b, atol=0, rtol=0)
 
 
 def _assert_gate_up_checkpoint_not_swiglu_split(adapters):
     """Each half holds one projection; splitting it again as fused [gate; up] permutes rows when ETP changes."""
-    with patch(
-        "megatron.bridge.peft.utils._apply_grouped_expert_swiglu_sharded_factory",
-        wraps=_apply_grouped_expert_swiglu_sharded_factory,
-    ) as swiglu_split:
+    with (
+        patch(
+            "megatron.bridge.peft.utils._apply_grouped_expert_swiglu_sharded_factory",
+            wraps=_apply_grouped_expert_swiglu_sharded_factory,
+        ) as grouped_swiglu_split,
+        patch.object(
+            ParallelLinearAdapter,
+            "_apply_expert_axis_factory",
+            autospec=True,
+            side_effect=ParallelLinearAdapter._apply_expert_axis_factory,
+        ) as expert_axis_factory,
+    ):
         metadata = {"dp_cp_group": parallel_state.get_data_parallel_group(with_context_parallel=True)}
         for key in ("adapter_gate", "adapter_up"):
             adapters[key].sharded_state_dict(prefix=f"{key}.", metadata=metadata)
-    swiglu_split.assert_not_called()
+    grouped_swiglu_split.assert_not_called()
+    assert not any(call.kwargs.get("split_swiglu") for call in expert_axis_factory.call_args_list)
 
 
 @pytest.mark.usefixtures("two_rank_process_group")
@@ -259,7 +271,7 @@ def test_expert_projections_export(shared_outer, packed_checkpoint):
             layer,
             layer.adapters[0],
             config,
-            shared_outer=shared_outer,
+            layout="shared_outer" if shared_outer else "per_expert",
             packed_checkpoint=packed_checkpoint,
             slot=0,
         )
@@ -267,17 +279,17 @@ def test_expert_projections_export(shared_outer, packed_checkpoint):
 
 
 @pytest.mark.usefixtures("two_rank_process_group")
-@pytest.mark.parametrize("shared_outer", [False, True])
+@pytest.mark.parametrize("layout", ["shared", "per_expert", "shared_outer"])
 @pytest.mark.parametrize("packed_checkpoint", [False, True])
-def test_single_adapter_expert_projections_export(shared_outer, packed_checkpoint):
+def test_single_adapter_expert_projections_export(layout, packed_checkpoint):
     with _model_parallel(tp=1, ep=2):
         config = _expert_fc1_config()
         transform = CanonicalLoRA(
             target_modules=["linear_fc1_gate", "linear_fc1_up"],
             dim=8,
             alpha=8,
-            share_expert_adapters=False,
-            experts_shared_outer_loras=shared_outer,
+            share_expert_adapters=layout == "shared",
+            experts_shared_outer_loras=layout == "shared_outer",
             lora_B_init_method="normal",
         )
         layer = transform.transform(_expert_fc1(config), name="linear_fc1", prefix="decoder.layers.0.mlp.experts")
@@ -289,9 +301,7 @@ def test_single_adapter_expert_projections_export(shared_outer, packed_checkpoin
         for row in range(16):
             parts = []
             for key in ("adapter_gate", "adapter_up"):
-                adapter = adapters[key]
-                a = adapter.linear_in.weight if shared_outer else adapter.linear_in.weight[row // 8]
-                b = adapter.linear_out.weight[row // 8]
+                a, b = _expert_factors(adapters[key], layout, row // 8)
                 parts.append(F.linear(F.linear(x[row], a), b))
             expected.append(torch.cat(parts))
         torch.testing.assert_close(actual, torch.stack(expected), atol=0.03125, rtol=0.02)
@@ -299,6 +309,6 @@ def test_single_adapter_expert_projections_export(shared_outer, packed_checkpoin
         assert all(p.grad is not None and p.grad.count_nonzero() > 0 for p in adapters.parameters())
 
         _assert_expert_projections_exported(
-            layer, adapters, config, shared_outer=shared_outer, packed_checkpoint=packed_checkpoint
+            layer, adapters, config, layout=layout, packed_checkpoint=packed_checkpoint
         )
         _assert_gate_up_checkpoint_not_swiglu_split(adapters)
