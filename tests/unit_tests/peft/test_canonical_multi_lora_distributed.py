@@ -168,7 +168,9 @@ def test_single_adapter_layernorm_input_grad_tp(canonical, name, sequence_parall
             adapters = [layer.adapter[f"adapter_{key}"] for key in (("q", "k", "v") if is_qkv else ("gate", "up"))]
         else:
             adapters = [layer.adapter]
-        leaves = [(adapter, _gather(adapter.linear_in.weight), _gather(adapter.linear_out.weight)) for adapter in adapters]
+        leaves = [
+            (adapter, _gather(adapter.linear_in.weight), _gather(adapter.linear_out.weight)) for adapter in adapters
+        ]
         deltas = [b @ a * 2 for _, a, b in leaves]
         if canonical and is_qkv:
             merged = merge_qkv_weights(config, *deltas)
