@@ -532,6 +532,13 @@ class TestCanonicalLoRA:
             "adapter_in_proj_a": 4,
         }
 
+    def test_canonical_lora_rejects_gdn_components_on_non_gdn_in_proj(self):
+        """A Mamba-sized in_proj also matches 'in_proj'; GDN component widths must cover it exactly."""
+        model = GDNMegatronStyleModel()
+        model.decoder.layers[0].self_attention.in_proj.out_features = 48
+        with pytest.raises(AssertionError, match="is not a GDN in_proj"):
+            _apply_with_linear_adapters(CanonicalLoRA(target_modules=["in_proj_q"]), model)
+
     @pytest.mark.parametrize("lora_cls", [CanonicalLoRA, CanonicalMultiLoRA])
     def test_canonical_lora_rejects_fused_and_split_gdn_in_proj(self, lora_cls):
         with pytest.raises(AssertionError, match="cannot mix fused 'in_proj'"):

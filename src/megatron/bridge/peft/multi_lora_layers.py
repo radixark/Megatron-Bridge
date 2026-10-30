@@ -168,7 +168,10 @@ def _projection_sizes(to_wrap, out_features, targets):
         # Qwen3.5's query projection includes its output gate.
         return {"adapter_q": out_features - k_size - v_size, "adapter_k": k_size, "adapter_v": v_size}
     if targets <= set(GDN_IN_PROJ_TARGETS):
-        return {PROJECTION_ADAPTER_KEYS[target]: size for target, size in gdn_in_proj_sizes(to_wrap.config).items()}
+        sizes = gdn_in_proj_sizes(to_wrap.config)
+        # Mamba's mixer.in_proj also matches 'in_proj'
+        assert sum(sizes.values()) == out_features, f"{out_features}-wide in_proj is not a GDN in_proj"
+        return {PROJECTION_ADAPTER_KEYS[target]: size for target, size in sizes.items()}
     assert targets <= {"linear_fc1_gate", "linear_fc1_up"}, targets
     assert to_wrap.config.gated_linear_unit, "Independent gate/up adapters require a gated MLP"
     return {"adapter_gate": out_features // 2, "adapter_up": out_features // 2}

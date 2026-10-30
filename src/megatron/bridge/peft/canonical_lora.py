@@ -512,12 +512,15 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
                 return LoRALinearSplitFC1UpGate(m, adapters)
 
             if canonical_submodules & set(GDN_IN_PROJ_TARGETS):
+                sizes = gdn_in_proj_sizes(m.config)
+                # Mamba's mixer.in_proj also matches 'in_proj'
+                assert sum(sizes.values()) == attrs.out_features, f"{full_name} is not a GDN in_proj"
                 adapters = ModuleDict(
                     {
                         f"adapter_{component}": adapter_cls(attrs.in_features, size, **adapter_kwargs)
                         if component in canonical_submodules
                         else None
-                        for component, size in gdn_in_proj_sizes(m.config).items()
+                        for component, size in sizes.items()
                     }
                 )
                 return LoRALinearSplitGDNInProj(m, adapters)
