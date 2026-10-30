@@ -1610,16 +1610,16 @@ class MegatronPeftBridge:
         """Merge per-component GDN in_proj adapters; q/k/v merge into their row blocks of HF's in_proj_qkv."""
 
         sizes = gdn_in_proj_sizes(unwrap_model(megatron_model)[0].config)
-        adapter_by_role = {GDN_IN_PROJ_ADAPTER_ROLES[w.adapter_key]: w for w in adapter_weights}
+        adapter_by_target = {w.adapter_key.removeprefix("adapter_"): w for w in adapter_weights}
         for hf_name, base_weight in list(converted_weights_dict.items()):
             projection_key = self._infer_gdn_in_proj_projection_from_name(hf_name)
             if projection_key is None:
                 raise ValueError(f"Unknown GDN in_proj weight name: {hf_name}")
-            roles = ("q", "k", "v") if projection_key == "in_proj_qkv" else (projection_key.removeprefix("in_proj_"),)
-            blocks = base_weight.split([sizes[f"in_proj_{role}"] for role in roles])
+            targets = ("in_proj_q", "in_proj_k", "in_proj_v") if projection_key == "in_proj_qkv" else (projection_key,)
+            blocks = base_weight.split([sizes[target] for target in targets])
             merged = []
-            for role, block in zip(roles, blocks):
-                adapter = adapter_by_role.get(role)
+            for target, block in zip(targets, blocks):
+                adapter = adapter_by_target.get(target)
                 if adapter is not None:
                     block = self._merge_single_adapter_weight(
                         block,
