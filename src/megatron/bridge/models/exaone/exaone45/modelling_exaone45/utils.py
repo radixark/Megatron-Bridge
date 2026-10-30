@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import copy
 from dataclasses import dataclass
 from typing import Optional, Union
 
@@ -121,6 +122,9 @@ class Exaone45VisionPatchMerger(MegatronModule):
         use_postshuffle_norm=False,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
+        # the merger MLP is plain GELU; the vision config's gated flag describes the vision blocks only
+        config = copy.copy(config)
+        config.gated_linear_unit = False
         super().__init__(config=config)
 
         self.hidden_size = config.hidden_size * (config.spatial_merge_size**2)  # 2048 * 2 * 2 = 8192
