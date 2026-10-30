@@ -304,7 +304,7 @@ class TestLoRA:
         model = MoEModel()
         model.decoder.layers[0].mlp.shared_experts.linear_fc1.config.gated_linear_unit = False
 
-        def mock_get_attrs(module, is_expert=False, sequence_parallel_input_regather=False):
+        def mock_get_attrs(module, is_expert=False):
             return AdapterAttributes(
                 input_is_parallel=False,
                 in_features=module.in_features,
@@ -337,8 +337,7 @@ class TestLoRA:
         model = GroupedExpertModel()
         lora = LoRA(target_modules=["linear_fc2"])
 
-        def mock_get_attrs(module, is_expert=False, sequence_parallel_input_regather=False):
-            assert sequence_parallel_input_regather is False
+        def mock_get_attrs(module, is_expert=False):
             return AdapterAttributes(
                 input_is_parallel=True,
                 in_features=module.in_features,
@@ -366,8 +365,7 @@ class TestLoRA:
         model = GroupedExpertModel()
         lora = LoRA(target_modules=["linear_fc2"], share_expert_adapters=False)
 
-        def mock_get_attrs(module, is_expert=False, sequence_parallel_input_regather=False):
-            assert sequence_parallel_input_regather is False
+        def mock_get_attrs(module, is_expert=False):
             return AdapterAttributes(
                 input_is_parallel=True,
                 in_features=module.in_features,
@@ -635,8 +633,7 @@ class TestLoRANormalizeMoE:
         model = MoEModel(moe_router_topk=2)
         lora = LoRA(target_modules=["linear_fc1", "linear_fc2", "linear_proj"], dim=32, normalize_moe_lora=True)
 
-        def mock_get_attrs(module, is_expert=False, sequence_parallel_input_regather=False):
-            assert sequence_parallel_input_regather is False
+        def mock_get_attrs(module, is_expert=False):
             return AdapterAttributes(
                 input_is_parallel=False,
                 in_features=module.in_features,
@@ -675,8 +672,7 @@ class TestLoRANormalizeMoE:
         model = MoEModel(moe_router_topk=2)
         lora = LoRA(target_modules=["linear_fc1", "linear_fc2"], dim=32, normalize_moe_lora=False)
 
-        def mock_get_attrs(module, is_expert=False, sequence_parallel_input_regather=False):
-            assert sequence_parallel_input_regather is False
+        def mock_get_attrs(module, is_expert=False):
             return AdapterAttributes(
                 input_is_parallel=False,
                 in_features=module.in_features,
@@ -700,8 +696,7 @@ class TestLoRANormalizeMoE:
         model = MoEModel(moe_router_topk=3)
         lora = LoRA(target_modules=["linear_fc1"], dim=32, normalize_moe_lora=True)
 
-        def mock_get_attrs(module, is_expert=False, sequence_parallel_input_regather=False):
-            assert sequence_parallel_input_regather is False
+        def mock_get_attrs(module, is_expert=False):
             return AdapterAttributes(
                 input_is_parallel=False,
                 in_features=module.in_features,
@@ -722,8 +717,7 @@ class TestLoRANormalizeMoE:
         model = MoEModel(moe_router_topk=2)
         lora = LoRA(target_modules=["linear_fc1"], dim=32, normalize_moe_lora=True)
 
-        def mock_get_attrs(module, is_expert=False, sequence_parallel_input_regather=False):
-            assert sequence_parallel_input_regather is False
+        def mock_get_attrs(module, is_expert=False):
             return AdapterAttributes(
                 input_is_parallel=False,
                 in_features=module.in_features,
@@ -752,8 +746,7 @@ class TestLoRANormalizeMoE:
                 module.config.expert_tensor_parallel_size = 2
         lora = LoRA(target_modules=["linear_fc1"], dim=8, normalize_moe_lora=True)
 
-        def mock_get_attrs(module, is_expert=False, sequence_parallel_input_regather=False):
-            assert sequence_parallel_input_regather is False
+        def mock_get_attrs(module, is_expert=False):
             return AdapterAttributes(
                 input_is_parallel=False,
                 in_features=module.in_features,
@@ -788,8 +781,7 @@ class TestLoRANormalizeMoE:
         model.decoder.layers[0].mlp.experts.linear_fc2.config.expert_tensor_parallel_size = 2
         lora = LoRA(target_modules=["linear_fc2"], dim=8, normalize_moe_lora=True, share_expert_adapters=False)
 
-        def mock_get_attrs(module, is_expert=False, sequence_parallel_input_regather=False):
-            assert sequence_parallel_input_regather is False
+        def mock_get_attrs(module, is_expert=False):
             return AdapterAttributes(
                 input_is_parallel=False,
                 in_features=module.in_features,

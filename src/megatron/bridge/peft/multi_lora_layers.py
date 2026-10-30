@@ -261,8 +261,7 @@ class MultiLoRALinear(AdapterWrapper):
         self._column_init_method = column_init_method
         self._row_init_method = row_init_method
 
-        # Own the LN-output gather so its backward includes adapter gradients.
-        attrs = get_adapter_attributes_from_linear(to_wrap, sequence_parallel_input_regather=True)
+        attrs = get_adapter_attributes_from_linear(to_wrap)
 
         # input_is_parallel distinguishes column-parallel base (False, e.g. linear_qkv,
         # linear_fc1) from row-parallel base (True, e.g. linear_proj, linear_fc2).

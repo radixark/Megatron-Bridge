@@ -127,7 +127,7 @@ def test_projection_forward_backward_tp(name, targets, widths, output_gate, sequ
 @pytest.mark.usefixtures("two_rank_process_group")
 @pytest.mark.parametrize("canonical", [False, True])
 @pytest.mark.parametrize("name", ["linear_qkv", "linear_fc1"])
-@pytest.mark.parametrize("sequence_parallel", [False])
+@pytest.mark.parametrize("sequence_parallel", [False, True])
 def test_single_adapter_layernorm_input_grad_tp(canonical, name, sequence_parallel):
     from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
 
