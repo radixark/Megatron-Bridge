@@ -546,11 +546,7 @@ def test_gdn_in_proj_components_tp(multi, targets, sequence_parallel):
         for adapter, (a, b) in leaves.items():
             _assert_close(adapter.linear_in.weight.grad, a.grad.chunk(2)[tp_rank])
             _assert_close(adapter.linear_out.weight.grad, b.grad.chunk(2)[tp_rank])
-        # Single-adapter LoRA under SP takes TE's gathered LN output, whose grad TE drops, for every
-        # wrapper (fused LoRA included); MultiLoRA owns that gather.
-        if multi or not sequence_parallel:
-            expected_dx = full_x.grad.chunk(2)[tp_rank] if sequence_parallel else full_x.grad
-            _assert_close(x.grad, expected_dx)
+        _assert_close(x.grad, full_x.grad.chunk(2)[tp_rank] if sequence_parallel else full_x.grad)
         if multi:
             assert all(p.grad is not None and p.grad.count_nonzero() == 0 for p in layer.adapters[2].parameters())
 
