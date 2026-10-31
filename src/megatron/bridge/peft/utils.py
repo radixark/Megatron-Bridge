@@ -23,11 +23,9 @@ from contextlib import nullcontext
 from dataclasses import dataclass, fields
 from functools import cache
 from importlib import import_module
-from importlib.metadata import version
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
-import packaging
 import torch
 import torch.nn as nn
 from megatron.core import ModelParallelConfig, dist_checkpointing
@@ -555,7 +553,6 @@ def get_adapter_attributes_from_linear(
     m: nn.Module,
     is_expert: bool = False,
     pg_collection: ProcessGroupCollection | None = None,
-    sequence_parallel_input_regather: bool = False,
 ) -> AdapterAttributes:
     """Returns attributes from the base layer as an AdapterAttributes dataclass.
 
@@ -569,7 +566,6 @@ def get_adapter_attributes_from_linear(
         m: The linear module to analyze (should have a config attribute).
         is_expert: Whether the linear belongs to an expert module.
         pg_collection: Optional process-group collection associated with the module.
-        sequence_parallel_input_regather: Whether LoRA-A should re-gather its sequence-parallel input in backward.
 
     Returns:
         AdapterAttributes containing:
@@ -629,32 +625,9 @@ def get_adapter_attributes_from_linear(
         out_features = m.out_features * tp_size
 
         if isinstance(m, TELayerNormColumnParallelLinear):
-            # LoRA is applied after layernorm, so layernorm output must be returned
+            # LoRA is applied after layernorm, so layernorm output must be returned.
+            # Not gathered: TE's backward drops the gradient on a gathered layernorm output.
             m.return_layernorm_output = True
-            # perf optimization for LoRA + SP
-            if hasattr(m, "ub_overlap_ag"):
-                ub_overlap_ag = m.ub_overlap_ag
-            elif hasattr(m, "ub_overlap_ag_fprop"):
-                ub_overlap_ag = m.ub_overlap_ag_fprop
-            else:
-                ub_overlap_ag = False
-            if hasattr(m, "config") and m.config.sequence_parallel and not ub_overlap_ag:
-                # The adapter's MCore SP linear must own the gather so it can retain the local shard.
-                # Preserve the existing TE optimization for the default path.
-                m.return_layernorm_output_gathered = not sequence_parallel_input_regather
-                te_version = packaging.version.Version(version("transformer-engine"))
-                if (
-                    not sequence_parallel_input_regather
-                    and te_version >= packaging.version.Version("1.5.0dev")
-                    and (
-                        not getattr(m.config, "tp_comm_overlap", False)
-                        or getattr(m.config, "tp_comm_overlap_disable_qkv", False)
-                    )
-                ):
-                    # TE 1.5 introduces the option `return_layernorm_output_gathered`, so the all gather
-                    # in the forward method is not needed, so disable sp communications
-                    # unless TP communication overlap is used
-                    disable_sequence_parallel_comm = True
     elif HAVE_TE and any(isinstance(m, te_row_parallel) for te_row_parallel in TERL):
         input_is_parallel = True
         in_features = m.in_features * tp_size

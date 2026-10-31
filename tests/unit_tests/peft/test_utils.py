@@ -365,24 +365,18 @@ class TestGetAdapterAttributes:
         assert not attrs.disable_sequence_parallel_comm  # Should be False when sequence_parallel is True
         assert attrs.base_linear_is_parallel  # Should be True for parallel linear layers
 
-    def test_get_adapter_attributes_te_sequence_parallel_input_regather(self):
-        """Test that input re-gather uses the local TE LayerNorm shard, including with UB overlap."""
+    def test_get_adapter_attributes_te_layernorm_output_not_gathered(self):
+        """The adapter owns the sequence-parallel gather: TE drops the gradient on a gathered LN output."""
 
         class FakeTELayerNormColumnParallelLinear(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.config = SimpleNamespace(
-                    sequence_parallel=True,
-                    tensor_model_parallel_size=2,
-                    tp_comm_overlap=False,
-                    tp_comm_overlap_disable_qkv=False,
-                )
+                self.config = SimpleNamespace(sequence_parallel=True, tensor_model_parallel_size=2)
                 self.in_features = 16
                 self.out_features = 12
                 self.parallel_mode = "column"
                 self.return_layernorm_output = False
                 self.return_layernorm_output_gathered = False
-                self.ub_overlap_ag = False
                 self._tp_group = MockProcessGroup(size=2)
 
         with (
@@ -393,29 +387,12 @@ class TestGetAdapterAttributes:
                 "TELayerNormColumnParallelLinear",
                 FakeTELayerNormColumnParallelLinear,
             ),
-            patch.object(peft_utils, "version", return_value="1.10.0"),
         ):
-            baseline = FakeTELayerNormColumnParallelLinear()
-            baseline_attrs = get_adapter_attributes_from_linear(baseline)
-            assert baseline.return_layernorm_output
-            assert baseline.return_layernorm_output_gathered
-            assert baseline_attrs.disable_sequence_parallel_comm
-
-            regather = FakeTELayerNormColumnParallelLinear()
-            regather_attrs = get_adapter_attributes_from_linear(regather, sequence_parallel_input_regather=True)
-            assert regather.return_layernorm_output
-            assert not regather.return_layernorm_output_gathered
-            assert not regather_attrs.disable_sequence_parallel_comm
-
-            overlap_regather = FakeTELayerNormColumnParallelLinear()
-            overlap_regather.ub_overlap_ag = True
-            overlap_regather.config.tp_comm_overlap = True
-            overlap_regather_attrs = get_adapter_attributes_from_linear(
-                overlap_regather, sequence_parallel_input_regather=True
-            )
-            assert overlap_regather.return_layernorm_output
-            assert not overlap_regather.return_layernorm_output_gathered
-            assert not overlap_regather_attrs.disable_sequence_parallel_comm
+            linear = FakeTELayerNormColumnParallelLinear()
+            attrs = get_adapter_attributes_from_linear(linear)
+            assert linear.return_layernorm_output
+            assert not linear.return_layernorm_output_gathered
+            assert not attrs.disable_sequence_parallel_comm
 
     def test_get_adapter_attributes_unsupported_module(self):
         """Test with unsupported module type."""

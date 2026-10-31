@@ -185,11 +185,7 @@ class LoRA(PEFT, ModuleMatcher):
                 return LoRALinear(module, adapter)
 
             is_expert = is_expert_linear(full_name)
-            attrs = get_adapter_attributes_from_linear(
-                module,
-                is_expert=is_expert,
-                sequence_parallel_input_regather=self.sequence_parallel_input_regather and not is_expert,
-            )
+            attrs = get_adapter_attributes_from_linear(module, is_expert=is_expert)
 
             dim = get_effective_lora_dim(
                 module, dim=self.dim, normalize_moe_lora=self.normalize_moe_lora, is_expert=is_expert

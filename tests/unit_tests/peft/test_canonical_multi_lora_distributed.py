@@ -14,6 +14,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 
 from megatron.bridge.models.conversion.param_mapping import merge_qkv_weights
 from megatron.bridge.peft.canonical_lora import CanonicalLoRA, LoRALinearSplitFC1UpGate
+from megatron.bridge.peft.lora import LoRA
 from megatron.bridge.peft.lora_layers import LoRALinear
 from megatron.bridge.peft.multi_lora import CanonicalMultiLoRA
 from megatron.bridge.peft.multi_lora_layers import expose_adapter_slot, init_adapter_slot, set_tokens_per_adapter_slot
@@ -121,6 +122,86 @@ def test_projection_forward_backward_tp(name, targets, widths, output_gate, sequ
         assert all(p.grad is not None and p.grad.count_nonzero() == 0 for p in layer.adapters[2].parameters())
         with expose_adapter_slot(layer, 1):
             assert all(adapter.alpha / adapter.dim == 2 for adapter in layer.adapter.values())
+
+
+@pytest.mark.usefixtures("two_rank_process_group")
+@pytest.mark.parametrize("variant", ["fused", "canonical", "canonical_first_only"])
+@pytest.mark.parametrize("name", ["linear_qkv", "linear_fc1"])
+@pytest.mark.parametrize("sequence_parallel", [False, True])
+def test_single_adapter_layernorm_input_grad_tp(variant, name, sequence_parallel):
+    from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
+
+    with _model_parallel(tp=2, ep=1):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            num_query_groups=2,
+            kv_channels=8,
+            gated_linear_unit=True,
+            tensor_model_parallel_size=2,
+            sequence_parallel=sequence_parallel,
+            params_dtype=torch.float32,
+            gradient_accumulation_fusion=False,
+        )
+        is_qkv = name == "linear_qkv"
+        base = TELayerNormColumnParallelLinear(
+            32,
+            64,
+            config=config,
+            init_method=torch.nn.init.zeros_,
+            bias=False,
+            skip_bias_add=True,
+            tp_comm_buffer_name="qkv" if is_qkv else "fc1",
+            gather_output=False,
+            is_expert=False,
+        )
+        base = base.cuda().requires_grad_(False)
+        kwargs = dict(dim=8, alpha=16, lora_B_init_method="normal")
+        canonical = variant != "fused"
+        keys, widths = (("q", "k", "v"), (32, 16, 16)) if is_qkv else (("gate", "up"), (32, 32))
+        if canonical:
+            # untargeted projections are zero-filled by the wrapper
+            targeted = keys[:1] if variant == "canonical_first_only" else keys
+            targets = [f"linear_{key}" if is_qkv else f"linear_fc1_{key}" for key in targeted]
+            transform = CanonicalLoRA(target_modules=targets, **kwargs)
+        else:
+            transform = LoRA(target_modules=[name], **kwargs)
+        layer = transform.transform(base, name=name, prefix="decoder.layers.0.self_attention")
+        if canonical:
+            adapters = [layer.adapter[f"adapter_{key}"] for key in keys]
+        else:
+            adapters = [layer.adapter]
+        factors = {
+            adapter: (_gather(adapter.linear_in.weight), _gather(adapter.linear_out.weight))
+            for adapter in adapters
+            if adapter is not None
+        }
+        deltas = [
+            factors[adapter][1] @ factors[adapter][0] * 2 if adapter is not None else torch.zeros(width, 32).cuda()
+            for adapter, width in zip(adapters, widths)
+        ]
+        if canonical and is_qkv:
+            merged = merge_qkv_weights(config, *deltas)
+        elif canonical:
+            # rank-local [gate; up] halves, matching the base's fc1 shards
+            merged = torch.cat([torch.cat([d.chunk(2)[r] for d in deltas]) for r in range(2)])
+        else:
+            merged = deltas[0]
+        torch.manual_seed(100)
+        full_x = torch.randn(8, 1, 32, device="cuda", requires_grad=True)
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        x = (full_x.detach().chunk(2)[tp_rank] if sequence_parallel else full_x.detach()).clone().requires_grad_()
+        actual, _ = layer(x)
+        expected = F.linear(F.layer_norm(full_x, (32,), eps=config.layernorm_epsilon), merged)
+        _assert_close(actual, expected.chunk(2, dim=-1)[tp_rank])
+        actual.square().sum().backward()
+        expected.square().sum().backward()
+        for adapter, (a, b) in factors.items():
+            _assert_close(adapter.linear_in.weight.grad, a.grad.chunk(2)[tp_rank])
+            _assert_close(adapter.linear_out.weight.grad, b.grad.chunk(2)[tp_rank])
+        # the base weight is zero, so the whole input gradient flows through the adapter
+        _assert_close(x.grad, full_x.grad.chunk(2)[tp_rank] if sequence_parallel else full_x.grad)
 
 
 def _expert_fc1_config():
@@ -465,11 +546,7 @@ def test_gdn_in_proj_components_tp(multi, targets, sequence_parallel):
         for adapter, (a, b) in leaves.items():
             _assert_close(adapter.linear_in.weight.grad, a.grad.chunk(2)[tp_rank])
             _assert_close(adapter.linear_out.weight.grad, b.grad.chunk(2)[tp_rank])
-        # Single-adapter LoRA under SP takes TE's gathered LN output, whose grad TE drops, for every
-        # wrapper (fused LoRA included); MultiLoRA owns that gather.
-        if multi or not sequence_parallel:
-            expected_dx = full_x.grad.chunk(2)[tp_rank] if sequence_parallel else full_x.grad
-            _assert_close(x.grad, expected_dx)
+        _assert_close(x.grad, full_x.grad.chunk(2)[tp_rank] if sequence_parallel else full_x.grad)
         if multi:
             assert all(p.grad is not None and p.grad.count_nonzero() == 0 for p in layer.adapters[2].parameters())
 
