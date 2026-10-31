@@ -493,7 +493,7 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
                 adapter_q, adapter_k, adapter_v = None, None, None
                 k_out_features = m.config.kv_channels * m.config.num_query_groups
                 v_out_features = value_head_size(m.config) * m.config.num_query_groups
-                # Qwen3.5's query projection carries its output gate, interleaved per head
+                # Qwen3.5: query rows include the output gate
                 q_out_features = (
                     m.config.kv_channels * m.config.num_attention_heads * (2 if m.config.attention_output_gate else 1)
                 )
