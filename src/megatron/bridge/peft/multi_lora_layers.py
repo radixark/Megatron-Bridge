@@ -52,7 +52,13 @@ from megatron.core.tensor_parallel.mappings import (
 from megatron.core.transformer.moe.moe_utils import sort_chunks_by_idxs
 
 from megatron.bridge.peft.adapter_wrapper import AdapterWrapper
-from megatron.bridge.peft.canonical_lora import ModuleDict, interleave_qkv, value_head_size
+from megatron.bridge.peft.canonical_lora import (
+    GDN_IN_PROJ_TARGETS,
+    ModuleDict,
+    gdn_in_proj_sizes,
+    interleave_qkv,
+    value_head_size,
+)
 from megatron.bridge.peft.utils import (
     GroupedExpertLinearAdapter,
     ParallelLinearAdapter,
@@ -161,6 +167,11 @@ def _projection_sizes(to_wrap, out_features, targets):
         v_size = value_head_size(config) * config.num_query_groups
         # Qwen3.5's query projection includes its output gate.
         return {"adapter_q": out_features - k_size - v_size, "adapter_k": k_size, "adapter_v": v_size}
+    if targets <= set(GDN_IN_PROJ_TARGETS):
+        sizes = gdn_in_proj_sizes(to_wrap.config)
+        # Mamba's mixer.in_proj also matches 'in_proj'
+        assert sum(sizes.values()) == out_features, f"{out_features}-wide in_proj is not a GDN in_proj"
+        return {PROJECTION_ADAPTER_KEYS[target]: size for target, size in sizes.items()}
     assert targets <= {"linear_fc1_gate", "linear_fc1_up"}, targets
     assert to_wrap.config.gated_linear_unit, "Independent gate/up adapters require a gated MLP"
     return {"adapter_gate": out_features // 2, "adapter_up": out_features // 2}
@@ -173,6 +184,7 @@ PROJECTION_ADAPTER_KEYS = {
     "linear_v": "adapter_v",
     "linear_fc1_gate": "adapter_gate",
     "linear_fc1_up": "adapter_up",
+    **{target: f"adapter_{target}" for target in GDN_IN_PROJ_TARGETS},
 }
 
 

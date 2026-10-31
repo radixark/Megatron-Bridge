@@ -32,12 +32,13 @@ from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
     ColumnParallelMapping,
     GatedMLPMapping,
+    GDNLinearMappingSeparate,
     RowParallelMapping,
     _fuse_gdn_separate_to_grouped,
     merge_gdn_linear_weights,
     merge_qkv_weights,
 )
-from megatron.bridge.models.conversion.peft_bridge import AdapterWeight
+from megatron.bridge.models.conversion.peft_bridge import GDN_IN_PROJ_KEYS, AdapterWeight
 
 
 class DummyBridge(MegatronModelBridge):
@@ -2039,6 +2040,75 @@ def test_merge_lora_adapter_weights_gdn_in_proj_split(monkeypatch):
         updated["model.layers.0.linear_attn.in_proj_a.weight"],
         base_a + a_delta,
     )
+
+
+def test_merge_canonical_gdn_in_proj_components():
+    """Each component merges into its own rows; q/k/v share HF's in_proj_qkv and untargeted rows stay intact."""
+    bridge = DummyBridge()
+    config = SimpleNamespace(
+        linear_key_head_dim=1,
+        linear_num_key_heads=2,
+        linear_value_head_dim=2,
+        linear_num_value_heads=2,
+        num_moe_experts=0,
+    )
+    prefix = "model.layers.0.linear_attn"
+    converted = {f"{prefix}.{key}.weight": torch.zeros(rows, 3) for key, rows in zip(GDN_IN_PROJ_KEYS, (8, 4, 2, 2))}
+
+    def adapter(key, rows, seed):
+        torch.manual_seed(seed)
+        return AdapterWeight(
+            global_base_prefix="decoder.layers.0.self_attention.in_proj",
+            adapter_key=key,
+            alpha=2,
+            dim=1,
+            linear_in_weight=MegatronWeightTuple("in", torch.randn(1, 3), vp_stage=0),
+            linear_out_weight=MegatronWeightTuple("out", torch.randn(rows, 1), vp_stage=0),
+        )
+
+    k, v, a = (
+        adapter("adapter_in_proj_k", 2, seed=0),
+        adapter("adapter_in_proj_v", 4, seed=1),
+        adapter("adapter_in_proj_a", 2, seed=2),
+    )
+    updated = bridge._merge_lora_adapter_weights(
+        [SimpleNamespace(config=config)], converted, [k, v, a], {"qkv": None, "z": None, "b": None, "a": None}
+    )
+
+    def delta(w):
+        return 2 * w.linear_out_weight.weight @ w.linear_in_weight.weight
+
+    torch.testing.assert_close(
+        updated[f"{prefix}.in_proj_qkv.weight"], torch.cat([torch.zeros(2, 3), delta(k), delta(v)])
+    )
+    torch.testing.assert_close(updated[f"{prefix}.in_proj_z.weight"], torch.zeros(4, 3))
+    torch.testing.assert_close(updated[f"{prefix}.in_proj_b.weight"], torch.zeros(2, 3))
+    torch.testing.assert_close(updated[f"{prefix}.in_proj_a.weight"], delta(a))
+
+
+def test_canonical_gdn_in_proj_adapters_resolve_component_names():
+    """q/k/v export under component names HF does not have; z/b/a under their HF projections."""
+    bridge = DummyBridge()
+    registry = MegatronMappingRegistry(
+        GDNLinearMappingSeparate(
+            megatron_param="decoder.layers.*.self_attention.in_proj.weight",
+            qkv="model.layers.*.linear_attn.in_proj_qkv.weight",
+            z="model.layers.*.linear_attn.in_proj_z.weight",
+            b="model.layers.*.linear_attn.in_proj_b.weight",
+            a="model.layers.*.linear_attn.in_proj_a.weight",
+        )
+    )
+    prefix = "decoder.layers.3.self_attention.in_proj"
+    for component in ("q", "k", "v", "z", "b", "a"):
+        adapter_key = f"adapter_in_proj_{component}"
+        hf_base = f"model.layers.3.linear_attn.in_proj_{component}"
+        assert (
+            bridge._resolve_hf_adapter_param_name(registry, prefix, ".linear_in.weight", ".weight", adapter_key)
+            == f"{hf_base}.lora_A.weight"
+        )
+        assert bridge._get_base_hf_param_names_for_adapter(registry, prefix, adapter_key, ".weight") == [
+            f"{hf_base}.weight"
+        ]
 
 
 def _stream_weights_with_merge_disabled(monkeypatch, converted_name: str):

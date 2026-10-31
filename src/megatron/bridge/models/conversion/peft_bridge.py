@@ -40,7 +40,7 @@ from megatron.bridge.models.conversion.utils import (
     get_module_and_param_from_name,
     persistent_buffers,
 )
-from megatron.bridge.peft.canonical_lora import ModuleDict
+from megatron.bridge.peft.canonical_lora import GDN_IN_PROJ_TARGETS, ModuleDict, gdn_in_proj_sizes
 from megatron.bridge.peft.lora_layers import LinearAdapter
 from megatron.bridge.peft.lora_merge import LoRAMerge
 from megatron.bridge.peft.utils import (
@@ -106,6 +106,8 @@ MEGATRON_TO_HF_LORA_SUFFIX = {
 }
 
 GDN_IN_PROJ_KEYS = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
+# CanonicalLoRA GDN in_proj adapter key -> its component; z/b/a are also roles of the mapping's ``hf_param``
+GDN_IN_PROJ_ADAPTER_ROLES = {f"adapter_{target}": target.removeprefix("in_proj_") for target in GDN_IN_PROJ_TARGETS}
 
 
 @dataclass(frozen=True)
@@ -150,6 +152,12 @@ def _hf_param_for_canonical_adapter(hf_param, adapter_key: Optional[str]) -> Opt
 
     if not isinstance(hf_param, dict):
         return None
+    role = GDN_IN_PROJ_ADAPTER_ROLES.get(adapter_key)
+    if role in ("q", "k", "v"):
+        # HF fuses q/k/v into in_proj_qkv; independent factors export under their component names
+        return hf_param["qkv"].replace("in_proj_qkv", f"in_proj_{role}")
+    if role is not None:
+        return hf_param[role]
     return hf_param.get(CANONICAL_ADAPTER_ROLES.get(adapter_key))
 
 
@@ -1367,6 +1375,9 @@ class MegatronPeftBridge:
             # Nothing to merge on this rank (e.g., non-owning PP rank or filtered mapping).
             return converted_weights_dict
 
+        if all(w.adapter_key in GDN_IN_PROJ_ADAPTER_ROLES for w in adapter_weights):
+            return self._merge_canonical_gdn_in_proj(megatron_model, converted_weights_dict, adapter_weights)
+
         if all(w.adapter_key in CANONICAL_ADAPTER_ROLES for w in adapter_weights):
             return self._merge_canonical_adapter_from_weights(
                 megatron_model, converted_weights_dict, adapter_weights, base_hf_param
@@ -1589,6 +1600,38 @@ class MegatronPeftBridge:
             tp_group=None,
         )
         return merged.to(orig_dtype)
+
+    def _merge_canonical_gdn_in_proj(
+        self,
+        megatron_model: List[MegatronModel],
+        converted_weights_dict: Dict[str, torch.Tensor],
+        adapter_weights: List[AdapterWeight],
+    ) -> Dict[str, torch.Tensor]:
+        """Merge per-component GDN in_proj adapters; q/k/v merge into their row blocks of HF's in_proj_qkv."""
+
+        sizes = gdn_in_proj_sizes(unwrap_model(megatron_model)[0].config)
+        adapter_by_target = {w.adapter_key.removeprefix("adapter_"): w for w in adapter_weights}
+        for hf_name, base_weight in list(converted_weights_dict.items()):
+            projection_key = self._infer_gdn_in_proj_projection_from_name(hf_name)
+            if projection_key is None:
+                raise ValueError(f"Unknown GDN in_proj weight name: {hf_name}")
+            targets = ("in_proj_q", "in_proj_k", "in_proj_v") if projection_key == "in_proj_qkv" else (projection_key,)
+            blocks = base_weight.split([sizes[target] for target in targets])
+            merged = []
+            for target, block in zip(targets, blocks):
+                adapter = adapter_by_target.get(target)
+                if adapter is not None:
+                    block = self._merge_single_adapter_weight(
+                        block,
+                        adapter.alpha,
+                        adapter.dim,
+                        adapter.linear_in_weight.weight,
+                        adapter.linear_out_weight.weight,
+                    )
+                merged.append(block)
+            converted_weights_dict[hf_name] = torch.cat(merged)
+
+        return converted_weights_dict
 
     def _merge_canonical_adapter_from_weights(
         self,

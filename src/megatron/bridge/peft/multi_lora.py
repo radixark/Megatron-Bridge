@@ -186,7 +186,7 @@ class MultiLoRA(PEFT, ModuleMatcher):
 
 @dataclass
 class CanonicalMultiLoRA(MultiLoRA, CanonicalLoRA):
-    """Multi-LoRA with independent Q/K/V and gate/up factors in each slot."""
+    """Multi-LoRA with independent Q/K/V, gate/up and GDN in_proj component factors in each slot."""
 
     target_modules: List[str] = field(
         default_factory=lambda: [
