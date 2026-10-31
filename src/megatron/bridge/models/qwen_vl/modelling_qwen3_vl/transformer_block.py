@@ -151,7 +151,8 @@ class Qwen3VLVisionTransformerBlock(TransformerBlock):
                             deepstack_idx = self.deepstack_visual_indexes.index(l_no)
                             deepstack_feature = self.deepstack_merger_list[deepstack_idx](hidden_states)
                             deepstack_feature_lists.append(deepstack_feature)
-                return hidden_states, deepstack_feature_lists, context
+                # Activation checkpointing only tracks gradients of top-level tensor outputs.
+                return hidden_states, context, *deepstack_feature_lists
 
             return custom_forward
 
@@ -189,7 +190,7 @@ class Qwen3VLVisionTransformerBlock(TransformerBlock):
 
             while layer_idx < self.num_layers_per_pipeline_rank:
                 chunk_end = min(layer_idx + self.config.recompute_num_layers, self.num_layers_per_pipeline_rank)
-                hidden_states, layer_deepstack_feature_lists, context = checkpoint_handler(
+                hidden_states, context, *layer_deepstack_feature_lists = checkpoint_handler(
                     custom(layer_idx, chunk_end)
                 )
 
@@ -211,11 +212,11 @@ class Qwen3VLVisionTransformerBlock(TransformerBlock):
                     layer_idx >= recompute_skip_num_layers
                     and layer_idx < self.config.recompute_num_layers + recompute_skip_num_layers
                 ):
-                    hidden_states, layer_deepstack_feature_lists, context = checkpoint_handler(
+                    hidden_states, context, *layer_deepstack_feature_lists = checkpoint_handler(
                         custom(layer_idx, layer_idx + 1)
                     )
                 else:
-                    hidden_states, layer_deepstack_feature_lists, context = custom(layer_idx, layer_idx + 1)(
+                    hidden_states, context, *layer_deepstack_feature_lists = custom(layer_idx, layer_idx + 1)(
                         hidden_states,
                         attention_mask,
                         context,
