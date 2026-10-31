@@ -65,8 +65,10 @@ class MockMegatronLinear(nn.Module):
         out_features,
         kv_channels=None,
         num_query_groups=None,
+        num_attention_heads=None,
         moe_router_topk=None,
         gated_linear_unit=True,
+        attention_output_gate=False,
     ):
         super().__init__()
         self.linear = nn.Linear(in_features, out_features)
@@ -77,10 +79,11 @@ class MockMegatronLinear(nn.Module):
             def __init__(self):
                 self.kv_channels = kv_channels or 64
                 self.num_query_groups = num_query_groups or 8
-                self.num_attention_heads = self.num_query_groups
+                self.num_attention_heads = num_attention_heads or self.num_query_groups
                 self.sequence_parallel = False
                 self.moe_router_topk = moe_router_topk
                 self.gated_linear_unit = gated_linear_unit
+                self.attention_output_gate = attention_output_gate
                 self.expert_tensor_parallel_size = 1
                 self.expert_model_parallel_size = 1
                 self.params_dtype = torch.float32
@@ -512,6 +515,23 @@ class TestCanonicalLoRA:
         mlp = transformed_model.language_model.decoder.layers[0].mlp
         for fc1 in (mlp.linear_fc1, mlp.experts.linear_fc1, mlp.shared_experts.linear_fc1):
             assert isinstance(fc1, MockMegatronLinear)
+
+    def test_canonical_lora_sizes_the_gated_query_adapter(self):
+        """The q adapter spans the query and output-gate rows, so the gated forward matches linear_qkv's width."""
+        model = MegatronStyleModel()
+        # 8 heads, 2 groups, 64 channels: query 512 + gate 512, key 128, value 128
+        model.linear_qkv = MockMegatronLinear(
+            512, 1280, kv_channels=64, num_query_groups=2, num_attention_heads=8, attention_output_gate=True
+        )
+        lora = CanonicalLoRA(target_modules=["linear_q", "linear_k", "linear_v"], dim=2)
+
+        linear_qkv = _apply_with_linear_adapters(lora, model).linear_qkv
+
+        assert isinstance(linear_qkv, LoRALinearSplitQKV)
+        assert linear_qkv.adapter.adapter_q.out_features == 1024
+        with torch.no_grad():
+            output, _ = linear_qkv(torch.randn(3, 512))
+        assert output.shape == (3, 1280)
 
     def test_canonical_lora_splits_gdn_in_proj(self):
         """Each targeted GDN in_proj component gets its own adapter sized to that component."""
