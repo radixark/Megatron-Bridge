@@ -67,6 +67,7 @@ class MockMegatronLinear(nn.Module):
         num_query_groups=None,
         moe_router_topk=None,
         gated_linear_unit=True,
+        attention_output_gate=False,
     ):
         super().__init__()
         self.linear = nn.Linear(in_features, out_features)
@@ -81,6 +82,7 @@ class MockMegatronLinear(nn.Module):
                 self.sequence_parallel = False
                 self.moe_router_topk = moe_router_topk
                 self.gated_linear_unit = gated_linear_unit
+                self.attention_output_gate = attention_output_gate
                 self.expert_tensor_parallel_size = 1
                 self.expert_model_parallel_size = 1
                 self.params_dtype = torch.float32
@@ -512,6 +514,23 @@ class TestCanonicalLoRA:
         mlp = transformed_model.language_model.decoder.layers[0].mlp
         for fc1 in (mlp.linear_fc1, mlp.experts.linear_fc1, mlp.shared_experts.linear_fc1):
             assert isinstance(fc1, MockMegatronLinear)
+
+    def test_canonical_lora_sizes_the_gated_query_adapter(self):
+        """Qwen3.5's query projection carries its output gate, so the q adapter covers its query and gate rows."""
+        model = MegatronStyleModel()
+        # 8 heads x 64: query 512 + gate 512, key 512, value 512
+        model.linear_qkv = MockMegatronLinear(
+            512, 2048, kv_channels=64, num_query_groups=8, attention_output_gate=True
+        )
+        lora = CanonicalLoRA(target_modules=["linear_q", "linear_k", "linear_v"], dim=2)
+
+        linear_qkv = _apply_with_linear_adapters(lora, model).linear_qkv
+
+        assert isinstance(linear_qkv, LoRALinearSplitQKV)
+        assert linear_qkv.adapter.adapter_q.out_features == 1024
+        with torch.no_grad():
+            output, _ = linear_qkv(torch.randn(3, 512))
+        assert output.shape == (3, 2048)
 
     def test_canonical_lora_splits_gdn_in_proj(self):
         """Each targeted GDN in_proj component gets its own adapter sized to that component."""

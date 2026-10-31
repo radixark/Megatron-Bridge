@@ -493,7 +493,10 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
                 adapter_q, adapter_k, adapter_v = None, None, None
                 k_out_features = m.config.kv_channels * m.config.num_query_groups
                 v_out_features = value_head_size(m.config) * m.config.num_query_groups
-                q_out_features = m.config.kv_channels * m.config.num_attention_heads
+                # Qwen3.5's query projection carries its output gate, interleaved per head
+                q_out_features = (
+                    m.config.kv_channels * m.config.num_attention_heads * (2 if m.config.attention_output_gate else 1)
+                )
                 if "linear_q" in canonical_submodules:
                     adapter_q = adapter_cls(attrs.in_features, q_out_features, **adapter_kwargs)
                 if "linear_k" in canonical_submodules:
