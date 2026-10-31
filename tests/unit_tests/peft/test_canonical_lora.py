@@ -517,7 +517,7 @@ class TestCanonicalLoRA:
             assert isinstance(fc1, MockMegatronLinear)
 
     def test_canonical_lora_sizes_the_gated_query_adapter(self):
-        """Qwen3.5's query projection carries its output gate, so the q adapter covers its query and gate rows."""
+        """The q adapter spans the query and output-gate rows, so the gated forward matches linear_qkv's width."""
         model = MegatronStyleModel()
         # 8 heads, 2 groups, 64 channels: query 512 + gate 512, key 128, value 128
         model.linear_qkv = MockMegatronLinear(
