@@ -38,6 +38,10 @@ class Glm5NextModelProvider(GLM5ModelProvider):
     # kpool-compressed indexer: keys pooled `dsa_index_kpool` at a time before the top-k.
     dsa_index_kpool: int = 4
 
+    # Must match the input packer: Megatron/Miles default to per-sequence zigzag;
+    # Miles --allgather-cp uses a contiguous slice of the entire packed stream.
+    glm5_next_cp_layout: str = "zigzag"
+
     # KDA linear attention (HF `linear_attn_config`).
     kda_layers: Tuple[int, ...] = ()
     kda_num_heads: int = 64

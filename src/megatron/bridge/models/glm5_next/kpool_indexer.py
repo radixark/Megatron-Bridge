@@ -35,6 +35,7 @@ from triton.language.extra import libdevice
 
 SPARSE_MLA_BLOCK = 64
 _SELECT_BLOCK = 256
+_QUERY_BLOCK = 32768
 
 
 def _indexer_replay_manager():
@@ -297,20 +298,57 @@ def kpool_select_topk(
     pool_cu_seqlens: torch.Tensor,
     index_topk: int,
     kpool: int,
+    *,
+    query_positions: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Score pooled keys, pick the top pools per query and expand to ``[t, 1, width]`` token ids.
 
-    Padded slots are ``-1`` (ignored by ``SparseMLA``). When miles' indexer replay is enabled the
-    pool top-k comes from the recorded rollout selection instead of the live scores.
+    ``query_positions`` maps local CP rows to global packed positions; selected
+    indices always address globally ordered keys. Padded slots are ``-1``
+    (ignored by ``SparseMLA``). When miles' indexer replay is enabled, the pool
+    top-k comes from recorded rollout selection instead of live scores.
     """
     num_tokens = index_q.shape[0]
     device = index_q.device
-    token_ids = torch.arange(num_tokens, device=device)
+    token_ids = torch.arange(num_tokens, device=device) if query_positions is None else query_positions
+    if token_ids.shape != (num_tokens,) or token_ids.device != device:
+        raise ValueError("query_positions must contain one global position per local query on the same device")
     seq_indices = torch.searchsorted(cu_seqlens, token_ids, right=True) - 1
     seq_token_base = cu_seqlens[seq_indices].to(torch.int32)
     pool_base = pool_cu_seqlens[seq_indices].to(torch.int32)
     local_positions = (token_ids - seq_token_base).to(torch.int32)
     eligible_pools = torch.div(local_positions + 1, kpool, rounding_mode="floor")
+
+    replay = _indexer_replay_manager()
+    if pooled_k.shape[0] > 0 and num_tokens > _QUERY_BLOCK and (replay is None or not replay.enabled):
+        # Scoring is independent per query. Bound the quadratic temporary even
+        # when a CP shard itself contains hundreds of thousands of tokens.
+        from megatron.bridge.models.glm5.tilelang.tilelang_indexer_fwd import indexer_fwd_interface
+
+        blocks = []
+        for start in range(0, num_tokens, _QUERY_BLOCK):
+            rows = slice(start, start + _QUERY_BLOCK)
+            with torch.no_grad():
+                logits = indexer_fwd_interface(
+                    index_q[rows],
+                    pooled_k,
+                    head_weights[rows],
+                    pool_base[rows],
+                    (pool_base[rows] + eligible_pools[rows]).to(torch.int32),
+                    clean_logits=True,
+                )
+            blocks.append(
+                _select_expand_tail(
+                    logits,
+                    seq_token_base[rows],
+                    pool_base[rows],
+                    local_positions[rows],
+                    index_topk,
+                    kpool,
+                )
+            )
+            del logits
+        return torch.cat(blocks).unsqueeze(1)
 
     if pooled_k.shape[0] > 0:
         # TileLang is only needed for the scoring kernel; keep it out of module import so the
@@ -329,7 +367,6 @@ def kpool_select_topk(
     else:
         pool_logits = torch.full((num_tokens, 1), float("-inf"), dtype=torch.float32, device=device)
 
-    replay = _indexer_replay_manager()
     if replay is not None and replay.enabled:
         topk_fn = replay.get_topk_fn(
             _pool_topk_to_token_fn(seq_token_base, pool_base, local_positions, kpool),
