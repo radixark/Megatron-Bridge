@@ -32,9 +32,10 @@ dim = heads), ``linear_f_a`` / ``linear_g_a`` are replicated (``head_dim`` outpu
 Megatron/TE linear so the PEFT adapters wrap them like any other attention linear.
 
 Numerics follow the GLM-5.3 reference (radixark/miles ``miles_plugins/models/glm5_next/kda.py``),
-which is what the rollout engine matches. Context parallelism is not supported.
+which is what the rollout engine matches. Context parallelism uses FLA state/halo communication.
 """
 
+import inspect
 from dataclasses import dataclass
 from typing import Optional, Union
 
@@ -49,6 +50,8 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
+
+from megatron.bridge.models.glm5_next.context_parallel import kda_cp_segments
 
 
 try:
@@ -111,7 +114,15 @@ class Glm5NextKDAAttention(MegatronModule):
         self.pg_collection = pg_collection
         self.layer_number = layer_number
         self.tp_size = pg_collection.tp.size()
-        assert config.context_parallel_size == 1, "GLM-5.3 KDA does not support context parallelism"
+        self.cp_size = config.context_parallel_size
+        self.cp_layout = config.glm5_next_cp_layout
+        self.build_cp_context = None
+        if self.cp_size > 1:
+            from fla.ops.cp import build_cp_context
+
+            if "layout" not in inspect.signature(build_cp_context).parameters:
+                raise ImportError("GLM-5.3 CP requires FLA with build_cp_context(layout=...) support")
+            self.build_cp_context = build_cp_context
 
         self.hidden_size = config.hidden_size
         self.num_heads = int(config.kda_num_heads)
@@ -235,7 +246,7 @@ class Glm5NextKDAAttention(MegatronModule):
         cu_seqlens = packed_seq_params.cu_seqlens_q
 
         # Column-parallel projections gather the sequence-parallel input internally, so
-        # q/k/v/beta/gates below are [s_full, 1, local features].
+        # q/k/v/beta/gates below are [s_cp_local, 1, local features].
         q, _ = self.linear_q(hidden_states)
         k, _ = self.linear_k(hidden_states)
         v, _ = self.linear_v(hidden_states)
@@ -245,14 +256,9 @@ class Glm5NextKDAAttention(MegatronModule):
         g_a, _ = self.linear_g_a(hidden_states)
         norm_gate, _ = self.linear_g_b(g_a)
 
-        # fla works batch-first: [1, T, ...]
+        # FLA works batch-first. CP communicates recurrent state and convolution
+        # halos, retaining only this rank's query/key/value tokens.
         mixed_qkv = torch.cat((q, k, v), dim=-1).transpose(0, 1)
-        mixed_qkv, _ = self.conv1d(x=mixed_qkv, cu_seqlens=cu_seqlens)
-        query, key, value = torch.split(mixed_qkv, [self.local_projection_size] * 3, dim=-1)
-        query = query.unflatten(-1, (self.local_num_heads, self.head_dim))
-        key = key.unflatten(-1, (self.local_num_heads, self.head_dim))
-        value = value.unflatten(-1, (self.local_num_heads, self.head_dim))
-
         beta = torch.sigmoid(beta_logits.transpose(0, 1).float())
         g = fused_kda_gate(
             forget.transpose(0, 1).unflatten(-1, (self.local_num_heads, self.head_dim)),
@@ -260,18 +266,41 @@ class Glm5NextKDAAttention(MegatronModule):
             self.dt_bias,
             lower_bound=self.gate_lower_bound,
         )
-
-        core_attn_out, _ = chunk_kda(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=True,
-            cu_seqlens=cu_seqlens,
-        )
+        if self.cp_size == 1:
+            segments = [(slice(None), cu_seqlens)]
+        else:
+            segments = kda_cp_segments(cu_seqlens, cp_size=self.cp_size, layout=self.cp_layout)
+        outputs = []
+        for rows, segment_cu in segments:
+            if self.cp_size == 1:
+                sequence_kwargs = {"cu_seqlens": segment_cu}
+            else:
+                sequence_kwargs = {
+                    "cp_context": self.build_cp_context(
+                        segment_cu.to(torch.long),
+                        group=self.pg_collection.cp,
+                        conv1d_kernel_size=self.conv_kernel_size,
+                        layout=self.cp_layout,
+                    )
+                }
+            convolved, _ = self.conv1d(x=mixed_qkv[:, rows], **sequence_kwargs)
+            query, key, value = torch.split(convolved, [self.local_projection_size] * 3, dim=-1)
+            query = query.unflatten(-1, (self.local_num_heads, self.head_dim))
+            key = key.unflatten(-1, (self.local_num_heads, self.head_dim))
+            value = value.unflatten(-1, (self.local_num_heads, self.head_dim))
+            out, _ = chunk_kda(
+                query,
+                key,
+                value,
+                g=g[:, rows],
+                beta=beta[:, rows],
+                initial_state=None,
+                output_final_state=False,
+                use_qk_l2norm_in_kernel=True,
+                **sequence_kwargs,
+            )
+            outputs.append(out)
+        core_attn_out = torch.cat(outputs, dim=1)
 
         out_shape = core_attn_out.shape  # [1, T, h_local, d]
         core_attn_out = self.o_norm(

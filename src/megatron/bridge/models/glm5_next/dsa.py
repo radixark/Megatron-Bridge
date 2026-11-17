@@ -46,6 +46,7 @@ from megatron.core.transformer.multi_latent_attention import MLASelfAttentionSub
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 
 from megatron.bridge.models.glm5.tilelang.tilelang_mla import TileLangMLASelfAttention
+from megatron.bridge.models.glm5_next.context_parallel import cp_token_positions, gather_cp_tokens
 from megatron.bridge.models.glm5_next.kpool_indexer import build_pooled_keys, kpool_select_topk, pool_boundaries
 
 
@@ -234,8 +235,11 @@ class Glm5NextDSAAttention(TileLangMLASelfAttention):
             weight=kv_up_ln_weight.float(),
             eps=config.layernorm_epsilon,
         ).to(kv_compressed.dtype)
-        kv_compressed = gather_from_sequence_parallel_region(
-            kv_compressed, group=parallel_state.get_context_parallel_group()
+        kv_compressed = gather_cp_tokens(
+            kv_compressed,
+            packed_seq_params.cu_seqlens_kv,
+            group=parallel_state.get_context_parallel_group(),
+            layout=config.glm5_next_cp_layout,
         )
         query = query.contiguous()
         key = kv_compressed.contiguous()
@@ -253,13 +257,21 @@ class Glm5NextDSAAttention(TileLangMLASelfAttention):
         index_k = self.k_norm(index_k.squeeze(1).float()).bfloat16()
         if config.sequence_parallel:
             index_k = gather_from_sequence_parallel_region(index_k)
-        index_k = gather_from_sequence_parallel_region(index_k, group=parallel_state.get_context_parallel_group())
+        index_k = gather_cp_tokens(
+            index_k,
+            packed_seq_params.cu_seqlens_kv,
+            group=parallel_state.get_context_parallel_group(),
+            layout=config.glm5_next_cp_layout,
+        )
 
         gate_score = F.linear(hidden_states.squeeze(1), self.index_kpool_compress_gate)
         if config.sequence_parallel:
             gate_score = gather_from_sequence_parallel_region(gate_score)
-        gate_score = gather_from_sequence_parallel_region(
-            gate_score, group=parallel_state.get_context_parallel_group()
+        gate_score = gather_cp_tokens(
+            gate_score,
+            packed_seq_params.cu_seqlens_kv,
+            group=parallel_state.get_context_parallel_group(),
+            layout=config.glm5_next_cp_layout,
         )
 
         weights_proj_weight = _base_linear(self.weights_proj).weight
@@ -271,9 +283,20 @@ class Glm5NextDSAAttention(TileLangMLASelfAttention):
         return query, key, w_vc, index_q, index_k, head_weights, gate_score
 
     def _kpool_select(self, index_q, index_k, head_weights, gate_score, packed_seq_params):
-        if parallel_state.get_context_parallel_world_size() > 1:
-            raise NotImplementedError("GLM-5.3 kpool indexer selection does not support context parallelism.")
         cu_seqlens = packed_seq_params.cu_seqlens_kv
+        query_positions = None
+        cp_size = parallel_state.get_context_parallel_world_size()
+        if cp_size > 1:
+            query_positions = cp_token_positions(
+                cu_seqlens,
+                cp_size=cp_size,
+                cp_rank=parallel_state.get_context_parallel_rank(),
+                layout=self.config.glm5_next_cp_layout,
+            )
+        if getattr(self, "indexer_replay", None) is not None:
+            from miles.utils.replay_base import indexer_replay_manager
+
+            indexer_replay_manager.set_current(self.indexer_replay)
         pool_cu_seqlens = pool_boundaries(cu_seqlens, self.index_kpool)
         pooled_k = build_pooled_keys(index_k, gate_score, self.index_kpool_compress_ape, cu_seqlens, self.index_kpool)
         return kpool_select_topk(
@@ -284,6 +307,7 @@ class Glm5NextDSAAttention(TileLangMLASelfAttention):
             pool_cu_seqlens=pool_cu_seqlens,
             index_topk=self.index_topk,
             kpool=self.index_kpool,
+            query_positions=query_positions,
         )
 
 
