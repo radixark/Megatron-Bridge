@@ -525,9 +525,14 @@ class MultiLoRALinear(AdapterWrapper):
             ).movedim(0, 1)
         elif not self.replicate_adapter:
             # B's output shards all contribute to each rank shard of A.
-            mid = gather_from_sequence_parallel_region(
-                mid.movedim(-1, 0).contiguous(), tensor_parallel_output_grad=True
-            ).movedim(0, -1)
+            # Row-major again before the B product. A column-major view starts a slot mid-column: grouped MM
+            # needs every slot's start 16-byte aligned (the whole-tensor layout check passes it anyway), and
+            # the dense path's bf16 product over such a view depends on the other slots' token counts.
+            mid = (
+                gather_from_sequence_parallel_region(mid.movedim(-1, 0).contiguous(), tensor_parallel_output_grad=True)
+                .movedim(0, -1)
+                .contiguous()
+            )
 
         out = _dense_multi_lora_mm(mid, stacked_B, token_splits=token_splits, offsets=offsets)
 

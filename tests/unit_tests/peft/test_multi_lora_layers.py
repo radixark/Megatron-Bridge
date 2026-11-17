@@ -362,6 +362,71 @@ def test_dense_multi_lora_mm_cuda_mixed_empty_slot_backward() -> None:
     assert torch.count_nonzero(weights.grad[1]) == 0
 
 
+def test_b_product_receives_a_row_major_input() -> None:
+    """Regression guarded: the B product got the gather's column-major view, in which a slot starts mid-column."""
+    real_mm = multi_lora_layers_module._dense_multi_lora_mm
+    inputs_contiguous = []
+
+    def recording_mm(x, *args, **kwargs):
+        inputs_contiguous.append(x.is_contiguous())
+        return real_mm(x, *args, **kwargs)
+
+    with adapter_deps_patch(), patch.object(multi_lora_layers_module, "_dense_multi_lora_mm", recording_mm):
+        layer = _build_multi_lora_linear(in_features=16, out_features=32, n_adapters=2, dim=8)
+        assert not layer.input_is_parallel and not layer.replicate_adapter
+        splits = (3, 7)
+        layer._adapter_forward(
+            torch.randn(10, 16), layer.adapters, splits, torch.tensor(splits).cumsum(0, dtype=torch.int32)
+        )
+
+    assert inputs_contiguous == [True, True]
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
+    reason="requires an SM80+ CUDA device",
+)
+def test_dense_multi_lora_mm_cuda_slot_output_ignores_other_slot_row_count() -> None:
+    """A slot's rows of a row-major input (what the B product gets after its gather) give the same bits whether
+    the slot before it holds 25 rows or 24, so a slice's output does not depend on where it starts."""
+    generator = torch.Generator().manual_seed(0)
+    weights = (torch.randn(3, 896, 32, generator=generator) * 0.05).to("cuda", torch.bfloat16)
+    rows = torch.randn(103, 32, generator=generator).to("cuda", torch.bfloat16)
+    other = torch.randn(25, 32, generator=generator).to("cuda", torch.bfloat16)
+
+    def slot_1_output(other_rows: int) -> torch.Tensor:
+        x = torch.cat([other[:other_rows], rows, other[: 25 - other_rows]])
+        splits = (other_rows, 128 - other_rows, 0)
+        out = multi_lora_layers_module._dense_multi_lora_mm(
+            x, weights, token_splits=splits, offsets=torch.tensor(splits, device="cuda").cumsum(0, dtype=torch.int32)
+        )
+        return out[other_rows : other_rows + 103]
+
+    assert torch.equal(slot_1_output(25), slot_1_output(24))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
+    reason="requires an SM80+ CUDA device",
+)
+def test_grouped_mm_cuda_takes_slots_not_a_multiple_of_8() -> None:
+    """A row-major input whose slot counts are not multiples of 8 (splits 25, 103, 8) takes the grouped path and
+    matches the per-slot products; a column-major one with these splits asserts on the device."""
+    generator = torch.Generator().manual_seed(0)
+    weights = (torch.randn(3, 896, 32, generator=generator) * 0.05).to("cuda", torch.bfloat16)
+    x = torch.randn(136, 32, generator=generator).to("cuda", torch.bfloat16)
+    splits = (25, 103, 8)
+    assert multi_lora_layers_module._can_use_grouped_mm(x, weights.transpose(-2, -1))
+
+    out = multi_lora_layers_module._dense_multi_lora_mm(
+        x, weights, token_splits=splits, offsets=torch.tensor(splits, device="cuda").cumsum(0, dtype=torch.int32)
+    )
+    torch.cuda.synchronize()
+
+    expected = torch.cat([F.linear(part, weight) for part, weight in zip(x.split(splits), weights)])
+    torch.testing.assert_close(out, expected)
+
+
 # ======================================================================
 # MultiLoRALinear: per-slot rank/alpha bookkeeping + rank masking
 # ======================================================================
