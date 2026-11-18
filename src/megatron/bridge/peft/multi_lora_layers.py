@@ -765,6 +765,8 @@ class MultiLoRAGroupedExpertLinear(MultiLoRALinear):
 
         attrs = get_adapter_attributes_from_linear(to_wrap, is_expert=True)
         self.input_is_parallel = attrs.input_is_parallel
+        self._adapter_in_features = attrs.in_features
+        self._adapter_out_features = attrs.out_features
         # With expert TP disabled the adapter needs no TP/SP collectives at all:
         # the base grouped linear issues none, and the dispatched rows it is
         # handed are already gathered to full sequence.
@@ -896,9 +898,20 @@ class MultiLoRAGroupedExpertLinear(MultiLoRALinear):
             get_expert_parallel_rng_tracker_name,
         )
 
-        for adapter in _adapter_leaves(self.adapters[idx]):
-            col_fn = ParallelLinearAdapter._get_init_fn(None, self._column_init_method)
-            row_fn = ParallelLinearAdapter._get_init_fn(None, self._row_init_method)
+        adapters = self.adapters[idx]
+        items = adapters.items() if isinstance(adapters, ModuleDict) else ((None, adapters),)
+        for key, adapter in items:
+            # Per-expert fans, as at construction: fans read off the packed
+            # [experts, rank, in] weight scale with rank * in and with the local expert count.
+            col_fn = ParallelLinearAdapter._get_init_fn(
+                None, self._column_init_method, fan_in=self._adapter_in_features, fan_out=self.max_rank
+            )
+            row_fn = ParallelLinearAdapter._get_init_fn(
+                None,
+                self._row_init_method,
+                fan_in=self.max_rank,
+                fan_out=self._projection_sizes.get(key, self._adapter_out_features),
+            )
             with get_cuda_rng_tracker().fork(get_expert_parallel_rng_tracker_name()):
                 col_fn(adapter.linear_in.weight.data)
                 row_fn(adapter.linear_out.weight.data)
