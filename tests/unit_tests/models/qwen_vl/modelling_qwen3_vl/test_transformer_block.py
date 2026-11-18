@@ -17,6 +17,7 @@
 import datetime
 import os
 from contextlib import nullcontext
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -24,11 +25,18 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from megatron.core import parallel_state
+from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TENorm, TERowParallelLinear
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 
-from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.transformer_block import Qwen3VLTransformerBlock
+from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.attention import Qwen3VLSelfAttention
+from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.transformer_block import (
+    Qwen3VLTransformerBlock,
+    Qwen3VLVisionTransformerBlock,
+)
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.transformer_config import Qwen3VLTransformerConfig
+from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.utils import PatchMergerSubmodules
 
 
 def test_forward_propagates_padding_mask_to_transformer_layer():
@@ -202,3 +210,62 @@ class TestQwen3VLTransformerBlock:
         loss.backward()
 
         assert hidden_states.grad is not None
+
+    @pytest.mark.timeout(60)
+    @pytest.mark.parametrize(
+        ("recompute_method", "recompute_num_layers"),
+        [("uniform", 1), ("uniform", 2), ("block", 3)],
+    )
+    def test_vision_checkpointed_forward_keeps_deepstack_gradients(self, recompute_method, recompute_num_layers):
+        """Full recompute leaves every vision gradient, the DeepStack mergers' included, unchanged."""
+        self._setup_parallel_state()
+        config = Qwen3VLTransformerConfig(
+            num_layers=4,
+            hidden_size=64,
+            num_attention_heads=4,
+            ffn_hidden_size=128,
+            add_bias_linear=True,
+            add_qkv_bias=True,
+            normalization="LayerNorm",
+            activation_func=partial(F.gelu, approximate="tanh"),
+            gated_linear_unit=False,
+            bias_activation_fusion=False,
+            layernorm_epsilon=1e-6,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            bf16=False,
+            use_cpu_initialization=True,
+            spatial_merge_size=2,
+            out_hidden_size=32,
+            deepstack_visual_indexes=[1, 2],
+        )
+        layer_spec = get_vit_layer_with_transformer_engine_spec()
+        layer_spec.submodules.self_attention.module = Qwen3VLSelfAttention
+        merger_spec = PatchMergerSubmodules(
+            patch_norm=TENorm, linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear
+        )
+        block = Qwen3VLVisionTransformerBlock(
+            config=config, spec=layer_spec, post_layer_norm=False, patch_merger_spec=merger_spec
+        ).cuda()
+        block.train()
+        hidden_states = torch.randn(16, 1, config.hidden_size, device="cuda", requires_grad=True)
+
+        def gradients(recompute_granularity):
+            config.recompute_granularity = recompute_granularity
+            config.recompute_method = recompute_method
+            config.recompute_num_layers = recompute_num_layers
+            block.zero_grad(set_to_none=True)
+            hidden_states.grad = None
+            output, deepstack_features = block(hidden_states=hidden_states, attention_mask=None)
+            assert len(deepstack_features) == len(config.deepstack_visual_indexes)
+            loss = output.square().sum() + sum(feature.square().sum() for feature in deepstack_features)
+            loss.backward()
+            return hidden_states.grad.clone(), {name: param.grad for name, param in block.named_parameters()}
+
+        expected_input_grad, expected = gradients(None)
+        input_grad, actual = gradients("full")
+
+        torch.testing.assert_close(input_grad, expected_input_grad)
+        for name, grad in expected.items():
+            assert actual[name] is not None, f"{name} got no gradient under full recompute"
+            torch.testing.assert_close(actual[name], grad, msg=name)
